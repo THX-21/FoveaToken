@@ -24,6 +24,8 @@ class LocalVisionImageProcessor(ImageProcessingMixin):
     def __init__(self, vision_packer: VisionPacker) -> None:
         self.vision_packer = vision_packer
         self.merge_size = vision_packer.local_config.spatial_merge_size
+        self.img_slot_token_count = vision_packer.img_slot_token_count if vision_packer.img_slot_enable else None
+        self._last_image_block_counts = []
 
     def __call__(self, images=None, **kwargs):
         if images is None:
@@ -33,10 +35,18 @@ class LocalVisionImageProcessor(ImageProcessingMixin):
 
         pixel_values = []
         image_grid_thw = []
+        image_block_counts = []
         for image in images:
             packed_pixels, packed_grid = self.vision_packer.pack(image)
             pixel_values.append(packed_pixels)
-            image_grid_thw.append(packed_grid)
+            if packed_grid.dim() == 1:
+                image_grid_thw.append(packed_grid)
+                image_block_counts.append(1)
+            else:
+                image_grid_thw.extend(list(packed_grid))
+                image_block_counts.append(int(packed_grid.shape[0]))
+
+        self._last_image_block_counts = image_block_counts
 
         return {
             "pixel_values": torch.cat(pixel_values, dim=0),
@@ -81,6 +91,13 @@ class Qwen35HF(Qwen3_VL):
         image_aspect_ratio: str = "normal",
         image_grid_pinpoints: str | None = None,
         max_image_tokens: int | None = 128,
+        img_slot_enable: bool = False,
+        img_slot_m: int = 4,
+        img_slot_k: int = 64,
+        img_slot_delta: int = 8,
+        img_slot_beta: float = 0.3,
+        img_slot_lambda: float = 0.9,
+        img_slot_tile_size: int | None = None,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -89,6 +106,10 @@ class Qwen35HF(Qwen3_VL):
         valid_attn_implementations = [None, "flash_attention_2", "sdpa", "eager"]
         if attn_implementation not in valid_attn_implementations:
             raise ValueError(f"attn_implementation must be one of {valid_attn_implementations}, got {attn_implementation}")
+        if isinstance(img_slot_enable, str):
+            img_slot_enable = img_slot_enable.lower() in {"1", "true", "yes"}
+        if img_slot_enable and img_slot_tile_size is None:
+            raise ValueError("img_slot_tile_size is required when img_slot_enable=true.")
 
         accelerator = Accelerator()
         self.accelerator = accelerator
@@ -105,8 +126,26 @@ class Qwen35HF(Qwen3_VL):
         }
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
+        model_kwargs.update(
+            {
+                "img_slot_enable": bool(img_slot_enable),
+                "img_slot_m": int(img_slot_m),
+                "img_slot_k": int(img_slot_k),
+                "img_slot_delta": int(img_slot_delta),
+                "img_slot_beta": float(img_slot_beta),
+                "img_slot_lambda": float(img_slot_lambda),
+                "img_slot_tile_size": None if img_slot_tile_size is None else int(img_slot_tile_size),
+            }
+        )
 
         self._model = Qwen3_5ForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
+        self._model.config.img_slot_enable = bool(img_slot_enable)
+        self._model.config.img_slot_m = int(img_slot_m)
+        self._model.config.img_slot_k = int(img_slot_k)
+        self._model.config.img_slot_delta = int(img_slot_delta)
+        self._model.config.img_slot_beta = float(img_slot_beta)
+        self._model.config.img_slot_lambda = float(img_slot_lambda)
+        self._model.config.img_slot_tile_size = None if img_slot_tile_size is None else int(img_slot_tile_size)
         if peft is not None:
             from peft import PeftModel
 
@@ -121,6 +160,10 @@ class Qwen35HF(Qwen3_VL):
             image_aspect_ratio=image_aspect_ratio,
             image_grid_pinpoints=image_grid_pinpoints,
             max_image_tokens=max_image_tokens,
+            img_slot_enable=bool(img_slot_enable),
+            img_slot_m=int(img_slot_m),
+            img_slot_k=int(img_slot_k),
+            img_slot_tile_size=None if img_slot_tile_size is None else int(img_slot_tile_size),
         )
         self.processor = Qwen3VLProcessor(
             image_processor=LocalVisionImageProcessor(vision_packer),

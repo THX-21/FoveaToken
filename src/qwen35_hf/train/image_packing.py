@@ -84,6 +84,31 @@ def resize_and_pad_image(image: Image.Image, target_resolution: tuple[int, int])
     return new_image
 
 
+def split_image_into_blocks(image: Image.Image, tile_size: int) -> list[Image.Image]:
+    """Split an image into non-overlapping, evenly sized blocks.
+
+    The number of blocks along each axis is `ceil(dim / tile_size)`. Boundaries
+    are then evenly spaced over the original image, so the last block is not a
+    small leftover strip.
+    """
+
+    if tile_size is None or tile_size <= 0:
+        raise ValueError("img_slot_tile_size must be a positive integer when ImgSlot is enabled.")
+
+    width, height = image.size
+    cols = max(1, math.ceil(width / tile_size))
+    rows = max(1, math.ceil(height / tile_size))
+    blocks: list[Image.Image] = []
+    for row in range(rows):
+        top = round(row * height / rows)
+        bottom = round((row + 1) * height / rows)
+        for col in range(cols):
+            left = round(col * width / cols)
+            right = round((col + 1) * width / cols)
+            blocks.append(image.crop((left, top, right, bottom)))
+    return blocks
+
+
 def parse_grid_pinpoints(grid_pinpoints: str | Sequence[Sequence[int]] | None) -> list[tuple[int, int]]:
     """Normalize user-provided anyres candidates into `(width, height)` pairs."""
 

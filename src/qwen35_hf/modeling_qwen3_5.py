@@ -19,6 +19,7 @@
 # limitations under the License.
 
 import itertools
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -2111,6 +2112,25 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3_5Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        hidden_size = config.text_config.hidden_size
+        num_anchor_tokens = max(1, int(getattr(config, "img_slot_m", 4)))
+        num_heads = next((h for h in (16, 12, 8, 6, 4, 3, 2, 1) if hidden_size % h == 0), 1)
+        self.imgslot_num_heads = num_heads
+        self.imgslot_a_tokens = nn.Parameter(torch.randn(num_anchor_tokens, hidden_size) * 0.02)
+        self.imgslot_text_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.imgslot_text_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.imgslot_text_v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.imgslot_text_o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.imgslot_img_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.imgslot_img_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.imgslot_attn_norm = nn.LayerNorm(hidden_size)
+        self.imgslot_ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+        self.imgslot_ffn_norm = nn.LayerNorm(hidden_size)
+        self._imgslot_runtime = {"enabled": False, "states": [], "delta": 1, "step": 0}
 
         self.post_init()
 
@@ -2119,6 +2139,230 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
     def set_input_embeddings(self, value):
         self.model.set_input_embeddings(value)
+
+    def _imgslot_is_enabled(self) -> bool:
+        return bool(getattr(self.config, "img_slot_enable", False))
+
+    def _imgslot_config(self) -> dict[str, float | int]:
+        if self._imgslot_is_enabled() and getattr(self.config, "img_slot_tile_size", None) is None:
+            raise ValueError("img_slot_tile_size is required when img_slot_enable=true.")
+        return {
+            "m": int(getattr(self.config, "img_slot_m", 4)),
+            "k": int(getattr(self.config, "img_slot_k", 64)),
+            "delta": max(1, int(getattr(self.config, "img_slot_delta", 8))),
+            "beta": float(getattr(self.config, "img_slot_beta", 0.3)),
+            "lam": float(getattr(self.config, "img_slot_lambda", 0.9)),
+        }
+
+    def _run_imgslot_text_block(self, anchor_tokens, text_tokens):
+        num_heads = self.imgslot_num_heads
+        hidden_dim = anchor_tokens.shape[-1]
+        head_dim = hidden_dim // num_heads
+        query = self.imgslot_text_q_proj(anchor_tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
+        key = self.imgslot_text_k_proj(text_tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
+        value = self.imgslot_text_v_proj(text_tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
+        attention_weights = torch.softmax(torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(head_dim), dim=-1)
+        context = torch.matmul(attention_weights, value).transpose(1, 2).reshape(1, anchor_tokens.shape[0], hidden_dim)
+        context = self.imgslot_attn_norm(anchor_tokens.unsqueeze(0) + self.imgslot_text_o_proj(context))
+        context = self.imgslot_ffn_norm(context + self.imgslot_ffn(context))
+        return context[0]
+
+    def _score_imgslot_visual_tokens(self, visual_pool, anchor_tokens):
+        num_heads = self.imgslot_num_heads
+        hidden_dim = visual_pool.shape[-1]
+        head_dim = hidden_dim // num_heads
+        query = self.imgslot_img_q_proj(visual_pool).view(1, -1, num_heads, head_dim).transpose(1, 2)
+        key = self.imgslot_img_k_proj(anchor_tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
+        attention_logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(head_dim)
+        return attention_logits.mean(1).max(-1).values[0]
+
+    def _build_imgslot_state(self, visual_pool, text_tokens, span_start: int, span_length: int):
+        imgslot_config = self._imgslot_config()
+        num_anchors = max(1, int(imgslot_config["m"]))
+        topk_target = max(1, int(imgslot_config["k"]))
+        expected_length = num_anchors + topk_target
+        if span_length != expected_length:
+            raise ValueError(f"ImgSlot span length {span_length} must equal m+k ({expected_length}).")
+        if text_tokens.numel() == 0:
+            text_tokens = visual_pool
+        anchor_seed = self.imgslot_a_tokens[:num_anchors].to(device=visual_pool.device, dtype=visual_pool.dtype)
+        anchor_tokens = self._run_imgslot_text_block(anchor_seed, text_tokens.to(visual_pool.dtype))
+        scores = self._score_imgslot_visual_tokens(visual_pool, anchor_tokens)
+        topk_select = max(1, min(topk_target, visual_pool.shape[0]))
+        topk_idx = torch.topk(scores, k=topk_select, dim=0).indices
+        visual_topk = visual_pool[topk_idx]
+        if topk_select < topk_target:
+            visual_topk = torch.cat([visual_topk, visual_topk[-1:].repeat(topk_target - topk_select, 1)], dim=0)
+        replacement = torch.cat([anchor_tokens, visual_topk], dim=0)
+        state = {
+            "span": (int(span_start), int(span_length)),
+            "A": anchor_tokens.detach(),
+            "V": visual_pool.detach(),
+            "T": text_tokens.detach(),
+            "V_topk": visual_topk.detach(),
+            "score_prev": scores.detach(),
+            "topk_idx": topk_idx.detach(),
+        }
+        return replacement, state
+
+    def _refresh_imgslot_state(self, state: dict[str, Any]):
+        imgslot_config = self._imgslot_config()
+        visual_pool = state["V"]
+        text_tokens = state.get("T", visual_pool)
+        prev_anchor = state["A"]
+        anchor_tokens = self._run_imgslot_text_block(prev_anchor.to(visual_pool.dtype), text_tokens.to(visual_pool.dtype))
+        anchor_tokens = (1.0 - imgslot_config["beta"]) * prev_anchor + imgslot_config["beta"] * anchor_tokens
+        scores_current = self._score_imgslot_visual_tokens(visual_pool, anchor_tokens)
+        scores = imgslot_config["lam"] * state["score_prev"] + (1.0 - imgslot_config["lam"]) * scores_current
+        topk_target = max(1, int(imgslot_config["k"]))
+        topk_select = max(1, min(topk_target, visual_pool.shape[0]))
+        topk_idx = torch.topk(scores, k=topk_select, dim=0).indices
+        visual_topk = visual_pool[topk_idx]
+        if topk_select < topk_target:
+            visual_topk = torch.cat([visual_topk, visual_topk[-1:].repeat(topk_target - topk_select, 1)], dim=0)
+        state["A"] = anchor_tokens.detach()
+        state["V_topk"] = visual_topk.detach()
+        state["score_prev"] = scores.detach()
+        state["topk_idx"] = topk_idx.detach()
+        return state
+
+    def _image_placeholder_spans(self, input_ids: torch.Tensor) -> list[list[tuple[int, int]]]:
+        image_token_id = self.config.image_token_id
+        all_spans: list[list[tuple[int, int]]] = []
+        for sample_ids in input_ids:
+            positions = torch.where(sample_ids == image_token_id)[0].tolist()
+            sample_spans: list[tuple[int, int]] = []
+            if positions:
+                start = previous = positions[0]
+                for pos in positions[1:]:
+                    if pos != previous + 1:
+                        sample_spans.append((start, previous - start + 1))
+                        start = pos
+                    previous = pos
+                sample_spans.append((start, previous - start + 1))
+            all_spans.append(sample_spans)
+        return all_spans
+
+    def _build_imgslot_visual_pools(self, pixel_values, image_grid_thw):
+        if pixel_values is None or image_grid_thw is None:
+            return None
+        image_outputs = self.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, return_dict=True)
+        return [pool.detach() for pool in image_outputs.pooler_output]
+
+    def _prebuild_imgslot_inputs(self, input_ids, attention_mask, inputs_embeds, visual_pools):
+        spans_by_sample = self._image_placeholder_spans(input_ids)
+        if sum(len(spans) for spans in spans_by_sample) != len(visual_pools):
+            raise ValueError("ImgSlot visual block count must match image placeholder span count.")
+        batch_states: list[list[dict[str, Any]]] = []
+        pool_index = 0
+        new_inputs_embeds = inputs_embeds.clone()
+        if attention_mask is None:
+            attention_mask = input_ids.new_ones(input_ids.shape)
+        runtime_text_tokens: list[torch.Tensor] = []
+        for batch_idx, spans in enumerate(spans_by_sample):
+            valid_text_mask = (input_ids[batch_idx] != self.config.image_token_id) & attention_mask[batch_idx].bool()
+            text_tokens = inputs_embeds[batch_idx][valid_text_mask]
+            sample_states: list[dict[str, Any]] = []
+            for span_start, span_length in spans:
+                visual_pool = visual_pools[pool_index].to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+                pool_index += 1
+                replacement, state = self._build_imgslot_state(visual_pool, text_tokens, span_start, span_length)
+                new_inputs_embeds[batch_idx, span_start : span_start + span_length] = replacement.to(inputs_embeds.dtype)
+                sample_states.append(state)
+            batch_states.append(sample_states)
+            runtime_text_tokens.append(text_tokens.detach())
+        self._imgslot_runtime = {
+            "enabled": True,
+            "states": batch_states,
+            "delta": self._imgslot_config()["delta"],
+            "step": 0,
+            "text_tokens": runtime_text_tokens,
+        }
+        return new_inputs_embeds, attention_mask
+
+    def _slot_kv_for_layer(self, layer, slot_tokens, slot_positions):
+        attention = getattr(layer, "self_attn", None)
+        if attention is None or not all(hasattr(attention, attr) for attr in ("k_proj", "v_proj", "k_norm")):
+            return None
+        layer_device = next(layer.parameters()).device
+        slot_tokens = slot_tokens.to(device=layer_device)
+        slot_positions = slot_positions.to(device=layer_device)
+        input_shape = slot_tokens.shape[:-1]
+        hidden_shape = (*input_shape, -1, attention.head_dim)
+        key_states = attention.k_norm(attention.k_proj(slot_tokens).view(hidden_shape)).transpose(1, 2)
+        value_states = attention.v_proj(slot_tokens).view(hidden_shape).transpose(1, 2)
+        dummy_query = key_states.new_zeros((slot_tokens.shape[0], attention.config.num_attention_heads, slot_tokens.shape[1], attention.head_dim))
+        position_embeddings = self.model.language_model.rotary_emb(slot_tokens, slot_positions)
+        _, key_states = apply_rotary_pos_emb(dummy_query, key_states, *position_embeddings)
+        return key_states, value_states
+
+    def _overwrite_cache_layer(self, past_key_values, layer_idx: int, batch_idx: int, span_start: int, span_end: int, key_states, value_states) -> bool:
+        if isinstance(past_key_values, (tuple, list)):
+            if layer_idx >= len(past_key_values):
+                return False
+            layer_past = past_key_values[layer_idx]
+            if not isinstance(layer_past, (tuple, list)) or len(layer_past) < 2:
+                return False
+            layer_past[0][batch_idx, :, span_start:span_end] = key_states[0].to(layer_past[0].dtype)
+            layer_past[1][batch_idx, :, span_start:span_end] = value_states[0].to(layer_past[1].dtype)
+            return True
+        layers = getattr(past_key_values, "layers", None)
+        if layers is None or layer_idx >= len(layers):
+            return False
+        cache_layer = layers[layer_idx]
+        keys = getattr(cache_layer, "keys", None)
+        values = getattr(cache_layer, "values", None)
+        if keys is None or values is None or keys.numel() == 0 or span_end > keys.shape[-2]:
+            return False
+        keys[batch_idx, :, span_start:span_end] = key_states[0].to(keys.dtype)
+        values[batch_idx, :, span_start:span_end] = value_states[0].to(values.dtype)
+        return True
+
+    def _maybe_refresh_imgslot_cache(self, past_key_values):
+        runtime = getattr(self, "_imgslot_runtime", None)
+        if not runtime or not runtime.get("enabled") or past_key_values is None:
+            return past_key_values
+        runtime["step"] += 1
+        if runtime["step"] % runtime["delta"]:
+            return past_key_values
+        layers = self.model.language_model.layers
+        layer_types = getattr(self.config.text_config, "layer_types", None) or []
+        for batch_idx, states in enumerate(runtime["states"]):
+            for state_idx, state in enumerate(states):
+                text_tokens = runtime.get("text_tokens", [])[batch_idx]
+                if text_tokens.numel() > 0:
+                    state["T"] = text_tokens.to(state["V"].device, state["V"].dtype).detach()
+                state = self._refresh_imgslot_state(state)
+                states[state_idx] = state
+                span_start, span_length = state["span"]
+                span_end = span_start + span_length
+                slot_tokens = torch.cat([state["A"], state["V_topk"]], dim=0)[:span_length]
+                slot_tokens = slot_tokens.to(device=state["V"].device, dtype=state["V"].dtype).unsqueeze(0)
+                slot_positions = torch.arange(span_start, span_end, device=slot_tokens.device, dtype=torch.long).unsqueeze(0)
+                for layer_idx, layer in enumerate(layers):
+                    if layer_idx < len(layer_types) and layer_types[layer_idx] != "full_attention":
+                        continue
+                    kv = self._slot_kv_for_layer(layer, slot_tokens, slot_positions)
+                    if kv is None:
+                        continue
+                    self._overwrite_cache_layer(past_key_values, layer_idx, batch_idx, span_start, span_end, kv[0], kv[1])
+        return past_key_values
+
+    def _append_imgslot_text_hidden(self, hidden_states, past_key_values):
+        runtime = getattr(self, "_imgslot_runtime", None)
+        if not runtime or not runtime.get("enabled") or past_key_values is None or hidden_states is None:
+            return
+        if hidden_states.shape[1] == 0:
+            return
+        last_hidden = hidden_states[:, -1:, :].detach()
+        text_tokens = runtime.setdefault("text_tokens", [])
+        if len(text_tokens) != last_hidden.shape[0]:
+            return
+        max_text_tokens = int(getattr(self.config, "img_slot_max_text_tokens", 512))
+        for batch_idx in range(last_hidden.shape[0]):
+            text_tokens[batch_idx] = torch.cat([text_tokens[batch_idx].to(last_hidden.device), last_hidden[batch_idx]], dim=0)[
+                -max_text_tokens:
+            ].detach()
 
     @auto_docstring
     def get_video_features(
@@ -2217,6 +2461,29 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         >>> print(output_text)
         ```
         """
+        pre_refresh_past_key_values = past_key_values
+        if self._imgslot_is_enabled() and past_key_values is not None:
+            past_key_values = self._maybe_refresh_imgslot_cache(past_key_values)
+
+        if self._imgslot_is_enabled() and past_key_values is None and input_ids is not None and pixel_values is not None:
+            if inputs_embeds is None:
+                inputs_embeds = self.get_input_embeddings()(input_ids)
+            visual_pools = self._build_imgslot_visual_pools(pixel_values, image_grid_thw)
+            if not visual_pools:
+                raise RuntimeError("ImgSlot: empty visual pools.")
+            inputs_embeds, attention_mask = self._prebuild_imgslot_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                visual_pools=visual_pools,
+            )
+            input_ids = None
+            pixel_values = None
+            image_grid_thw = None
+            mm_token_type_ids = None
+            if position_ids is None:
+                position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long)
+                position_ids = position_ids.unsqueeze(0).expand(inputs_embeds.shape[0], -1)
 
         outputs = self.model(
             input_ids=input_ids,
@@ -2233,6 +2500,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]  # (bs, seq_len, hidden_size)
+        self._append_imgslot_text_hidden(hidden_states, pre_refresh_past_key_values)
 
         # -> (bs, kept_seq_len, vocab_size)
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss

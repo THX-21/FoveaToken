@@ -18,7 +18,13 @@ from ..processing_qwen3_vl import (
     build_visual_placeholder,
     image_token_count_from_grid,
 )
-from .image_packing import VisionPackerConfig, maybe_infer_processor_stats, pack_anyres_image, pack_single_image
+from .image_packing import (
+    VisionPackerConfig,
+    maybe_infer_processor_stats,
+    pack_anyres_image,
+    pack_single_image,
+    split_image_into_blocks,
+)
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -80,7 +86,7 @@ def load_json_records(data_path: str) -> list[dict[str, Any]]:
 
 def replace_image_tokens_in_conversations(
     conversations: Sequence[dict[str, Any]],
-    image_token_counts: Sequence[int],
+    image_token_counts: Sequence[int | Sequence[int]],
 ) -> list[dict[str, Any]]:
     """Apply image placeholder expansion across a full conversation list.
 
@@ -90,9 +96,13 @@ def replace_image_tokens_in_conversations(
     """
 
     conversations = copy.deepcopy(list(conversations))
+    image_token_groups = [
+        [int(count) for count in counts] if isinstance(counts, (list, tuple)) else [int(counts)]
+        for counts in image_token_counts
+    ]
     total_placeholders = sum(sentence["value"].count(DEFAULT_IMAGE_TOKEN) for sentence in conversations)
-    if total_placeholders == 1 and len(image_token_counts) > 1:
-        joined_placeholder = "".join(build_visual_placeholder(count) for count in image_token_counts)
+    if total_placeholders == 1 and len(image_token_groups) > 1:
+        joined_placeholder = "".join(build_visual_placeholder(count) for group in image_token_groups for count in group)
         for sentence in conversations:
             value = sentence["value"]
             if DEFAULT_IMAGE_TOKEN in value:
@@ -103,13 +113,13 @@ def replace_image_tokens_in_conversations(
     for sentence in conversations:
         value = sentence["value"]
         while DEFAULT_IMAGE_TOKEN in value:
-            if image_index >= len(image_token_counts):
+            if image_index >= len(image_token_groups):
                 raise ValueError("Conversation references more <image> placeholders than the sample provides.")
-            placeholder = build_visual_placeholder(image_token_counts[image_index])
+            placeholder = "".join(build_visual_placeholder(count) for count in image_token_groups[image_index])
             value = value.replace(DEFAULT_IMAGE_TOKEN, placeholder, 1)
             image_index += 1
         sentence["value"] = value
-    if image_index != len(image_token_counts):
+    if image_index != len(image_token_groups):
         raise ValueError("Sample provides more images than there are <image> placeholders in the conversation.")
     return conversations
 
@@ -127,7 +137,7 @@ def tokenize_text(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
 def encode_chatml_example(
     tokenizer: PreTrainedTokenizerBase,
     conversations: Sequence[dict[str, Any]],
-    image_token_counts: Sequence[int],
+    image_token_counts: Sequence[int | Sequence[int]],
     system_message: str,
 ) -> tuple[torch.LongTensor, torch.LongTensor]:
     """Encode one conversation into causal-LM inputs and labels.
@@ -203,12 +213,24 @@ class VisionPacker:
         image_aspect_ratio: str = "square",
         image_grid_pinpoints: str | None = None,
         max_image_tokens: int | None = None,
+        img_slot_enable: bool = False,
+        img_slot_m: int = 4,
+        img_slot_k: int = 64,
+        img_slot_tile_size: int | None = None,
     ) -> None:
         self.processor = processor
         self.processor_backend = processor_backend
         self.image_aspect_ratio = image_aspect_ratio
         self.image_grid_pinpoints = image_grid_pinpoints
         self.max_image_tokens = max_image_tokens
+        self.img_slot_enable = img_slot_enable
+        self.img_slot_token_count = int(img_slot_m) + int(img_slot_k)
+        self.img_slot_tile_size = img_slot_tile_size
+        if self.img_slot_enable:
+            if self.img_slot_tile_size is None:
+                raise ValueError("img_slot_tile_size is required when img_slot_enable=true.")
+            if self.img_slot_token_count <= 0:
+                raise ValueError("img_slot_m + img_slot_k must be positive when ImgSlot is enabled.")
 
         # Some configs expose scalar patch sizes while others expose tuples.
         patch_size = vision_config.patch_size if isinstance(vision_config.patch_size, int) else int(vision_config.patch_size[0])
@@ -226,16 +248,7 @@ class VisionPacker:
             image_std=image_std,
             rescale_factor=rescale_factor,
         )
-    def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
-        """Pack one image and return `(pixel_values, image_grid_thw)`.
-
-        Resolution strategy:
-        - anyres mode: always use the local path, because candidate canvas
-          selection is driven by the training config.
-        - official/auto backend: try the HF processor first.
-        - local fallback: reproduce patch packing in pure PyTorch.
-        """
-
+    def _pack_single_block(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
         if self.image_aspect_ratio == "anyres" or "anyres" in self.image_aspect_ratio:
             if not self.image_grid_pinpoints:
                 return pack_single_image(
@@ -249,6 +262,30 @@ class VisionPacker:
                 grid_pinpoints=self.image_grid_pinpoints,
                 max_tiles=self.max_image_tokens,
             )
+
+        return pack_single_image(image=image, config=self.local_config, max_image_tokens=self.max_image_tokens)
+
+    def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
+        """Pack one image and return `(pixel_values, image_grid_thw)`.
+
+        Resolution strategy:
+        - anyres mode: always use the local path, because candidate canvas
+          selection is driven by the training config.
+        - official/auto backend: try the HF processor first.
+        - local fallback: reproduce patch packing in pure PyTorch.
+        """
+
+        if self.img_slot_enable:
+            pixel_values_list = []
+            image_grid_list = []
+            for block in split_image_into_blocks(image, int(self.img_slot_tile_size)):
+                packed_pixels, packed_grid = self._pack_single_block(block)
+                pixel_values_list.append(packed_pixels)
+                image_grid_list.append(packed_grid)
+            return torch.cat(pixel_values_list, dim=0), torch.stack(image_grid_list, dim=0)
+
+        if self.image_aspect_ratio == "anyres" or "anyres" in self.image_aspect_ratio:
+            return self._pack_single_block(image)
 
         if self.processor_backend in {"official", "auto"} and self.processor is not None:
             try:
@@ -274,7 +311,7 @@ class VisionPacker:
                 if self.processor_backend == "official":
                     raise
 
-        return pack_single_image(image=image, config=self.local_config, max_image_tokens=self.max_image_tokens)
+        return self._pack_single_block(image)
 
 
 class LazySupervisedDataset(Dataset):
@@ -292,6 +329,7 @@ class LazySupervisedDataset(Dataset):
         vision_packer: VisionPacker,
         image_token_id: int,
         system_message: str = DEFAULT_SYSTEM_MESSAGE,
+        img_slot_enable: bool = False,
     ) -> None:
         self.records = load_json_records(data_path)
         self.image_folder = image_folder
@@ -299,6 +337,7 @@ class LazySupervisedDataset(Dataset):
         self.vision_packer = vision_packer
         self.image_token_id = image_token_id
         self.system_message = system_message
+        self.img_slot_enable = img_slot_enable
 
     def __len__(self) -> int:
         return len(self.records)
@@ -323,7 +362,7 @@ class LazySupervisedDataset(Dataset):
         image_field = record.get("image")
         pixel_values = None
         image_grid_thw = None
-        image_token_counts: list[int] = []
+        image_token_counts: list[list[int]] = []
 
         if image_field is not None:
             image_names = image_field if isinstance(image_field, list) else [image_field]
@@ -332,21 +371,33 @@ class LazySupervisedDataset(Dataset):
             for image_name in image_names:
                 packed_pixels, packed_grid = self._load_image(image_name)
                 pixel_values_list.append(packed_pixels)
-                image_grid_list.append(packed_grid)
+                if packed_grid.dim() == 1:
+                    grids_for_counts = [packed_grid]
+                    image_grid_list.append(packed_grid)
+                else:
+                    grids_for_counts = list(packed_grid)
+                    image_grid_list.extend(grids_for_counts)
+                current_image_token_counts: list[int] = []
                 # Convert `(t, h, w)` grid metadata into the number of text-side
                 # image placeholder tokens expected by the language model. The
                 # spatial merge size reduces how many visual patches survive into
                 # the final multimodal token sequence.
-                image_token_counts.append(
-                    image_token_count_from_grid(
-                        packed_grid,
-                        self.vision_packer.local_config.spatial_merge_size,
-                    )
-                )
-            # Multiple images in one sample are concatenated along the patch axis.
-            pixel_values = torch.cat(pixel_values_list, dim=0)
-            # Keep per-image grids separate so the model can reconstruct boundaries.
-            image_grid_thw = torch.stack(image_grid_list, dim=0)
+                for grid in grids_for_counts:
+                    if self.img_slot_enable:
+                        current_image_token_counts.append(self.vision_packer.img_slot_token_count)
+                    else:
+                        current_image_token_counts.append(
+                            image_token_count_from_grid(
+                                grid,
+                                self.vision_packer.local_config.spatial_merge_size,
+                            )
+                        )
+                image_token_counts.append(current_image_token_counts)
+            if pixel_values_list:
+                # Multiple images or blocks in one sample are concatenated along
+                # the patch axis. Keep one grid row per logical image/block.
+                pixel_values = torch.cat(pixel_values_list, dim=0)
+                image_grid_thw = torch.stack(image_grid_list, dim=0)
 
         input_ids, labels = encode_chatml_example(
             tokenizer=self.tokenizer,

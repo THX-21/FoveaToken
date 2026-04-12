@@ -144,6 +144,23 @@ class Qwen3_5VisionConfig(PreTrainedConfig):
 @strict
 class Qwen3_5Config(PreTrainedConfig):
     r"""
+    img_slot_enable (`bool`, *optional*, defaults to `False`):
+        Whether to enable block-based ImgSlot routing.
+    img_slot_m (`int`, *optional*, defaults to 4):
+        Number of dynamic anchor/query tokens per image block slot.
+    img_slot_k (`int`, *optional*, defaults to 64):
+        Number of selected visual tokens per image block slot.
+    img_slot_delta (`int`, *optional*, defaults to 8):
+        Decode-step interval for refreshing ImgSlot KV entries.
+    img_slot_beta (`float`, *optional*, defaults to 0.3):
+        Update strength for the dynamic anchor tokens.
+    img_slot_lambda (`float`, *optional*, defaults to 0.9):
+        Momentum coefficient for visual Top-K scores.
+    img_slot_tile_size (`int`, *optional*):
+        Required when ImgSlot is enabled. Original images are evenly split into
+        blocks using `ceil(width / img_slot_tile_size)` and
+        `ceil(height / img_slot_tile_size)`.
+
     Example:
 
     ```python
@@ -171,6 +188,13 @@ class Qwen3_5Config(PreTrainedConfig):
     vision_start_token_id: int = 248053
     vision_end_token_id: int = 248054
     tie_word_embeddings: bool = False
+    img_slot_enable: bool = False
+    img_slot_m: int = 4
+    img_slot_k: int = 64
+    img_slot_delta: int = 8
+    img_slot_beta: float = 0.3
+    img_slot_lambda: float = 0.9
+    img_slot_tile_size: int | None = None
 
     def __post_init__(self, **kwargs):
         if isinstance(self.vision_config, dict):

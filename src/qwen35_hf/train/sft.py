@@ -18,6 +18,13 @@ class ModelArguments:
     lora_alpha: int = field(default=16)
     lora_dropout: float = field(default=0.05)
     unfreeze_vision: bool = field(default=True)
+    img_slot_enable: bool = field(default=False)
+    img_slot_m: int = field(default=4)
+    img_slot_k: int = field(default=64)
+    img_slot_delta: int = field(default=8)
+    img_slot_beta: float = field(default=0.3)
+    img_slot_lambda: float = field(default=0.9)
+    img_slot_tile_size: Optional[int] = field(default=None)
 
 
 @dataclass
@@ -257,6 +264,13 @@ def main() -> None:
         model_args.model_name_or_path,
         torch_dtype="auto",
         attn_implementation=training_args.attn_implementation,
+        img_slot_enable=model_args.img_slot_enable,
+        img_slot_m=model_args.img_slot_m,
+        img_slot_k=model_args.img_slot_k,
+        img_slot_delta=model_args.img_slot_delta,
+        img_slot_beta=model_args.img_slot_beta,
+        img_slot_lambda=model_args.img_slot_lambda,
+        img_slot_tile_size=model_args.img_slot_tile_size,
         output_loading_info=True,
     )
     print_loading_summary(model, loading_info)
@@ -267,6 +281,15 @@ def main() -> None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or 0
 
     processor = load_optional_processor(model_args.model_name_or_path, model_args.processor_backend)
+    if model_args.img_slot_enable and model_args.img_slot_tile_size is None:
+        raise ValueError("--img_slot_tile_size is required when --img_slot_enable true.")
+    model.config.img_slot_enable = model_args.img_slot_enable
+    model.config.img_slot_m = model_args.img_slot_m
+    model.config.img_slot_k = model_args.img_slot_k
+    model.config.img_slot_delta = model_args.img_slot_delta
+    model.config.img_slot_beta = model_args.img_slot_beta
+    model.config.img_slot_lambda = model_args.img_slot_lambda
+    model.config.img_slot_tile_size = model_args.img_slot_tile_size
     model.config.use_cache = False
     if training_args.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
@@ -285,6 +308,10 @@ def main() -> None:
         image_aspect_ratio=data_args.image_aspect_ratio,
         image_grid_pinpoints=data_args.image_grid_pinpoints,
         max_image_tokens=data_args.max_image_tokens,
+        img_slot_enable=model_args.img_slot_enable,
+        img_slot_m=model_args.img_slot_m,
+        img_slot_k=model_args.img_slot_k,
+        img_slot_tile_size=model_args.img_slot_tile_size,
     )
 
     train_dataset = LazySupervisedDataset(
@@ -294,6 +321,7 @@ def main() -> None:
         vision_packer=vision_packer,
         image_token_id=model.config.image_token_id,
         system_message=data_args.system_message,
+        img_slot_enable=model_args.img_slot_enable,
     )
     data_collator = DataCollatorForQwen3_5SFT(
         tokenizer=tokenizer,

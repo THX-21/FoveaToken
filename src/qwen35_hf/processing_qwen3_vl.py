@@ -81,6 +81,9 @@ class Qwen3VLProcessor(ProcessorMixin):
             grids = [image_grid_thw]
         else:
             grids = list(image_grid_thw)
+        img_slot_token_count = getattr(self.image_processor, "img_slot_token_count", None)
+        if img_slot_token_count is not None:
+            return [int(img_slot_token_count) for _ in grids]
         return [image_token_count_from_grid(grid, self.image_processor.merge_size) for grid in grids]
 
     def build_visual_placeholder(self, num_image_tokens: int) -> str:
@@ -95,14 +98,61 @@ class Qwen3VLProcessor(ProcessorMixin):
         """Expand each single image pad in text to match packed visual tokens."""
 
         image_token_counts = self.image_token_counts_from_grids(image_grid_thw)
+        image_block_counts = getattr(self.image_processor, "_last_image_block_counts", None)
         index = 0
+        image_index = 0
         output = text.copy()
         for i in range(len(output)):
+            full_placeholder = f"{self.vision_start_token}{self.image_token}{self.vision_end_token}"
+            while full_placeholder in output[i]:
+                if index >= len(image_token_counts):
+                    raise ValueError("Text contains more image placeholders than image_grid_thw entries.")
+                block_count = 1
+                if image_block_counts is not None:
+                    if image_index >= len(image_block_counts):
+                        raise ValueError("Text contains more image placeholders than image block metadata entries.")
+                    block_count = int(image_block_counts[image_index])
+                block_counts = image_token_counts[index : index + block_count]
+                if len(block_counts) != block_count:
+                    raise ValueError("image_grid_thw contains fewer blocks than expected for image placeholder.")
+                replacement = "".join(
+                    build_visual_placeholder(
+                        count,
+                        image_token="<|placeholder|>",
+                        vision_start_token=self.vision_start_token,
+                        vision_end_token=self.vision_end_token,
+                    )
+                    for count in block_counts
+                )
+                index += block_count
+                image_index += 1
+                output[i] = output[i].replace(full_placeholder, replacement, 1)
             while self.image_token in output[i]:
                 if index >= len(image_token_counts):
                     raise ValueError("Text contains more image placeholders than image_grid_thw entries.")
-                output[i] = output[i].replace(self.image_token, "<|placeholder|>" * image_token_counts[index], 1)
-                index += 1
+                block_count = 1
+                if image_block_counts is not None:
+                    if image_index >= len(image_block_counts):
+                        raise ValueError("Text contains more image placeholders than image block metadata entries.")
+                    block_count = int(image_block_counts[image_index])
+                block_counts = image_token_counts[index : index + block_count]
+                if len(block_counts) != block_count:
+                    raise ValueError("image_grid_thw contains fewer blocks than expected for image placeholder.")
+                if block_count == 1:
+                    replacement = "<|placeholder|>" * block_counts[0]
+                else:
+                    replacement = "".join(
+                        build_visual_placeholder(
+                            count,
+                            image_token="<|placeholder|>",
+                            vision_start_token=self.vision_start_token,
+                            vision_end_token=self.vision_end_token,
+                        )
+                        for count in block_counts
+                    )
+                output[i] = output[i].replace(self.image_token, replacement, 1)
+                index += block_count
+                image_index += 1
             output[i] = output[i].replace("<|placeholder|>", self.image_token)
         if index != len(image_token_counts):
             raise ValueError("image_grid_thw contains more images than text placeholders.")

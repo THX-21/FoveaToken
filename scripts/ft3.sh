@@ -20,6 +20,7 @@ JSON_PATH="${JSON_PATH:-/mnt/data/GeoLLaVA-Data/ft3_whole_shuffle.json}"
 IMAGE_FOLDER="${IMAGE_FOLDER:-/mnt/data/GeoLLaVA-Data/jpg_images}"
 CKPT_PATH="${CKPT_PATH:-Qwen/Qwen3.5-9B}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
+IMG_SLOT_TILE_SIZE="${IMG_SLOT_TILE_SIZE:?IMG_SLOT_TILE_SIZE must be set when ImgSlot is enabled}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src:${PYTHONPATH}"
 
@@ -87,6 +88,13 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
     --unfreeze_vision true \
+    --img_slot_enable true \
+    --img_slot_m 4 \
+    --img_slot_k 64 \
+    --img_slot_delta 8 \
+    --img_slot_beta 0.3 \
+    --img_slot_lambda 0.9 \
+    --img_slot_tile_size "${IMG_SLOT_TILE_SIZE}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
     --output_dir "${OUTPUT_DIR}" \
