@@ -2,11 +2,11 @@
 
 ## 项目结构
 
-- `qwen35_hf/` 是当前主要工作目录，包含本地 Qwen3.5 HF 实现、训练脚本和 lmms-eval 适配。
-- `qwen35_hf/src/qwen35_hf/` 存放模型、配置、tokenizer、processor 和训练代码。
-- `qwen35_hf/scripts/` 存放训练/评测脚本。不要在项目根目录直接找 `eval.sh`，当前评测脚本在 `qwen35_hf/scripts/eval.sh`。
-- `qwen35_hf/lmms-eval/` 是本地 lmms-eval 副本，当前新增了 `qwen35_hf` 模型适配器。
-- `qwen35_hf/checkpoints/` 和 `qwen35_hf/logs/` 是训练/评测产物目录，通常不要提交。
+- 当前工作目录是 `/root/wd/FoveaToken/qwen35_hf`，包含本地 Qwen3.5 HF 实现、训练脚本和 lmms-eval 适配。
+- `src/qwen35_hf/` 存放模型、配置、tokenizer、processor 和训练代码。
+- `scripts/` 存放训练/评测脚本。当前评测脚本在 `scripts/eval.sh`，不要在仓库根目录直接找 `eval.sh`。
+- `lmms-eval/` 是本地 lmms-eval 副本，当前新增了 `qwen35_hf` 模型适配器。
+- `checkpoints/` 和 `logs/` 是训练/评测产物目录，通常不要提交。
 
 ## 常用命令
 
@@ -17,7 +17,7 @@ cd /root/wd/FoveaToken/qwen35_hf
 bash scripts/ft3.sh
 ```
 
-评测 LoRA checkpoint：
+运行评测：
 
 ```bash
 cd /root/wd/FoveaToken/qwen35_hf
@@ -27,10 +27,10 @@ bash scripts/eval.sh
 语法检查：
 
 ```bash
-bash -n qwen35_hf/scripts/ft3.sh
-bash -n qwen35_hf/scripts/eval.sh
-/root/wd/FoveaToken/.venv/bin/python -m py_compile qwen35_hf/src/qwen35_hf/train/sft.py
-/root/wd/FoveaToken/.venv/bin/python -m py_compile qwen35_hf/src/qwen35_hf/train/data.py
+bash -n scripts/ft3.sh
+bash -n scripts/eval.sh
+/root/wd/FoveaToken/.venv/bin/python -m py_compile src/qwen35_hf/train/sft.py
+/root/wd/FoveaToken/.venv/bin/python -m py_compile src/qwen35_hf/train/data.py
 ```
 
 ## 训练约定
@@ -39,12 +39,14 @@ bash -n qwen35_hf/scripts/eval.sh
 - `scripts/ft3.sh` 会自动查找 `OUTPUT_DIR` 下最新的 `checkpoint-*` 并传入 `--resume_from_checkpoint` 继续训练。
 - 默认训练基座是 `Qwen/Qwen3.5-9B`，默认数据路径是 `/mnt/data/GeoLLaVA-Data/ft3_whole_shuffle.json`。
 - 当前训练是 LoRA + 解冻 vision tower：`--lora_enable true` 且 `--unfreeze_vision true`。
-- `processor_backend` 当前脚本里是 `official`，但 `image_aspect_ratio=anyres` 时训练代码会强制走本地 `pack_anyres_image` 路径。
+- `processor_backend` 当前脚本里是 `local`。
+- `image_aspect_ratio` 当前脚本里是 `normal`；只有设置为 `anyres` 或包含 `anyres` 时，训练代码才会强制走本地 `pack_anyres_image` 路径。
+- `scripts/ft3.sh` 当前传入 `--max_image_tokens 2048`。
 - `max_image_tokens` 在本地 anyres 路径里表示最终图像 token 预算，不是旧的 tile 数。
 
 ## 数据和模板
 
-- 训练编码入口是 `qwen35_hf/src/qwen35_hf/train/data.py` 的 `encode_chatml_example`。
+- 训练编码入口是 `src/qwen35_hf/train/data.py` 的 `encode_chatml_example`。
 - 当前训练模板手写 ChatML，并已对齐 Qwen3.5 官方 assistant 空 thinking scaffold：
 
 ```text
@@ -62,7 +64,7 @@ answer<|im_end|>
 
 ## 图像处理
 
-- 本地图像打包代码在 `qwen35_hf/src/qwen35_hf/train/image_packing.py`。
+- 本地图像打包代码在 `src/qwen35_hf/train/image_packing.py`。
 - `anyres` 路径使用 `pack_anyres_image`，会根据 `grid_pinpoints`、`patch_size`、`spatial_merge_size` 和 `max_image_tokens` 选择合法分辨率。
 - 图像最终 token 数计算：
 
@@ -79,7 +81,9 @@ image_tokens = image_grid_thw.prod() // spatial_merge_size**2
   - `qwen35_hf.Qwen3_5ForConditionalGeneration`
   - `qwen35_hf.Qwen3_5Tokenizer`
   - `qwen35_hf.Qwen3VLProcessor`
-- 评测 LoRA 的方式是先加载 `BASE_MODEL`，再通过 `PeftModel.from_pretrained` 加载 `LORA_CHECKPOINT`。
+- 评测适配器用 `VisionPacker` 和 `LocalVisionImageProcessor` 复用本地训练侧图像打包逻辑。
+- `scripts/eval.sh` 当前实际 `--model_args` 使用 `processor_backend=local,image_aspect_ratio=normal,max_image_tokens=16384`。
+- 评测 LoRA 的方式是先加载 `BASE_MODEL`，再通过 `PeftModel.from_pretrained` 加载 `LORA_CHECKPOINT`；当前 `scripts/eval.sh` 保留了 peft 示例注释，但实际命令没有传 `peft=${LORA_CHECKPOINT}`。
 - `eval.sh` 是 bash 脚本，必须用 `bash scripts/eval.sh` 或 `./scripts/eval.sh` 运行，不要用 `python scripts/eval.sh`。
 - `xlrs-lite` 的打分会把 `(A)` 标准化为 `A`，所以输出 `(A)` 可以算对。
 
