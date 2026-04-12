@@ -1,0 +1,169 @@
+from typing import Any
+
+import numpy as np
+
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.processing_utils import ProcessorMixin
+
+
+DEFAULT_IMAGE_PAD = "<|image_pad|>"
+DEFAULT_VISION_START = "<|vision_start|>"
+DEFAULT_VISION_END = "<|vision_end|>"
+
+
+def image_token_count_from_grid(image_grid_thw, merge_size: int) -> int:
+    """Convert one `(t, h, w)` image grid into text-side image token count."""
+
+    merge_length = max(int(merge_size), 1) ** 2
+    grid_prod = image_grid_thw.prod()
+    if hasattr(grid_prod, "item"):
+        grid_prod = grid_prod.item()
+    return int(grid_prod // merge_length)
+
+
+def build_visual_placeholder(
+    num_image_tokens: int,
+    image_token: str = DEFAULT_IMAGE_PAD,
+    vision_start_token: str = DEFAULT_VISION_START,
+    vision_end_token: str = DEFAULT_VISION_END,
+) -> str:
+    """Expand one logical image into the placeholder span expected by Qwen VL."""
+
+    return f"{vision_start_token}{image_token * num_image_tokens}{vision_end_token}"
+
+
+def build_mm_token_type_ids(input_ids, image_token_id: int, video_token_id: int | None = None):
+    """Mark image placeholder token positions for the multimodal model."""
+
+    if hasattr(input_ids, "new_zeros"):
+        mm_token_type_ids = input_ids.new_zeros(input_ids.shape, dtype=getattr(input_ids, "dtype", None))
+        mm_token_type_ids[input_ids == image_token_id] = 1
+        if video_token_id is not None:
+            mm_token_type_ids[input_ids == video_token_id] = 2
+        return mm_token_type_ids
+
+    array_ids = np.array(input_ids)
+    mm_token_type_ids = np.zeros_like(array_ids)
+    mm_token_type_ids[array_ids == image_token_id] = 1
+    if video_token_id is not None:
+        mm_token_type_ids[array_ids == video_token_id] = 2
+    return mm_token_type_ids
+
+
+class Qwen3VLProcessor(ProcessorMixin):
+    attributes = ["image_processor", "tokenizer", "video_processor"]
+    image_processor_class = "AutoImageProcessor"
+    video_processor_class = "AutoVideoProcessor"
+    tokenizer_class = ("Qwen2Tokenizer", "Qwen2TokenizerFast")
+
+    def __init__(self, image_processor=None, tokenizer=None, video_processor=None, chat_template=None):
+        super().__init__(image_processor, tokenizer, video_processor, chat_template=chat_template)
+
+        self.image_token = getattr(tokenizer, "image_token", "<|image_pad|>")
+        self.video_token = getattr(tokenizer, "video_token", "<|video_pad|>")
+        self.image_token_id = getattr(tokenizer, "image_token_id", tokenizer.convert_tokens_to_ids(self.image_token))
+        self.video_token_id = getattr(tokenizer, "video_token_id", tokenizer.convert_tokens_to_ids(self.video_token))
+        self.vision_start_token = getattr(tokenizer, "vision_start_token", "<|vision_start|>")
+        self.vision_end_token = getattr(tokenizer, "vision_end_token", "<|vision_end|>")
+        self.vision_start_token_id = getattr(
+            tokenizer, "vision_start_token_id", tokenizer.convert_tokens_to_ids(self.vision_start_token)
+        )
+        self.vision_end_token_id = getattr(
+            tokenizer, "vision_end_token_id", tokenizer.convert_tokens_to_ids(self.vision_end_token)
+        )
+
+    def image_token_counts_from_grids(self, image_grid_thw) -> list[int]:
+        """Return per-image text placeholder counts from processor grid metadata."""
+
+        if image_grid_thw is None:
+            return []
+        if hasattr(image_grid_thw, "dim") and image_grid_thw.dim() == 1:
+            grids = [image_grid_thw]
+        else:
+            grids = list(image_grid_thw)
+        return [image_token_count_from_grid(grid, self.image_processor.merge_size) for grid in grids]
+
+    def build_visual_placeholder(self, num_image_tokens: int) -> str:
+        return build_visual_placeholder(
+            num_image_tokens,
+            image_token=self.image_token,
+            vision_start_token=self.vision_start_token,
+            vision_end_token=self.vision_end_token,
+        )
+
+    def expand_image_pad_tokens(self, text: list[str], image_grid_thw) -> list[str]:
+        """Expand each single image pad in text to match packed visual tokens."""
+
+        image_token_counts = self.image_token_counts_from_grids(image_grid_thw)
+        index = 0
+        output = text.copy()
+        for i in range(len(output)):
+            while self.image_token in output[i]:
+                if index >= len(image_token_counts):
+                    raise ValueError("Text contains more image placeholders than image_grid_thw entries.")
+                output[i] = output[i].replace(self.image_token, "<|placeholder|>" * image_token_counts[index], 1)
+                index += 1
+            output[i] = output[i].replace("<|placeholder|>", self.image_token)
+        if index != len(image_token_counts):
+            raise ValueError("image_grid_thw contains more images than text placeholders.")
+        return output
+
+    def build_mm_token_type_ids(self, input_ids):
+        return build_mm_token_type_ids(input_ids, self.image_token_id, self.video_token_id)
+
+    def __call__(
+        self,
+        images=None,
+        text=None,
+        videos=None,
+        return_mm_token_type_ids: bool | None = None,
+        return_tensors=None,
+        **kwargs,
+    ) -> BatchFeature:
+        if text is None:
+            text = []
+        if not isinstance(text, list):
+            text = [text]
+        text = text.copy()
+
+        image_inputs = {}
+        image_grid_thw = None
+        if images is not None:
+            image_inputs = self.image_processor(images=images, **kwargs)
+            image_grid_thw = image_inputs["image_grid_thw"]
+
+        videos_inputs = {}
+        if videos is not None and self.video_processor is not None:
+            videos_inputs = self.video_processor(videos=videos, **kwargs)
+
+        if image_grid_thw is not None:
+            text = self.expand_image_pad_tokens(text, image_grid_thw)
+
+        text_inputs = self.tokenizer(text, return_tensors=return_tensors, **kwargs)
+
+        if return_mm_token_type_ids is None:
+            return_mm_token_type_ids = True
+
+        if return_mm_token_type_ids:
+            mm_token_type_ids = self.build_mm_token_type_ids(text_inputs["input_ids"])
+            text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
+
+        return BatchFeature(
+            data={
+                **text_inputs,
+                **image_inputs,
+                **videos_inputs,
+            },
+            tensor_type=return_tensors,
+        )
+
+
+__all__ = [
+    "DEFAULT_IMAGE_PAD",
+    "DEFAULT_VISION_END",
+    "DEFAULT_VISION_START",
+    "Qwen3VLProcessor",
+    "build_mm_token_type_ids",
+    "build_visual_placeholder",
+    "image_token_count_from_grid",
+]

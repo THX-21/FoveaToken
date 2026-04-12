@@ -1,0 +1,9 @@
+*.log
+*.codex
+*.vscode
+*.pyc
+*.whl
+__pycache__/
+logs/
+checkpoints/
+*.egg-info/
