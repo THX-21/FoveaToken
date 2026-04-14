@@ -7,21 +7,21 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 WORKSPACE_ROOT="$(cd -- "${PROJECT_ROOT}" && pwd)"
 
-export NNODES="${NNODES:-1}"
-export NUM_GPUS="${NUM_GPUS:-1}"
-export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-export MASTER_PORT="${MASTER_PORT:-29599}"
+export NNODES=1
+export NUM_GPUS=1
+export MASTER_ADDR="127.0.0.1"
+export MASTER_PORT=29599
 export WORLD_SIZE=$((NNODES * NUM_GPUS))
-export RANK="${RANK:-0}"
+export RANK=0
 
-NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-RUN_NAME="${RUN_NAME:-Qwen3.5-ft3-anyres24}"
-JSON_PATH="${JSON_PATH:-/mnt/data/GeoLLaVA-Data/ft3_whole_shuffle.json}"
-IMAGE_FOLDER="${IMAGE_FOLDER:-/mnt/data/GeoLLaVA-Data/jpg_images}"
-CKPT_PATH="${CKPT_PATH:-Qwen/Qwen3.5-9B}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
+NUM_TRAIN_EPOCHS=1
+RUN_NAME="Qwen3.5-ft3-anyres24"
+JSON_PATH="/mnt/data/GeoLLaVA-Data/ft3_whole_shuffle.json"
+IMAGE_FOLDER="/mnt/data/GeoLLaVA-Data/jpg_images"
+CKPT_PATH="Qwen/Qwen3.5-9B"
+OUTPUT_DIR="${PROJECT_ROOT}/checkpoints/${RUN_NAME}"
 
-export PYTHONPATH="${PROJECT_ROOT}/src:${PYTHONPATH}"
+export PYTHONPATH="${PROJECT_ROOT}/src"
 
 if python - <<'PY'
 import torch
@@ -56,7 +56,7 @@ if [[ -n "${LATEST_CHECKPOINT}" ]]; then
     RESUME_ARGS=(--resume_from_checkpoint "${LATEST_CHECKPOINT}")
 fi
 
-GRID_PINPOINTS="${IMAGE_GRID_PINPOINTS:-}"
+GRID_PINPOINTS=""
 if [[ -z "${GRID_PINPOINTS}" ]]; then
     GRID_PINPOINTS="["
     for width in $(seq 384 384 8192); do
