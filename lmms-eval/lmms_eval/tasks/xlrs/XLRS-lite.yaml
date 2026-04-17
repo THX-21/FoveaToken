@@ -1,4 +1,6 @@
 dataset_path: /mnt/data/XLRS-Bench-lite
+dataset_kwargs:
+  load_from_disk: true
 task: xlrs-lite
 test_split: train
 output_type: generate_until

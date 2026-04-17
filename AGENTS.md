@@ -124,8 +124,9 @@ Qwen3_5ForConditionalGeneration ← Qwen3VLForConditionalGeneration
 - `qwen35_hf.Qwen3_5ForConditionalGeneration`
 - `qwen35_hf.Qwen3_5Tokenizer`
 - `qwen35_hf.Qwen3VLProcessor`
+- `scripts/eval.sh` 当前默认 LoRA checkpoint 是 `checkpoints/Qwen3.5-ft3-anyres24/checkpoint-20030`。
 
-LoRA 评测方式：先加载 `BASE_MODEL`，再通过 `PeftModel.from_pretrained` 加载 `LORA_CHECKPOINT`。
+- `xlrs-lite` 当前任务 YAML（`lmms-eval/lmms_eval/tasks/xlrs/XLRS-lite.yaml`）通过 `dataset_kwargs.load_from_disk: true` 直接从本地磁盘数据集加载，避免 `datasets.load_dataset(...)` 写入 HF `.cache`。
 
 ---
 
