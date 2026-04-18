@@ -86,6 +86,9 @@ class Qwen3VLProcessor(ProcessorMixin):
             return [int(img_slot_token_count) for _ in grids]
         return [image_token_count_from_grid(grid, self.image_processor.merge_size) for grid in grids]
 
+    def uses_imgslot_placeholders(self) -> bool:
+        return getattr(self.image_processor, "img_slot_token_count", None) is not None
+
     def build_visual_placeholder(self, num_image_tokens: int) -> str:
         return build_visual_placeholder(
             num_image_tokens,
@@ -191,7 +194,9 @@ class Qwen3VLProcessor(ProcessorMixin):
 
         text_inputs = self.tokenizer(text, return_tensors=return_tensors, **kwargs)
 
-        if return_mm_token_type_ids is None:
+        if self.uses_imgslot_placeholders():
+            return_mm_token_type_ids = False
+        elif return_mm_token_type_ids is None:
             return_mm_token_type_ids = True
 
         if return_mm_token_type_ids:

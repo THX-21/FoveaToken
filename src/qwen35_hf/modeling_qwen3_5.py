@@ -2112,15 +2112,30 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3_5Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        # ImgSlot uses the language hidden width as its working dimension:
+        #   hidden_size = D
+        #   m = img_slot_m anchor/query tokens per image block
+        #   k = img_slot_k selected visual tokens per image block
+        # Each block consumes one fixed text span of length m + k.
         hidden_size = config.text_config.hidden_size
         num_anchor_tokens = max(1, int(getattr(config, "img_slot_m", 4)))
         num_heads = next((h for h in (16, 12, 8, 6, 4, 3, 2, 1) if hidden_size % h == 0), 1)
         self.imgslot_num_heads = num_heads
-        self.imgslot_a_tokens = nn.Parameter(torch.randn(num_anchor_tokens, hidden_size) * 0.02)
+        # Learnable anchor seed A0: weight [m, D]. During prefill it is
+        # conditioned on text context to produce the runtime anchor A per block.
+        self.imgslot_a_tokens = nn.Embedding(num_anchor_tokens, hidden_size)
+        # Text-conditioned anchor update:
+        #   Q from anchor tokens [m, D]
+        #   K/V from text tokens [T_text, D]
+        #   output anchor tokens [m, D]
         self.imgslot_text_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.imgslot_text_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.imgslot_text_v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.imgslot_text_o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        # Visual scoring branch:
+        #   Q from visual pool V [N, D]
+        #   K from anchor A [m, D]
+        # Produces one scalar score per visual token: [N].
         self.imgslot_img_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.imgslot_img_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.imgslot_attn_norm = nn.LayerNorm(hidden_size)
@@ -2130,6 +2145,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             nn.Linear(hidden_size * 4, hidden_size),
         )
         self.imgslot_ffn_norm = nn.LayerNorm(hidden_size)
+        # Runtime state is populated during multimodal prefill. Shape summary:
+        #   states: List[batch][block] of dicts
+        #   state["span"] = (start, length=m+k)
+        #   state["A"] = [m, D], state["V"] = [N, D]
+        #   state["V_topk"] = [k, D], state["score_prev"] = [N]
+        #   text_tokens[batch] = [T_ctx, D], truncated during decode.
         self._imgslot_runtime = {"enabled": False, "states": [], "delta": 1, "step": 0}
 
         self.post_init()
@@ -2141,92 +2162,280 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         self.model.set_input_embeddings(value)
 
     def _imgslot_is_enabled(self) -> bool:
-        return bool(getattr(self.config, "img_slot_enable", False))
+        return bool(self.config.img_slot_enable)
 
     def _imgslot_config(self) -> dict[str, float | int]:
-        if self._imgslot_is_enabled() and getattr(self.config, "img_slot_tile_size", None) is None:
+        """Return normalized ImgSlot hyperparameters.
+
+        Shapes implied by these values:
+            m: anchor rows in A, state["A"] has shape [m, D]
+            k: selected visual rows, state["V_topk"] has shape [k, D]
+            m + k: fixed placeholder span length in input_ids
+        """
+        if self._imgslot_is_enabled() and self.config.img_slot_tile_size is None:
             raise ValueError("img_slot_tile_size is required when img_slot_enable=true.")
         return {
-            "m": int(getattr(self.config, "img_slot_m", 4)),
-            "k": int(getattr(self.config, "img_slot_k", 64)),
-            "delta": max(1, int(getattr(self.config, "img_slot_delta", 8))),
-            "beta": float(getattr(self.config, "img_slot_beta", 0.3)),
-            "lam": float(getattr(self.config, "img_slot_lambda", 0.9)),
+            "m": int(self.config.img_slot_m),
+            "k": int(self.config.img_slot_k),
+            "delta": int(self.config.img_slot_delta),
+            "beta": float(self.config.img_slot_beta),
+            "lam": float(self.config.img_slot_lambda),
+            "max_text_tokens": int(self.config.img_slot_max_text_tokens),
         }
 
-    def _run_imgslot_text_block(self, anchor_tokens, text_tokens):
-        num_heads = self.imgslot_num_heads
-        hidden_dim = anchor_tokens.shape[-1]
-        head_dim = hidden_dim // num_heads
-        query = self.imgslot_text_q_proj(anchor_tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
-        key = self.imgslot_text_k_proj(text_tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
-        value = self.imgslot_text_v_proj(text_tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
-        attention_weights = torch.softmax(torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(head_dim), dim=-1)
-        context = torch.matmul(attention_weights, value).transpose(1, 2).reshape(1, anchor_tokens.shape[0], hidden_dim)
-        context = self.imgslot_attn_norm(anchor_tokens.unsqueeze(0) + self.imgslot_text_o_proj(context))
-        context = self.imgslot_ffn_norm(context + self.imgslot_ffn(context))
-        return context[0]
+    def _project_imgslot_text_tokens(self, text_tokens):
+        """Project text context once and keep it in ImgSlot runtime.
 
-    def _score_imgslot_visual_tokens(self, visual_pool, anchor_tokens):
+        Args:
+            text_tokens: [T_text, D].
+
+        Returns:
+            text_key/text_value: [1, H, T_text, Dh].
+        """
+        num_heads = self.imgslot_num_heads
+        hidden_dim = text_tokens.shape[-1]
+        head_dim = hidden_dim // num_heads
+        text_key = self.imgslot_text_k_proj(text_tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
+        text_value = self.imgslot_text_v_proj(text_tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
+        return text_key, text_value
+
+    def _project_imgslot_visual_pool(self, visual_pool):
+        """Project static visual tokens once for repeated Top-K scoring.
+
+        Args:
+            visual_pool: [N, D].
+
+        Returns:
+            visual_query: [1, H, N, Dh].
+        """
         num_heads = self.imgslot_num_heads
         hidden_dim = visual_pool.shape[-1]
         head_dim = hidden_dim // num_heads
-        query = self.imgslot_img_q_proj(visual_pool).view(1, -1, num_heads, head_dim).transpose(1, 2)
-        key = self.imgslot_img_k_proj(anchor_tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
-        attention_logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(head_dim)
-        return attention_logits.mean(1).max(-1).values[0]
+        visual_query = self.imgslot_img_q_proj(visual_pool).view(1, -1, num_heads, head_dim).transpose(1, 2)
+        return visual_query
 
-    def _build_imgslot_state(self, visual_pool, text_tokens, span_start: int, span_length: int):
+    def _run_imgslot_text_blocks(self, anchor_tokens, text_key, text_value, text_mask=None):
+        """Batched text-conditioned anchor update for one or many blocks.
+
+        Args:
+            anchor_tokens: [R, m, D], previous/current anchors for R blocks.
+            text_key/text_value: [R, H, T_max, Dh], cached text projections.
+            text_mask: [R, T_max] bool mask for padded text positions.
+
+        Returns:
+            [R, m, D] updated anchor tokens.
+        """
+        num_heads = self.imgslot_num_heads
+        hidden_dim = anchor_tokens.shape[-1]
+        head_dim = hidden_dim // num_heads
+        block_count = anchor_tokens.shape[0]
+        # query: [R, H, m, Dh].
+        query = self.imgslot_text_q_proj(anchor_tokens).view(block_count, -1, num_heads, head_dim).transpose(1, 2)
+        # attention_logits: [R, H, m, T_max].
+        attention_logits = torch.matmul(query.float(), text_key.float().transpose(-2, -1)) / math.sqrt(head_dim)
+        if text_mask is not None:
+            attention_logits = attention_logits.masked_fill(~text_mask[:, None, None, :], torch.finfo(attention_logits.dtype).min)
+        attention_logits = attention_logits - attention_logits.amax(dim=-1, keepdim=True)
+        attention_weights = torch.softmax(attention_logits, dim=-1).to(text_value.dtype)
+        # context before output projection: [R, m, D].
+        context = torch.matmul(attention_weights.float(), text_value.float()).transpose(1, 2).reshape(block_count, anchor_tokens.shape[1], hidden_dim)
+        context = context.to(anchor_tokens.dtype)
+        context = self.imgslot_attn_norm(anchor_tokens + self.imgslot_text_o_proj(context))
+        return self.imgslot_ffn_norm(context + self.imgslot_ffn(context))
+
+    def _score_imgslot_visual_tokens(self, visual_queries, anchor_tokens, visual_mask=None):
+        """Score visual tokens for one or many blocks in one batched pass.
+
+        Args:
+            visual_queries: [R, H, N_max, Dh], cached/padded visual projections.
+            anchor_tokens: [R, m, D], current anchor tokens for R blocks.
+            visual_mask: [R, N_max] bool mask for valid visual rows.
+
+        Returns:
+            [R, N_max] scalar score per visual row. Invalid padded rows are
+            filled with `finfo.min` so downstream `topk` ignores them.
+        """
+        num_heads = self.imgslot_num_heads
+        hidden_dim = anchor_tokens.shape[-1]
+        head_dim = hidden_dim // num_heads
+        block_count = anchor_tokens.shape[0]
+        # visual_queries: [R, H, N_max, Dh], key: [R, H, m, Dh].
+        key = self.imgslot_img_k_proj(anchor_tokens).view(block_count, -1, num_heads, head_dim).transpose(1, 2)
+        # attention_logits: [R, H, N_max, m].
+        attention_logits = torch.matmul(visual_queries.float(), key.float().transpose(-2, -1)) / math.sqrt(head_dim)
+        # scores: [R, N_max]. Mean over heads then max over anchors.
+        scores = attention_logits.mean(1).max(-1).values
+        if visual_mask is not None:
+            scores = scores.masked_fill(~visual_mask, torch.finfo(scores.dtype).min)
+        return scores
+
+    def _build_imgslot_states_for_sample(self, visual_pools, text_tokens, spans, text_key=None, text_value=None):
+        """Create initial ImgSlot replacements for all blocks in one sample.
+
+        Args:
+            visual_pools: List[[N_i, D]] for all blocks in one sample.
+            text_tokens: [T_text, D], shared non-image prompt embeddings.
+            spans: List[(start, length)] for the sample's image blocks.
+            text_key/text_value: [1, H, T_text, Dh], shared projected text cache.
+
+        Returns:
+            replacements: List[[m + k, D]] in block order.
+            states: List[dict], one runtime state per block.
+        """
+        if len(visual_pools) != len(spans):
+            raise ValueError("ImgSlot sample visual block count must match sample span count.")
+        if not visual_pools:
+            return [], []
+
         imgslot_config = self._imgslot_config()
-        num_anchors = max(1, int(imgslot_config["m"]))
-        topk_target = max(1, int(imgslot_config["k"]))
+        num_anchors = int(imgslot_config["m"])
+        topk_target = int(imgslot_config["k"])
         expected_length = num_anchors + topk_target
-        if span_length != expected_length:
-            raise ValueError(f"ImgSlot span length {span_length} must equal m+k ({expected_length}).")
+        visual_device = visual_pools[0].device
+        visual_dtype = visual_pools[0].dtype
         if text_tokens.numel() == 0:
-            text_tokens = visual_pool
-        anchor_seed = self.imgslot_a_tokens[:num_anchors].to(device=visual_pool.device, dtype=visual_pool.dtype)
-        anchor_tokens = self._run_imgslot_text_block(anchor_seed, text_tokens.to(visual_pool.dtype))
-        scores = self._score_imgslot_visual_tokens(visual_pool, anchor_tokens)
-        topk_select = max(1, min(topk_target, visual_pool.shape[0]))
-        topk_idx = torch.topk(scores, k=topk_select, dim=0).indices
-        visual_topk = visual_pool[topk_idx]
-        if topk_select < topk_target:
-            visual_topk = torch.cat([visual_topk, visual_topk[-1:].repeat(topk_target - topk_select, 1)], dim=0)
-        replacement = torch.cat([anchor_tokens, visual_topk], dim=0)
-        state = {
-            "span": (int(span_start), int(span_length)),
-            "A": anchor_tokens.detach(),
-            "V": visual_pool.detach(),
-            "T": text_tokens.detach(),
-            "V_topk": visual_topk.detach(),
-            "score_prev": scores.detach(),
-            "topk_idx": topk_idx.detach(),
-        }
-        return replacement, state
+            raise ValueError("ImgSlot requires non-empty text_tokens.")
+        if text_key is None or text_value is None:
+            text_key, text_value = self._project_imgslot_text_tokens(text_tokens.to(visual_dtype))
 
-    def _refresh_imgslot_state(self, state: dict[str, Any]):
+        block_count = len(visual_pools)
+        # visual_queries_padded: [R, H, N_max, Dh], visual_mask: [R, N_max].
+        visual_queries = []
+        visual_lengths = []
+        sanitized_pools = []
+        for visual_pool in visual_pools:
+            sanitized_pools.append(visual_pool)
+            visual_query = self._project_imgslot_visual_pool(visual_pool)
+            visual_queries.append(visual_query[0])  # [H, N_i, Dh]
+            visual_lengths.append(visual_pool.shape[0])
+        max_visual_tokens = max(visual_lengths)
+        num_heads = self.imgslot_num_heads
+        head_dim = sanitized_pools[0].shape[-1] // num_heads
+        visual_queries_padded = sanitized_pools[0].new_zeros((block_count, num_heads, max_visual_tokens, head_dim))
+        visual_mask = torch.zeros((block_count, max_visual_tokens), dtype=torch.bool, device=visual_device)
+        for block_idx, visual_query in enumerate(visual_queries):
+            visual_len = visual_query.shape[1]
+            visual_queries_padded[block_idx, :, :visual_len, :] = visual_query
+            visual_mask[block_idx, :visual_len] = True
+
+        # anchor_seed / anchor_tokens: [R, m, D].
+        anchor_seed = self.imgslot_a_tokens.weight[:num_anchors].to(device=visual_device, dtype=visual_dtype)
+        anchor_seed = anchor_seed.unsqueeze(0).expand(block_count, -1, -1)
+        text_key = text_key.to(device=visual_device, dtype=visual_dtype).expand(block_count, -1, -1, -1)
+        text_value = text_value.to(device=visual_device, dtype=visual_dtype).expand(block_count, -1, -1, -1)
+        anchor_tokens = self._run_imgslot_text_blocks(anchor_seed, text_key, text_value)
+
+        # scores_padded: [R, N_max].
+        scores_padded = self._score_imgslot_visual_tokens(visual_queries_padded, anchor_tokens, visual_mask=visual_mask)
+        replacements = []
+        states = []
+        for block_idx, ((span_start, span_length), visual_pool) in enumerate(zip(spans, sanitized_pools)):
+            if span_length != expected_length:
+                raise ValueError(f"ImgSlot span length {span_length} must equal m+k ({expected_length}).")
+            scores = scores_padded[block_idx, : visual_pool.shape[0]]
+            topk_idx = torch.topk(scores, k=topk_target, dim=0).indices
+            visual_topk = visual_pool[topk_idx]
+            replacement = torch.cat([anchor_tokens[block_idx], visual_topk], dim=0)
+            replacements.append(replacement)
+            states.append(
+                {
+                    "span": (int(span_start), int(span_length)),
+                    "A": anchor_tokens[block_idx].detach(),
+                    "V": visual_pool.detach(),
+                    "V_q": visual_queries_padded[block_idx : block_idx + 1, :, : visual_pool.shape[0], :].detach(),
+                    "T": text_tokens.detach(),
+                    "T_k": text_key[block_idx : block_idx + 1].detach(),
+                    "T_v": text_value[block_idx : block_idx + 1].detach(),
+                    "V_topk": visual_topk.detach(),
+                    "score_prev": scores.detach(),
+                    "topk_idx": topk_idx.detach(),
+                }
+            )
+        return replacements, states
+
+    def _refresh_imgslot_states_for_sample(self, states: list[dict[str, Any]], text_tokens, text_key, text_value):
+        """Refresh all block states in one sample with one batched text pass.
+
+        Args:
+            states: List of R block states for one batch item.
+            text_tokens: [T_ctx, D], retained in runtime state.
+            text_key/text_value: [1, H, T_ctx, Dh], projected text cache.
+
+        Returns:
+            slot_records: List of refreshed slot descriptors. Each record has
+                tokens [m + k, D] and span metadata used for batched KV rewrite.
+        """
+        if not states:
+            return []
+
         imgslot_config = self._imgslot_config()
-        visual_pool = state["V"]
-        text_tokens = state.get("T", visual_pool)
-        prev_anchor = state["A"]
-        anchor_tokens = self._run_imgslot_text_block(prev_anchor.to(visual_pool.dtype), text_tokens.to(visual_pool.dtype))
-        anchor_tokens = (1.0 - imgslot_config["beta"]) * prev_anchor + imgslot_config["beta"] * anchor_tokens
-        scores_current = self._score_imgslot_visual_tokens(visual_pool, anchor_tokens)
-        scores = imgslot_config["lam"] * state["score_prev"] + (1.0 - imgslot_config["lam"]) * scores_current
-        topk_target = max(1, int(imgslot_config["k"]))
-        topk_select = max(1, min(topk_target, visual_pool.shape[0]))
-        topk_idx = torch.topk(scores, k=topk_select, dim=0).indices
-        visual_topk = visual_pool[topk_idx]
-        if topk_select < topk_target:
-            visual_topk = torch.cat([visual_topk, visual_topk[-1:].repeat(topk_target - topk_select, 1)], dim=0)
-        state["A"] = anchor_tokens.detach()
-        state["V_topk"] = visual_topk.detach()
-        state["score_prev"] = scores.detach()
-        state["topk_idx"] = topk_idx.detach()
-        return state
+        visual_dtype = states[0]["V"].dtype
+        visual_device = states[0]["V"].device
+        block_count = len(states)
+        topk_target = int(imgslot_config["k"])
+
+        text_key = text_key.to(device=visual_device, dtype=visual_dtype).expand(block_count, -1, -1, -1)
+        text_value = text_value.to(device=visual_device, dtype=visual_dtype).expand(block_count, -1, -1, -1)
+        anchors_prev = torch.stack([state["A"].to(device=visual_device, dtype=visual_dtype) for state in states], dim=0)
+        # anchors_candidate / anchors_new: [R, m, D].
+        anchors_candidate = self._run_imgslot_text_blocks(anchors_prev, text_key, text_value)
+        anchors_new = (1.0 - imgslot_config["beta"]) * anchors_prev + imgslot_config["beta"] * anchors_candidate
+
+        # visual_queries_padded: [R, H, N_max, Dh], visual_mask: [R, N_max].
+        visual_queries = [state["V_q"] for state in states]
+        visual_lengths = [visual_query.shape[-2] for visual_query in visual_queries]
+        max_visual_tokens = max(visual_lengths)
+        num_heads = self.imgslot_num_heads
+        head_dim = anchors_prev.shape[-1] // num_heads
+        visual_queries_padded = anchors_prev.new_zeros((block_count, num_heads, max_visual_tokens, head_dim))
+        visual_mask = torch.zeros((block_count, max_visual_tokens), dtype=torch.bool, device=visual_device)
+        for state_idx, visual_query in enumerate(visual_queries):
+            visual_len = visual_query.shape[-2]
+            visual_queries_padded[state_idx, :, :visual_len, :] = visual_query[0].to(device=visual_device, dtype=visual_dtype)
+            visual_mask[state_idx, :visual_len] = True
+        scores_current_padded = self._score_imgslot_visual_tokens(
+            visual_queries_padded,
+            anchors_new,
+            visual_mask=visual_mask,
+        )
+
+        slot_records = []
+        for state_idx, state in enumerate(states):
+            visual_pool = state["V"]  # [N, D]
+            scores_current = scores_current_padded[state_idx, : visual_pool.shape[0]]
+            scores = imgslot_config["lam"] * state["score_prev"] + (1.0 - imgslot_config["lam"]) * scores_current
+            topk_idx = torch.topk(scores, k=topk_target, dim=0).indices
+            visual_topk = visual_pool[topk_idx]
+            state["A"] = anchors_new[state_idx].detach()
+            state["V_topk"] = visual_topk.detach()
+            state["score_prev"] = scores.detach()
+            state["topk_idx"] = topk_idx.detach()
+            state["T"] = text_tokens.to(state["V"].device, state["V"].dtype).detach()
+            state["T_k"] = text_key[state_idx : state_idx + 1].detach()
+            state["T_v"] = text_value[state_idx : state_idx + 1].detach()
+            states[state_idx] = state
+            span_start, span_length = state["span"]
+            slot_records.append(
+                {
+                    "state": state,
+                    "span_start": span_start,
+                    "span_length": span_length,
+                    "slot_tokens": torch.cat([state["A"], state["V_topk"]], dim=0)[:span_length],
+                }
+            )
+        return slot_records
 
     def _image_placeholder_spans(self, input_ids: torch.Tensor) -> list[list[tuple[int, int]]]:
+        """Find contiguous image-token spans for every sample.
+
+        Args:
+            input_ids: [B, S].
+
+        Returns:
+            List of length B. Each item is a list of (start, length) spans.
+            With ImgSlot enabled, each length must equal m + k and corresponds
+            to one image block, not necessarily one original image.
+        """
         image_token_id = self.config.image_token_id
         all_spans: list[list[tuple[int, int]]] = []
         for sample_ids in input_ids:
@@ -2244,125 +2453,267 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         return all_spans
 
     def _build_imgslot_visual_pools(self, pixel_values, image_grid_thw):
+        """Run the vision tower and return one visual pool per image block.
+
+        Args:
+            pixel_values: [sum(raw_block_patches), patch_volume].
+            image_grid_thw: [num_blocks, 3].
+
+        Returns:
+            List length num_blocks; each pool is [N_block, D].
+        """
         if pixel_values is None or image_grid_thw is None:
             return None
         image_outputs = self.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, return_dict=True)
-        return [pool.detach() for pool in image_outputs.pooler_output]
+        return list(image_outputs.pooler_output)
 
     def _prebuild_imgslot_inputs(self, input_ids, attention_mask, inputs_embeds, visual_pools):
+        """Replace image placeholder embeddings with initial ImgSlot content.
+
+        Args:
+            input_ids: [B, S], contains image_token_id spans of length m + k.
+            attention_mask: [B, S] or None.
+            inputs_embeds: [B, S, D], token embeddings before visual injection.
+            visual_pools: List[[N_i, D]], one item per image block span.
+
+        Returns:
+            new_inputs_embeds: [B, S, D], same sequence length with image spans
+                overwritten by [A, V_topk].
+            attention_mask: [B, S].
+        """
+        # spans_by_sample: List[B][num_blocks_in_sample] of (start, length).
         spans_by_sample = self._image_placeholder_spans(input_ids)
         if sum(len(spans) for spans in spans_by_sample) != len(visual_pools):
             raise ValueError("ImgSlot visual block count must match image placeholder span count.")
         batch_states: list[list[dict[str, Any]]] = []
         pool_index = 0
+        # Clone instead of editing caller-owned embeddings in-place.
+        # Shape stays [B, S, D].
         new_inputs_embeds = inputs_embeds.clone()
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
+        imgslot_config = self._imgslot_config()
+        max_text_tokens = int(imgslot_config["max_text_tokens"])
         runtime_text_tokens: list[torch.Tensor] = []
+        runtime_text_keys: list[torch.Tensor] = []
+        runtime_text_values: list[torch.Tensor] = []
         for batch_idx, spans in enumerate(spans_by_sample):
+            # valid_text_mask: [S]. Excludes image slots and padding.
             valid_text_mask = (input_ids[batch_idx] != self.config.image_token_id) & attention_mask[batch_idx].bool()
-            text_tokens = inputs_embeds[batch_idx][valid_text_mask]
+            # text_tokens: [T_text, D], used to condition every block in sample.
+            text_tokens = inputs_embeds[batch_idx][valid_text_mask][-max_text_tokens:]
+            text_key = text_value = None
+            if text_tokens.numel() > 0:
+                # text_key/text_value: [1, H, T_text, Dh]. These are shared by
+                # all image blocks in the sample and extended incrementally in decode.
+                text_key, text_value = self._project_imgslot_text_tokens(text_tokens)
             sample_states: list[dict[str, Any]] = []
-            for span_start, span_length in spans:
-                visual_pool = visual_pools[pool_index].to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            sample_visual_pools = []
+            for _span_start, _span_length in spans:
+                # visual_pool: [N_block, D].
+                sample_visual_pools.append(visual_pools[pool_index].to(device=inputs_embeds.device, dtype=inputs_embeds.dtype))
                 pool_index += 1
-                replacement, state = self._build_imgslot_state(visual_pool, text_tokens, span_start, span_length)
+            # replacements: List[[m + k, D]], sample_states: List[dict].
+            replacements, sample_states = self._build_imgslot_states_for_sample(
+                sample_visual_pools,
+                text_tokens,
+                spans,
+                text_key=text_key,
+                text_value=text_value,
+            )
+            for replacement, (span_start, span_length) in zip(replacements, spans):
                 new_inputs_embeds[batch_idx, span_start : span_start + span_length] = replacement.to(inputs_embeds.dtype)
-                sample_states.append(state)
             batch_states.append(sample_states)
             runtime_text_tokens.append(text_tokens.detach())
+            runtime_text_keys.append(text_key.detach())
+            runtime_text_values.append(text_value.detach())
         self._imgslot_runtime = {
             "enabled": True,
             "states": batch_states,
-            "delta": self._imgslot_config()["delta"],
+            "delta": imgslot_config["delta"],
             "step": 0,
             "text_tokens": runtime_text_tokens,
+            "text_keys": runtime_text_keys,
+            "text_values": runtime_text_values,
         }
         return new_inputs_embeds, attention_mask
 
     def _slot_kv_for_layer(self, layer, slot_tokens, slot_positions):
-        attention = getattr(layer, "self_attn", None)
-        if attention is None or not all(hasattr(attention, attr) for attr in ("k_proj", "v_proj", "k_norm")):
-            return None
+        """Project refreshed slot tokens into one full-attention layer's KV.
+
+        Args:
+            layer: one decoder layer. Only full-attention layers with k_proj,
+                v_proj and k_norm are supported.
+            slot_tokens: [R, m + k, D], refreshed [A, V_topk] for R blocks.
+            slot_positions: [R, m + k], absolute text positions for each block.
+
+        Returns:
+            (key_states, value_states) with shapes:
+                key_states: [R, num_kv_heads, m + k, head_dim]
+                value_states: [R, num_kv_heads, m + k, head_dim]
+            or None if the layer has no compatible full-attention KV path.
+        """
+        attention = layer.self_attn
         layer_device = next(layer.parameters()).device
         slot_tokens = slot_tokens.to(device=layer_device)
         slot_positions = slot_positions.to(device=layer_device)
         input_shape = slot_tokens.shape[:-1]
         hidden_shape = (*input_shape, -1, attention.head_dim)
+        # key/value before transpose: [R, m + k, num_kv_heads, head_dim].
+        # After transpose: [R, num_kv_heads, m + k, head_dim].
         key_states = attention.k_norm(attention.k_proj(slot_tokens).view(hidden_shape)).transpose(1, 2)
         value_states = attention.v_proj(slot_tokens).view(hidden_shape).transpose(1, 2)
+        # apply_rotary_pos_emb expects a query tensor too. The query result is
+        # discarded; only RoPE-rotated key_states are needed for cache overwrite.
         dummy_query = key_states.new_zeros((slot_tokens.shape[0], attention.config.num_attention_heads, slot_tokens.shape[1], attention.head_dim))
+        # position_embeddings cos/sin are broadcast over [R, heads, S=m+k, Dh].
         position_embeddings = self.model.language_model.rotary_emb(slot_tokens, slot_positions)
         _, key_states = apply_rotary_pos_emb(dummy_query, key_states, *position_embeddings)
         return key_states, value_states
 
     def _overwrite_cache_layer(self, past_key_values, layer_idx: int, batch_idx: int, span_start: int, span_end: int, key_states, value_states) -> bool:
-        if isinstance(past_key_values, (tuple, list)):
-            if layer_idx >= len(past_key_values):
-                return False
-            layer_past = past_key_values[layer_idx]
-            if not isinstance(layer_past, (tuple, list)) or len(layer_past) < 2:
-                return False
-            layer_past[0][batch_idx, :, span_start:span_end] = key_states[0].to(layer_past[0].dtype)
-            layer_past[1][batch_idx, :, span_start:span_end] = value_states[0].to(layer_past[1].dtype)
-            return True
-        layers = getattr(past_key_values, "layers", None)
-        if layers is None or layer_idx >= len(layers):
+        """Overwrite one block span in a single layer's KV cache.
+
+        Args:
+            past_key_values: HF Cache object or legacy tuple/list cache.
+            layer_idx: target decoder layer index.
+            batch_idx: target sample index in batch.
+            span_start/span_end: cache sequence slice [start, end), length m+k.
+            key_states: [1, num_kv_heads, m + k, head_dim].
+            value_states: [1, num_kv_heads, m + k, head_dim].
+        """
+        cache_layer = past_key_values.layers[layer_idx]
+        keys = cache_layer.keys
+        values = cache_layer.values
+        if keys.numel() == 0 or span_end > keys.shape[-2]:
             return False
-        cache_layer = layers[layer_idx]
-        keys = getattr(cache_layer, "keys", None)
-        values = getattr(cache_layer, "values", None)
-        if keys is None or values is None or keys.numel() == 0 or span_end > keys.shape[-2]:
-            return False
+        # keys/values: [B, num_kv_heads, cache_seq_len, head_dim].
         keys[batch_idx, :, span_start:span_end] = key_states[0].to(keys.dtype)
         values[batch_idx, :, span_start:span_end] = value_states[0].to(values.dtype)
         return True
 
     def _maybe_refresh_imgslot_cache(self, past_key_values):
-        runtime = getattr(self, "_imgslot_runtime", None)
-        if not runtime or not runtime.get("enabled") or past_key_values is None:
+        """Periodically refresh every block and locally overwrite KV cache.
+
+        Args:
+            past_key_values: populated cache from generation prefill/decode.
+
+        Behavior:
+            - Text token cache remains append-only.
+            - Each block state refreshes A and V_topk every `delta` decode steps.
+            - Only full-attention layer KV slices at state["span"] are overwritten.
+        """
+        runtime = self._imgslot_runtime
+        if not runtime["enabled"] or past_key_values is None:
             return past_key_values
         runtime["step"] += 1
         if runtime["step"] % runtime["delta"]:
             return past_key_values
         layers = self.model.language_model.layers
-        layer_types = getattr(self.config.text_config, "layer_types", None) or []
+        layer_types = self.config.text_config.layer_types
+        text_tokens_by_batch = runtime["text_tokens"]
+        text_keys_by_batch = runtime["text_keys"]
+        text_values_by_batch = runtime["text_values"]
+        refreshed_records = []
         for batch_idx, states in enumerate(runtime["states"]):
-            for state_idx, state in enumerate(states):
-                text_tokens = runtime.get("text_tokens", [])[batch_idx]
-                if text_tokens.numel() > 0:
-                    state["T"] = text_tokens.to(state["V"].device, state["V"].dtype).detach()
-                state = self._refresh_imgslot_state(state)
-                states[state_idx] = state
-                span_start, span_length = state["span"]
-                span_end = span_start + span_length
-                slot_tokens = torch.cat([state["A"], state["V_topk"]], dim=0)[:span_length]
-                slot_tokens = slot_tokens.to(device=state["V"].device, dtype=state["V"].dtype).unsqueeze(0)
-                slot_positions = torch.arange(span_start, span_end, device=slot_tokens.device, dtype=torch.long).unsqueeze(0)
-                for layer_idx, layer in enumerate(layers):
-                    if layer_idx < len(layer_types) and layer_types[layer_idx] != "full_attention":
-                        continue
-                    kv = self._slot_kv_for_layer(layer, slot_tokens, slot_positions)
-                    if kv is None:
-                        continue
-                    self._overwrite_cache_layer(past_key_values, layer_idx, batch_idx, span_start, span_end, kv[0], kv[1])
+            if batch_idx >= len(text_tokens_by_batch) or batch_idx >= len(text_keys_by_batch) or batch_idx >= len(text_values_by_batch):
+                continue
+            # text_tokens: [T_ctx, D], includes prompt text plus generated
+            # hidden states accumulated by _append_imgslot_text_hidden.
+            sample_records = self._refresh_imgslot_states_for_sample(
+                states,
+                text_tokens_by_batch[batch_idx],
+                text_keys_by_batch[batch_idx],
+                text_values_by_batch[batch_idx],
+            )
+            for record in sample_records:
+                record["batch_idx"] = batch_idx
+                refreshed_records.append(record)
+        if not refreshed_records:
+            return past_key_values
+
+        # KV projection is batched per full-attention layer. Instead of launching
+        # k_proj/v_proj/RoPE for every block-layer pair, each layer sees:
+        #   slot_tokens: [R_total, m + k, D]
+        #   slot_positions: [R_total, m + k]
+        # then individual rows are scattered back into their fixed cache spans.
+        for layer_idx, layer in enumerate(layers):
+            if layer_idx < len(layer_types) and layer_types[layer_idx] != "full_attention":
+                continue
+            layer_device = next(layer.parameters()).device
+            slot_tokens = torch.stack(
+                [record["slot_tokens"].to(device=layer_device) for record in refreshed_records],
+                dim=0,
+            )
+            slot_positions = torch.stack(
+                [
+                    torch.arange(
+                        record["span_start"],
+                        record["span_start"] + record["span_length"],
+                        device=layer_device,
+                        dtype=torch.long,
+                    )
+                    for record in refreshed_records
+                ],
+                dim=0,
+            )
+            kv = self._slot_kv_for_layer(layer, slot_tokens, slot_positions)
+            if kv is None:
+                continue
+            key_states, value_states = kv
+            for record_idx, record in enumerate(refreshed_records):
+                span_start = record["span_start"]
+                span_end = span_start + record["span_length"]
+                self._overwrite_cache_layer(
+                    past_key_values,
+                    layer_idx,
+                    record["batch_idx"],
+                    span_start,
+                    span_end,
+                    key_states[record_idx : record_idx + 1],
+                    value_states[record_idx : record_idx + 1],
+                )
         return past_key_values
 
     def _append_imgslot_text_hidden(self, hidden_states, past_key_values):
+        """Append the latest generated hidden state to ImgSlot text context.
+
+        Args:
+            hidden_states: [B, S_step, D], output of the language model call.
+                During decode S_step is normally 1; during prefill this method
+                is skipped because past_key_values is None.
+            past_key_values: non-None only after prefill, used as a decode flag.
+        """
         runtime = getattr(self, "_imgslot_runtime", None)
         if not runtime or not runtime.get("enabled") or past_key_values is None or hidden_states is None:
             return
         if hidden_states.shape[1] == 0:
             return
-        last_hidden = hidden_states[:, -1:, :].detach()
+        last_hidden = hidden_states[:, -1:, :].detach()  # [B, 1, D]
         text_tokens = runtime.setdefault("text_tokens", [])
+        text_keys = runtime.setdefault("text_keys", [])
+        text_values = runtime.setdefault("text_values", [])
         if len(text_tokens) != last_hidden.shape[0]:
             return
-        max_text_tokens = int(getattr(self.config, "img_slot_max_text_tokens", 512))
+        if len(text_keys) != last_hidden.shape[0] or len(text_values) != last_hidden.shape[0]:
+            return
+        max_text_tokens = int(self._imgslot_config()["max_text_tokens"])
         for batch_idx in range(last_hidden.shape[0]):
+            # new_key/new_value: [1, H, 1, Dh]. They are appended to the
+            # projected text cache so refresh can reuse historical K/V directly.
+            new_key, new_value = self._project_imgslot_text_tokens(last_hidden[batch_idx])
+            # text_tokens[batch_idx]: [T_ctx, D] after append/truncation.
             text_tokens[batch_idx] = torch.cat([text_tokens[batch_idx].to(last_hidden.device), last_hidden[batch_idx]], dim=0)[
                 -max_text_tokens:
             ].detach()
+            text_keys[batch_idx] = torch.cat(
+                [text_keys[batch_idx].to(new_key.device, new_key.dtype), new_key],
+                dim=-2,
+            )[:, :, -max_text_tokens:, :].detach()
+            text_values[batch_idx] = torch.cat(
+                [text_values[batch_idx].to(new_value.device, new_value.dtype), new_value],
+                dim=-2,
+            )[:, :, -max_text_tokens:, :].detach()
 
     @auto_docstring
     def get_video_features(
@@ -2462,10 +2813,26 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         ```
         """
         pre_refresh_past_key_values = past_key_values
+        imgslot_first_prefill = bool(kwargs.pop("imgslot_first_prefill", False))
         if self._imgslot_is_enabled() and past_key_values is not None:
+            # Decode path. input_ids/inputs_embeds normally contain only the
+            # current token ([B, 1] or [B, 1, D]); past_key_values already holds
+            # the fixed IMG_SLOT spans from prefill. Refresh may overwrite only
+            # those cached slot positions before the current token is appended.
             past_key_values = self._maybe_refresh_imgslot_cache(past_key_values)
 
-        if self._imgslot_is_enabled() and past_key_values is None and input_ids is not None and pixel_values is not None:
+        if (
+            self._imgslot_is_enabled()
+            and (imgslot_first_prefill or past_key_values is None)
+            and input_ids is not None
+            and pixel_values is not None
+        ):
+            # Prefill path. Shapes:
+            #   input_ids: [B, S]
+            #   inputs_embeds: [B, S, D]
+            #   pixel_values: [sum(raw_block_patches), patch_volume]
+            #   image_grid_thw: [num_blocks, 3]
+            # Image spans in input_ids already have fixed length m + k per block.
             if inputs_embeds is None:
                 inputs_embeds = self.get_input_embeddings()(input_ids)
             visual_pools = self._build_imgslot_visual_pools(pixel_values, image_grid_thw)
@@ -2482,6 +2849,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             image_grid_thw = None
             mm_token_type_ids = None
             if position_ids is None:
+                # Text-like position ids for the rewritten embedding-only
+                # prefill path: [B, S]. Qwen3_5Model expands this to MRoPE form.
                 position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long)
                 position_ids = position_ids.unsqueeze(0).expand(inputs_embeds.shape[0], -1)
 
@@ -2555,6 +2924,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             is_first_iteration=is_first_iteration,
             **kwargs,
         )
+
+        if self._imgslot_is_enabled() and is_first_iteration and pixel_values is not None:
+            model_inputs["imgslot_first_prefill"] = True
 
         if not is_first_iteration and use_cache:
             model_inputs["pixel_values"] = None

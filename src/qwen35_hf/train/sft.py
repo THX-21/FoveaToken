@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import transformers
-from transformers import AutoProcessor, HfArgumentParser, Trainer
+from transformers import HfArgumentParser, Trainer
 
 from qwen35_hf import Qwen3_5ForConditionalGeneration, Qwen3_5Tokenizer
 
@@ -12,7 +12,6 @@ from .data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(default="Qwen/Qwen3.5-9B")
-    processor_backend: str = field(default="auto")
     lora_enable: bool = field(default=True)
     lora_r: int = field(default=64)
     lora_alpha: int = field(default=16)
@@ -31,8 +30,6 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default=None)
     image_folder: str = field(default=None)
-    image_aspect_ratio: str = field(default="square")
-    image_grid_pinpoints: Optional[str] = field(default=None)
     max_image_tokens: Optional[int] = field(default=None)
     system_message: str = field(default="You are a helpful assistant.")
 
@@ -45,24 +42,18 @@ class TrainingArguments(transformers.TrainingArguments):
     attn_implementation: str = field(default="sdpa")
 
 
-def load_optional_processor(model_name_or_path: str, backend: str):
-    if backend not in {"auto", "official", "local"}:
-        raise ValueError(f"Unsupported processor backend: {backend}")
-    if backend == "local":
-        return None
-
-    try:
-        return AutoProcessor.from_pretrained(model_name_or_path)
-    except Exception:
-        if backend == "official":
-            raise
-        return None
-
-
 def freeze_for_vision_plus_lora(model: Qwen3_5ForConditionalGeneration, unfreeze_vision: bool) -> None:
     model.requires_grad_(False)
     if unfreeze_vision:
         get_visual_module(model).requires_grad_(True)
+
+
+def unfreeze_imgslot_parameters(model) -> None:
+    """Keep ImgSlot trainable after the base model freeze."""
+
+    for name, param in model.named_parameters():
+        if "imgslot_" in name:
+            param.requires_grad_(True)
 
 
 def get_visual_module(model):
@@ -92,6 +83,18 @@ def maybe_enable_lora(model, model_args: ModelArguments):
 
     from peft import LoraConfig, get_peft_model
 
+    imgslot_modules = [
+        "imgslot_a_tokens",
+        "imgslot_text_q_proj",
+        "imgslot_text_k_proj",
+        "imgslot_text_v_proj",
+        "imgslot_text_o_proj",
+        "imgslot_img_q_proj",
+        "imgslot_img_k_proj",
+        "imgslot_attn_norm",
+        "imgslot_ffn",
+        "imgslot_ffn_norm",
+    ]
     target_modules = [
         "q_proj",
         "k_proj",
@@ -113,6 +116,8 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=target_modules,
+        exclude_modules=imgslot_modules if model_args.img_slot_enable else None,
+        modules_to_save=imgslot_modules if model_args.img_slot_enable else None,
     )
     model = get_peft_model(model, lora_config)
     return model
@@ -280,7 +285,6 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or 0
 
-    processor = load_optional_processor(model_args.model_name_or_path, model_args.processor_backend)
     if model_args.img_slot_enable and model_args.img_slot_tile_size is None:
         raise ValueError("--img_slot_tile_size is required when --img_slot_enable true.")
     model.config.img_slot_enable = model_args.img_slot_enable
@@ -299,14 +303,12 @@ def main() -> None:
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     if model_args.unfreeze_vision:
         get_visual_module(model).requires_grad_(True)
+    if model_args.img_slot_enable:
+        unfreeze_imgslot_parameters(model)
     # print_parameter_summary(model)
 
     vision_packer = VisionPacker(
         vision_config=model.config.vision_config,
-        processor=processor,
-        processor_backend=model_args.processor_backend,
-        image_aspect_ratio=data_args.image_aspect_ratio,
-        image_grid_pinpoints=data_args.image_grid_pinpoints,
         max_image_tokens=data_args.max_image_tokens,
         img_slot_enable=model_args.img_slot_enable,
         img_slot_m=model_args.img_slot_m,

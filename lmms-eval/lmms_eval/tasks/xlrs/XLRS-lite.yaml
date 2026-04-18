@@ -1,5 +1,8 @@
 dataset_path: /mnt/data/XLRS-Bench-lite
+dataset_kwargs:
+  load_from_disk: true
 task: xlrs-lite
+process_docs: !function mcq_utils.xlrs_process_docs
 test_split: train
 output_type: generate_until
 doc_to_visual: !function mcq_utils.xlrs_doc_to_visual

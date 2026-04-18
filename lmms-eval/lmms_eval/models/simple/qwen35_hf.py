@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 from typing import List, Optional, Union
 
 import torch
@@ -87,9 +88,6 @@ class Qwen35HF(Qwen3_VL):
         interleave_visuals: Optional[bool] = False,
         enable_thinking: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
-        processor_backend: str = "local",
-        image_aspect_ratio: str = "normal",
-        image_grid_pinpoints: str | None = None,
         max_image_tokens: int | None = 128,
         img_slot_enable: bool = False,
         img_slot_m: int = 4,
@@ -110,6 +108,7 @@ class Qwen35HF(Qwen3_VL):
             img_slot_enable = img_slot_enable.lower() in {"1", "true", "yes"}
         if img_slot_enable and img_slot_tile_size is None:
             raise ValueError("img_slot_tile_size is required when img_slot_enable=true.")
+        self.img_slot_enable = bool(img_slot_enable)
 
         accelerator = Accelerator()
         self.accelerator = accelerator
@@ -128,7 +127,7 @@ class Qwen35HF(Qwen3_VL):
             model_kwargs["attn_implementation"] = attn_implementation
         model_kwargs.update(
             {
-                "img_slot_enable": bool(img_slot_enable),
+                "img_slot_enable": self.img_slot_enable,
                 "img_slot_m": int(img_slot_m),
                 "img_slot_k": int(img_slot_k),
                 "img_slot_delta": int(img_slot_delta),
@@ -139,7 +138,7 @@ class Qwen35HF(Qwen3_VL):
         )
 
         self._model = Qwen3_5ForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
-        self._model.config.img_slot_enable = bool(img_slot_enable)
+        self._model.config.img_slot_enable = self.img_slot_enable
         self._model.config.img_slot_m = int(img_slot_m)
         self._model.config.img_slot_k = int(img_slot_k)
         self._model.config.img_slot_delta = int(img_slot_delta)
@@ -149,18 +148,15 @@ class Qwen35HF(Qwen3_VL):
         if peft is not None:
             from peft import PeftModel
 
+            self._load_deepspeed_trainables(peft)
             self._model = PeftModel.from_pretrained(self._model, peft)
         self._model = self._model.eval()
 
         self._tokenizer = Qwen3_5Tokenizer.from_pretrained(pretrained)
         vision_packer = VisionPacker(
             vision_config=self._model.config.vision_config,
-            processor=None,
-            processor_backend=processor_backend,
-            image_aspect_ratio=image_aspect_ratio,
-            image_grid_pinpoints=image_grid_pinpoints,
             max_image_tokens=max_image_tokens,
-            img_slot_enable=bool(img_slot_enable),
+            img_slot_enable=self.img_slot_enable,
             img_slot_m=int(img_slot_m),
             img_slot_k=int(img_slot_k),
             img_slot_tile_size=None if img_slot_tile_size is None else int(img_slot_tile_size),
@@ -202,6 +198,54 @@ class Qwen35HF(Qwen3_VL):
         else:
             self._rank = 0
             self._world_size = 1
+
+    def _load_deepspeed_trainables(self, checkpoint_path: str) -> None:
+        """Load non-LoRA trainables saved in the Deepspeed checkpoint.
+
+        PEFT's adapter file contains LoRA and ImgSlot modules_to_save tensors.
+        The vision tower is still stored in Deepspeed's model state file under
+        ``global_step*/mp_rank_00_model_states.pt``.
+        """
+
+        checkpoint = Path(checkpoint_path)
+        if not checkpoint.is_dir():
+            return
+
+        latest_file = checkpoint / "latest"
+        if latest_file.exists():
+            global_step_name = latest_file.read_text().strip()
+            global_step_dir = checkpoint / global_step_name
+        else:
+            global_steps = sorted(checkpoint.glob("global_step*"))
+            global_step_dir = global_steps[-1] if global_steps else None
+        if global_step_dir is None:
+            return
+
+        state_path = global_step_dir / "mp_rank_00_model_states.pt"
+        if not state_path.exists():
+            return
+
+        eval_logger.info(f"Loading non-LoRA trainables from {state_path}")
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        module_state = state.get("module", {})
+        trainable_state = {}
+        prefix = "base_model.model."
+        for key, tensor in module_state.items():
+            if not key.startswith(prefix):
+                continue
+            raw_key = key[len(prefix) :]
+            if raw_key.startswith("model.visual"):
+                trainable_state[raw_key] = tensor
+
+        if not trainable_state:
+            eval_logger.warning(f"No vision trainables found in {state_path}")
+            return
+
+        incompatible = self._model.load_state_dict(trainable_state, strict=False)
+        unexpected = list(incompatible.unexpected_keys)
+        if unexpected:
+            eval_logger.warning(f"Unexpected non-LoRA trainable keys while loading {state_path}: {unexpected[:20]}")
+        eval_logger.info(f"Loaded {len(trainable_state) - len(unexpected)} vision tensors from Deepspeed checkpoint")
 
     def _preprocess_chunk(self, chunk):
         """Build prompts and local processor inputs without HF image processing."""
@@ -278,11 +322,14 @@ class Qwen35HF(Qwen3_VL):
         processor_kwargs = {
             "text": texts,
             "images": image_inputs or None,
-            "return_mm_token_type_ids": True,
+            "return_mm_token_type_ids": not self.img_slot_enable,
             "return_tensors": "pt",
         }
         if self.batch_size > 1:
             processor_kwargs.update({"padding": True, "padding_side": "left"})
         inputs = self.processor(**processor_kwargs)
+        if self.img_slot_enable:
+            inputs.pop("mm_token_type_ids", None)
+            gen_kwargs = dict(gen_kwargs)
 
         return inputs, contexts, gen_kwargs, until

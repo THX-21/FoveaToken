@@ -7,22 +7,22 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 WORKSPACE_ROOT="$(cd -- "${PROJECT_ROOT}" && pwd)"
 
-export NNODES="${NNODES:-1}"
-export NUM_GPUS="${NUM_GPUS:-1}"
-export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-export MASTER_PORT="${MASTER_PORT:-29599}"
+export NNODES=1
+export NUM_GPUS=1
+export MASTER_ADDR="127.0.0.1"
+export MASTER_PORT=29599
 export WORLD_SIZE=$((NNODES * NUM_GPUS))
-export RANK="${RANK:-0}"
+export RANK=0
 
-NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-RUN_NAME="${RUN_NAME:-Qwen3.5-ft3-anyres24}"
-JSON_PATH="${JSON_PATH:-/mnt/data/GeoLLaVA-Data/ft3_whole_shuffle.json}"
-IMAGE_FOLDER="${IMAGE_FOLDER:-/mnt/data/GeoLLaVA-Data/jpg_images}"
-CKPT_PATH="${CKPT_PATH:-Qwen/Qwen3.5-9B}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
-IMG_SLOT_TILE_SIZE="${IMG_SLOT_TILE_SIZE:?IMG_SLOT_TILE_SIZE must be set when ImgSlot is enabled}"
+NUM_TRAIN_EPOCHS=1
+RUN_NAME="Qwen3.5-ft3-imgslot"
+JSON_PATH="/mnt/data/GeoLLaVA-Data/ft3_whole_shuffle.json"
+IMAGE_FOLDER="/mnt/data/GeoLLaVA-Data/jpg_images"
+CKPT_PATH="Qwen/Qwen3.5-9B"
+OUTPUT_DIR="${PROJECT_ROOT}/checkpoints/${RUN_NAME}"
+IMG_SLOT_TILE_SIZE=1024
 
-export PYTHONPATH="${PROJECT_ROOT}/src:${PYTHONPATH}"
+export PYTHONPATH="${PROJECT_ROOT}/src"
 
 if python - <<'PY'
 import torch
@@ -39,6 +39,7 @@ then
 else
     PRECISION_ARGS=(--bf16 false --fp16 false --tf32 false)
 fi
+# PRECISION_ARGS=(--bf16 false --fp16 false --tf32 true) 
 
 LAUNCHER=(
     torchrun
@@ -57,43 +58,23 @@ if [[ -n "${LATEST_CHECKPOINT}" ]]; then
     RESUME_ARGS=(--resume_from_checkpoint "${LATEST_CHECKPOINT}")
 fi
 
-GRID_PINPOINTS="${IMAGE_GRID_PINPOINTS:-}"
-if [[ -z "${GRID_PINPOINTS}" ]]; then
-    GRID_PINPOINTS="["
-    for width in $(seq 384 384 8192); do
-        for height in $(seq 384 384 8192); do
-            if (( width * height > 4096 * 4096 )); then
-                continue
-            fi
-            if [[ "${GRID_PINPOINTS}" != "[" ]]; then
-                GRID_PINPOINTS+=", "
-            fi
-            GRID_PINPOINTS+="(${width}, ${height})"
-        done
-    done
-    GRID_PINPOINTS+="]"
-fi
-
 ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --deepspeed "${PROJECT_ROOT}/scripts/zero2_tp2.json" \
     --model_name_or_path "${CKPT_PATH}" \
-    --processor_backend local \
     --data_path "${JSON_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
-    --image_aspect_ratio normal \
-    --image_grid_pinpoints "${GRID_PINPOINTS}" \
-    --max_image_tokens 2048 \
+    --max_image_tokens 8196 \
     --lora_enable true \
     --lora_r 64 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
     --unfreeze_vision true \
     --img_slot_enable true \
-    --img_slot_m 4 \
-    --img_slot_k 64 \
-    --img_slot_delta 8 \
+    --img_slot_m 8 \
+    --img_slot_k 128 \
+    --img_slot_delta 128 \
     --img_slot_beta 0.3 \
-    --img_slot_lambda 0.9 \
+    --img_slot_lambda 0.5 \
     --img_slot_tile_size "${IMG_SLOT_TILE_SIZE}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
@@ -116,4 +97,5 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --dataloader_num_workers 4 \
     --report_to tensorboard \
     --remove_unused_columns false \
+    --logging_nan_inf_filter false \
     "${RESUME_ARGS[@]}"

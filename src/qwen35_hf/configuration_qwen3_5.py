@@ -156,6 +156,8 @@ class Qwen3_5Config(PreTrainedConfig):
         Update strength for the dynamic anchor tokens.
     img_slot_lambda (`float`, *optional*, defaults to 0.9):
         Momentum coefficient for visual Top-K scores.
+    img_slot_max_text_tokens (`int`, *optional*, defaults to 512):
+        Maximum number of text hidden states kept for ImgSlot decode refresh.
     img_slot_tile_size (`int`, *optional*):
         Required when ImgSlot is enabled. Original images are evenly split into
         blocks using `ceil(width / img_slot_tile_size)` and
@@ -194,6 +196,7 @@ class Qwen3_5Config(PreTrainedConfig):
     img_slot_delta: int = 8
     img_slot_beta: float = 0.3
     img_slot_lambda: float = 0.9
+    img_slot_max_text_tokens: int = 512
     img_slot_tile_size: int | None = None
 
     def __post_init__(self, **kwargs):

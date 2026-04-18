@@ -11,18 +11,15 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
 from ..processing_qwen3_vl import (
-    DEFAULT_IMAGE_PAD,
-    DEFAULT_VISION_END,
-    DEFAULT_VISION_START,
     build_mm_token_type_ids,
     build_visual_placeholder,
     image_token_count_from_grid,
 )
 from .image_packing import (
     VisionPackerConfig,
-    maybe_infer_processor_stats,
-    pack_anyres_image,
+    default_processor_stats,
     pack_single_image,
+    resize_to_token_budget,
     split_image_into_blocks,
 )
 
@@ -145,7 +142,8 @@ def encode_chatml_example(
     Labeling policy:
     - system turns: ignored
     - user turns: ignored
-    - assistant turns: supervise only the assistant content, not the role prefix
+    - assistant turns: supervise only the answer content and turn end marker,
+      not the role prefix or empty thinking scaffold
 
     This is the standard SFT setup where the model learns to continue the prompt
     as the assistant.
@@ -190,10 +188,10 @@ def encode_chatml_example(
         else:
             # Align with the official Qwen3.5 chat template: assistant turns
             # include an explicit thinking block even when reasoning content is
-            # absent, so the answer starts after an empty `<think>` scaffold.
-            assistant_content = f"<think>\n\n</think>\n\n{sentence['value']}"
-            full_segment = f"{prefix}{assistant_content}<|im_end|>\n"
-            prefix_len = len(tokenize_text(tokenizer, prefix))
+            # absent. The scaffold is prompt context only; supervise the answer.
+            answer_prefix = f"{prefix}<think>\n\n</think>\n\n"
+            full_segment = f"{answer_prefix}{sentence['value']}<|im_end|>\n"
+            prefix_len = len(tokenize_text(tokenizer, answer_prefix))
         if role in {"human", "user"}:
             append_segment(full_segment, supervised_prefix_len=None)
         else:
@@ -203,25 +201,17 @@ def encode_chatml_example(
 
 
 class VisionPacker:
-    """Adapter that chooses between official and local image preprocessing."""
+    """Local normal image preprocessing adapter."""
 
     def __init__(
         self,
         vision_config,
-        processor=None,
-        processor_backend: str = "auto",
-        image_aspect_ratio: str = "square",
-        image_grid_pinpoints: str | None = None,
         max_image_tokens: int | None = None,
         img_slot_enable: bool = False,
         img_slot_m: int = 4,
         img_slot_k: int = 64,
         img_slot_tile_size: int | None = None,
     ) -> None:
-        self.processor = processor
-        self.processor_backend = processor_backend
-        self.image_aspect_ratio = image_aspect_ratio
-        self.image_grid_pinpoints = image_grid_pinpoints
         self.max_image_tokens = max_image_tokens
         self.img_slot_enable = img_slot_enable
         self.img_slot_token_count = int(img_slot_m) + int(img_slot_k)
@@ -239,7 +229,7 @@ class VisionPacker:
             if isinstance(vision_config.temporal_patch_size, int)
             else int(vision_config.temporal_patch_size[0])
         )
-        image_mean, image_std, rescale_factor = maybe_infer_processor_stats(processor)
+        image_mean, image_std, rescale_factor = default_processor_stats()
         self.local_config = VisionPackerConfig(
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,
@@ -248,34 +238,17 @@ class VisionPacker:
             image_std=image_std,
             rescale_factor=rescale_factor,
         )
-    def _pack_single_block(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
-        if self.image_aspect_ratio == "anyres" or "anyres" in self.image_aspect_ratio:
-            if not self.image_grid_pinpoints:
-                return pack_single_image(
-                    image=image,
-                    config=self.local_config,
-                    max_image_tokens=self.max_image_tokens,
-                )
-            return pack_anyres_image(
-                image=image,
-                config=self.local_config,
-                grid_pinpoints=self.image_grid_pinpoints,
-                max_tiles=self.max_image_tokens,
-            )
 
+    def _pack_single_block(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
         return pack_single_image(image=image, config=self.local_config, max_image_tokens=self.max_image_tokens)
 
     def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
-        """Pack one image and return `(pixel_values, image_grid_thw)`.
-
-        Resolution strategy:
-        - anyres mode: always use the local path, because candidate canvas
-          selection is driven by the training config.
-        - official/auto backend: try the HF processor first.
-        - local fallback: reproduce patch packing in pure PyTorch.
-        """
+        """Pack one image and return `(pixel_values, image_grid_thw)`."""
 
         if self.img_slot_enable:
+            # Apply the token budget to the whole image first; block count and
+            # boundaries are based on the budgeted normal-resolution image.
+            image = resize_to_token_budget(image, self.local_config, self.max_image_tokens)
             pixel_values_list = []
             image_grid_list = []
             for block in split_image_into_blocks(image, int(self.img_slot_tile_size)):
@@ -283,33 +256,6 @@ class VisionPacker:
                 pixel_values_list.append(packed_pixels)
                 image_grid_list.append(packed_grid)
             return torch.cat(pixel_values_list, dim=0), torch.stack(image_grid_list, dim=0)
-
-        if self.image_aspect_ratio == "anyres" or "anyres" in self.image_aspect_ratio:
-            return self._pack_single_block(image)
-
-        if self.processor_backend in {"official", "auto"} and self.processor is not None:
-            try:
-                # The processor derives image-grid metadata from the prompt, so we
-                # feed it a minimal vision-only template.
-                vision_prompt = f"{DEFAULT_VISION_START}{DEFAULT_IMAGE_PAD}{DEFAULT_VISION_END}"
-                outputs = self.processor(
-                    text=[vision_prompt],
-                    images=[image],
-                    return_mm_token_type_ids=False,
-                    return_tensors="pt",
-                )
-                pixel_values = outputs["pixel_values"]
-                image_grid_thw = outputs["image_grid_thw"]
-                if pixel_values.dim() > 2 and pixel_values.shape[0] == 1:
-                    pixel_values = pixel_values.squeeze(0)
-                if image_grid_thw.dim() == 2 and image_grid_thw.shape[0] == 1:
-                    image_grid_thw = image_grid_thw.squeeze(0)
-                return pixel_values, image_grid_thw
-            except Exception:
-                # `official` means strict compatibility and should surface the
-                # processor failure. `auto` falls back to the local packer.
-                if self.processor_backend == "official":
-                    raise
 
         return self._pack_single_block(image)
 
