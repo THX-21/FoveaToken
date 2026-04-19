@@ -1,139 +1,242 @@
 # AGENTS.md
 
-本文件为 Claude Code（claude.ai/code）及其他 AI 编程助手提供项目导航与协作规范。**每次修改代码后必须同步更新本文档**，保持文档与代码一致。
+本文件面向 Claude Code（claude.ai/code）及其他 AI 编程助手，记录当前仓库的真实入口、数据流和协作约束。**修改代码后必须同步更新本文档**，避免下一位助手沿用过期假设。
 
 ---
 
-## 项目简介
+## 当前定位
 
-`qwen35-hf` 当前已切换为 **Fovea** 命名主线：在保留 Qwen3.5 架构兼容配置别名的同时，对外主模型/processor/tokenizer 入口分别为 `FoveaForConditionalGeneration`、`FoveaProcessor`、`FoveaTokenizer`。dev 分支新增了 **ImgSlot** 机制：将图像分块后用动态锚点 token + Top-K 视觉 token 替换原始图像占位，减少视觉 token 开销。
+`qwen35_hf` 是本地 Fovea / Qwen3.5 多模态实验仓库。当前对外主入口是：
+
+- `FoveaForConditionalGeneration`
+- `FoveaConfig` / `FoveaTextConfig` / `FoveaVisionConfig`
+- `FoveaProcessor`
+- `FoveaTokenizer`
+
+`Qwen3_5*` 名称仍作为兼容别名导出，但新代码优先使用 `Fovea*` 命名。核心实验功能是 **ImgSlot**：训练和推理时先把图像切成 block，再用一个样本级 anchor span + 每个 block 的 Top-K 视觉 token span 替代原始全量视觉占位，从而控制文本侧视觉 token 数。
+
+仓库根目录当前没有 `pyproject.toml`、`setup.py` 或 `setup.cfg`。不要假设 `pip install -e .` 可用；训练和评测脚本通过 `PYTHONPATH` 指向 `src` / `lmms-eval` 运行本地代码。
 
 ---
 
 ## 常用命令
 
-所有命令从项目根目录（`/root/wd/FoveaToken/qwen35_hf`）执行。
+所有命令从项目根目录 `/root/wd/FoveaToken/qwen35_hf` 执行。
 
-**安装：**
+**环境准备：**
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu128
-pip install -e .              # 基础安装
-pip install -e ".[train]"     # 添加训练依赖：accelerate, deepspeed, peft, datasets, tensorboard
-pip install -e ".[fast]"      # 添加加速依赖：causal-conv1d, flash-linear-attention
+pip install transformers huggingface_hub tokenizers numpy pillow accelerate deepspeed peft datasets tensorboard
+pip install -e ./lmms-eval
+pip install ./flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
 ```
 
-**训练（LoRA 微调，启用 ImgSlot）：**
+如需本地导入包：
 ```bash
-IMG_SLOT_TILE_SIZE=336 bash scripts/ft3.sh
+export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 ```
-`IMG_SLOT_TILE_SIZE` 是必填环境变量，未设置时脚本报错退出。
+
+**训练 LoRA + ImgSlot：**
+```bash
+bash scripts/ft3.sh
+```
+
+`ft3.sh` 固定走 `torchrun -m qwen35_hf.train.sft`、DeepSpeed ZeRO-2、单节点单卡默认配置。脚本不再显式传 `img_slot_*` 参数，训练入口使用 `ModelArguments` 默认值并写回 `model.config`。
+
+可覆盖的训练环境变量：
+
+- `FT3_MASTER_PORT`
+- `FT3_NUM_TRAIN_EPOCHS`
+- `FT3_RUN_NAME`
+- `FT3_JSON_PATH`
+- `FT3_IMAGE_FOLDER`
+- `FT3_CKPT_PATH`
+- `FT3_OUTPUT_DIR`
+- `FT3_SAVE_STEPS`
+- `FT3_MAX_STEPS`
+- `FT3_STOP_STEP`（由 `sft.py` 的 `StopAtStepCallback` 读取，用于分段训练）
 
 **评测 LoRA checkpoint：**
 ```bash
-IMG_SLOT_TILE_SIZE=336 bash scripts/eval.sh
+bash scripts/eval.sh
 ```
 
-**语法检查：**
+`eval.sh` 通过本地 `lmms-eval` 的 `fovea` model adapter 运行，默认任务是 `xlrs-lite`，默认 `HF_HUB_OFFLINE=1`。
+
+可覆盖的评测环境变量：
+
+- `EVAL_BASE_MODEL`
+- `EVAL_LORA_CHECKPOINT`
+- `EVAL_TASKS`
+- `EVAL_OUTPUT_PATH`
+- `EVAL_LOG_SUFFIX`
+
+**分段训练 + 每段评测：**
+```bash
+bash scripts/train_eval_loop.sh
+```
+
+该脚本按 checkpoint step 推进训练，训练到目标 step 后评测最新 checkpoint。训练或评测失败时通过 `|| break_loop` 停止后续分段；脚本启用 `set -uo pipefail`。
+
+**Qwen3.5 baseline 评测：**
+```bash
+bash scripts/eval_qwen35.sh
+```
+
+该脚本走 `lmms-eval` 的 `qwen3_5` adapter，不加载 Fovea LoRA。
+
+**轻量检查：**
 ```bash
 bash -n scripts/ft3.sh
 bash -n scripts/eval.sh
+bash -n scripts/eval_qwen35.sh
+bash -n scripts/train_eval_loop.sh
 /root/wd/FoveaToken/.venv/bin/python -m py_compile src/qwen35_hf/train/sft.py
 /root/wd/FoveaToken/.venv/bin/python -m py_compile src/qwen35_hf/train/data.py
+/root/wd/FoveaToken/.venv/bin/python -m py_compile src/qwen35_hf/modeling_fovea.py
 ```
 
 ---
 
-## 技术架构
+## 目录地图
 
-### 整体结构
-
-```
+```text
 src/qwen35_hf/
-  __init__.py                  # 公共 API：导出 Fovea 模型、配置、tokenizer、processor
-  configuration_fovea.py       # FoveaConfig / FoveaTextConfig / FoveaVisionConfig（含 img_slot_* 字段）
-  modeling_qwen3_5.py          # Qwen3.5 基础类与公共实现（不再包含条件生成主类）
-  modeling_fovea.py            # FoveaForConditionalGeneration（主模型入口，含 ImgSlot helper）
-  modular_qwen3_5.py           # 原始模板文件，不修改
-  tokenization_fovea.py        # FoveaTokenizer
-  processing_fovea.py          # FoveaProcessor（视觉-语言预处理、token 构建工具）
+  __init__.py             # Fovea 公共 API 与 Qwen3_5 兼容别名
+  configuration_fovea.py  # FoveaConfig / Text / Vision 配置，含 ImgSlot 默认值
+  modeling_qwen3_5.py     # Qwen3.5 text/vision/backbone 基础实现
+  modeling_fovea.py       # FoveaForConditionalGeneration 与 ImgSlot runtime/cache 逻辑
+  processing_fovea.py     # FoveaProcessor 与视觉占位展开工具
+  tokenization_fovea.py   # FoveaTokenizer
   train/
-    sft.py                     # 训练入口（ModelArguments / DataArguments / TrainingArguments）
-    data.py                    # 数据集加载、ChatML 编码、VisionPacker（含 ImgSlot 路径）
-    image_packing.py           # 图像切片：pack_single_image / split_image_into_blocks
+    sft.py                # Trainer 入口、LoRA、冻结策略、分段停止 callback
+    data.py               # SFT JSON 加载、ChatML 编码、VisionPacker、collator
+    image_packing.py      # 本地图像 resize / normalize / patch packing / block split
 
 scripts/
-  ft3.sh                       # LoRA 训练脚本（torchrun + DeepSpeed ZeRO-2，需 IMG_SLOT_TILE_SIZE）
-  eval.sh                      # lmms-eval 评测脚本（accelerate launch，需 IMG_SLOT_TILE_SIZE）
-  zero2_tp2.json               # DeepSpeed ZeRO-2 配置
+  ft3.sh                  # LoRA 训练脚本
+  eval.sh                 # Fovea LoRA 评测脚本
+  eval_qwen35.sh          # Qwen3.5 baseline 评测脚本
+  train_eval_loop.sh      # 分段训练并评测最新 checkpoint
+  zero2_tp2.json          # 当前 ft3.sh 使用的 DeepSpeed ZeRO-2 配置
+  zero2_tp2_gpu.json      # 备用 DeepSpeed 配置
 
 lmms-eval/
-  lmms_eval/models/simple/fovea.py   # lmms-eval 自定义模型适配器（含 ImgSlot 参数）
+  lmms_eval/models/simple/fovea.py      # Fovea 自定义 lmms-eval adapter
+  lmms_eval/tasks/xlrs/XLRS-lite.yaml   # 当前默认评测任务
+  lmms_eval/tasks/xlrs/mcq_utils.py     # xlrs-lite prompt、裁剪、解析、聚合逻辑
 ```
 
-### 模型继承链
+`modular_qwen3_5.py` 当前不在仓库中。不要再引用或修改这个旧模板文件。
 
+---
+
+## 模型结构
+
+`FoveaConfig`、`FoveaTextConfig`、`FoveaVisionConfig` 都继承 `PreTrainedConfig`；`Qwen3_5Config`、`Qwen3_5TextConfig`、`Qwen3_5VisionConfig` 是对应 Fovea 配置类的别名。
+
+`FoveaForConditionalGeneration` 继承 `Qwen3_5PreTrainedModel` 和 `GenerationMixin`，内部结构是：
+
+```text
+FoveaForConditionalGeneration
+  model: Qwen3_5Model
+    visual: Qwen3_5VisionModel
+    language_model: Qwen3_5TextModel
+      layers: Qwen3_5DecoderLayer
+        self_attn: Qwen3_5Attention 或 Qwen3_5GatedDeltaNet
+  lm_head
+  ImgSlot modules:
+    imgslot_a_tokens
+    imgslot_text_q_proj / k_proj / v_proj / o_proj
+    imgslot_img_q_proj / k_proj / v_proj / o_proj
+    imgslot_attn_norm
+    imgslot_ffn
+    imgslot_ffn_norm
 ```
-FoveaTextConfig   ← Qwen3NextConfig
-FoveaVisionConfig ← Qwen3VLVisionConfig
-FoveaConfig       ← (组合 Text + Vision 配置，新增 img_slot_* 字段)
 
-FoveaForConditionalGeneration ← Qwen3VLForConditionalGeneration
-  ├── visual: Qwen3VLVisionModel      （vision tower，--unfreeze_vision 时解冻）
-  ├── model:  Qwen3_5TextModel
-  │     └── layers: Qwen3NextAttention + Qwen3NextGatedDeltaNet（线性注意力）
-  └── ImgSlot 专属参数（仅在 img_slot_enable=True 时生效）：
-        imgslot_a_tokens.weight   # 可学习锚点 token（Embedding 权重，形状 [m, hidden]）
-        imgslot_text_q/k/v/o_proj # 锚点-文本交叉注意力投影
-        imgslot_img_q/k_proj      # 视觉 Top-K 评分投影
-        imgslot_attn_norm         # LayerNorm（锚点更新后）
-        imgslot_ffn + ffn_norm    # 前馈网络（锚点更新后）
-```
+`Qwen3_5Model` 负责普通多模态路径：视觉 tower 输出 features，按 placeholder mask 写回 `inputs_embeds`，再构造 MRoPE position ids 并调用 `Qwen3_5TextModel`。如果普通多模态路径收到 `image_grid_thw` / `video_grid_thw`，必须有 `mm_token_type_ids`，否则会报错。
 
-### ImgSlot 机制（dev 分支核心新功能）
+`FoveaForConditionalGeneration` 在 ImgSlot 启用时绕过普通视觉 scatter：先计算 `visual_pools`，再把文本中的 image placeholder spans 改写为 anchor tokens 和 Top-K visual tokens，随后把 `pixel_values` / `image_grid_thw` / `mm_token_type_ids` 清空并继续走 text decoder。
 
-**目标**：用更少的 token 表示图像，减少视觉序列长度。
+---
 
-**流程：**
-1. `split_image_into_blocks(image, tile_size)` — 将原图按 `ceil(W/tile_size) × ceil(H/tile_size)` 均分为 blocks。
-2. 每个 block 走 `_pack_single_block`（normal 路径），得到 `pixel_values` 和 `image_grid_thw`（多 block 时 grid 为 2D tensor）。
-3. 数据编码时，每个 block 对应的 token 数固定为 `img_slot_m + img_slot_k`（不再使用 `image_grid_thw` 计算）。
-4. 训练时，`FoveaForConditionalGeneration` 将图像占位 span 替换为：
-   - `img_slot_m` 个动态锚点 token（由 `imgslot_a_tokens.weight` + 文本交叉注意力初始化）
-   - `img_slot_k` 个 Top-K 视觉 token（由锚点对视觉池打分后选出）
-5. 推理时每隔 `img_slot_delta` 步用动量（`img_slot_lambda`）更新锚点和 Top-K 选择。
+## ImgSlot 约定
 
-**关键参数（`FoveaConfig` 中）：**
+默认配置来自 `FoveaConfig` 和 `ModelArguments`：
 
 | 参数 | 默认值 | 含义 |
-|------|--------|------|
-| `img_slot_enable` | `False` | 是否启用 ImgSlot |
-| `img_slot_m` | 8 | 每个 block 的动态锚点 token 数 |
-| `img_slot_k` | 128 | 每个 block 的 Top-K 视觉 token 数 |
-| `img_slot_delta` | 129 | 推理时刷新 KV 的解码步间隔 |
-| `img_slot_beta` | 0.3 | 锚点动量更新强度 |
-| `img_slot_lambda` | 0.9 | 视觉 Top-K 分数动量系数 |
-| `img_slot_tile_size` | `None`（必填） | 原图切块边长（像素） |
+| --- | --- | --- |
+| `img_slot_enable` | `True` | 是否启用 ImgSlot |
+| `img_slot_m` | `8` | 每个含图样本的共享 anchor token 数 |
+| `img_slot_k` | `128` | 每个 image block 保留的 Top-K 视觉 token 数 |
+| `img_slot_delta` | `129` | decode 时刷新 KV cache 的步间隔 |
+| `img_slot_beta` | `0.3` | anchor 动量更新强度 |
+| `img_slot_lambda` | `0.9` | Top-K 分数动量系数 |
+| `img_slot_max_text_tokens` | `512` | runtime 中保留的文本 token KV 上限 |
+| `img_slot_tile_size` | `1024` | 原图切块边长，启用 ImgSlot 时必须为正整数 |
 
-### 训练流程
+数据侧 placeholder 约定：
 
-1. `ft3.sh` 通过 `torchrun` 启动（即使单卡也走 torch distributed）。
-2. `IMG_SLOT_TILE_SIZE` 必须在运行前设置，否则脚本报错。
-3. `sft.py` 将 `img_slot_*` 参数写入 `model.config`，并传入 `VisionPacker` 和 `LazySupervisedDataset`。
-4. `ft3.sh` 自动查找 `OUTPUT_DIR` 下最新 `checkpoint-*` 并续训。
-5. 图像处理固定走 normal 本地路径（`image_aspect_ratio=normal`）。
+- `VisionPacker.pack()` 先对整图应用 `max_image_tokens` 预算，再用 `split_image_into_blocks()` 按 `ceil(width / tile_size)` 和 `ceil(height / tile_size)` 均匀切块。
+- 每个 block 走 normal 本地 patch packing，产生一行 `image_grid_thw`；多 block 图像返回 2D grid。
+- `encode_chatml_example()` 在含图样本前插入一个长度为 `m` 的 anchor span。
+- 每个 block 的文本侧视觉 span 长度固定为 `k`，不是 `m + k`；整张图的文本侧开销是 `m + num_blocks * k`。
+- `image_token_counts` 的形状语义是 `list[list[int]]`：外层按原图，内层按 block。
 
-### 数据编码与图像 token
+模型侧 runtime 约定：
 
-- 编码入口：`data.py` 的 `encode_chatml_example`。
-- `image_token_counts` 类型已从 `list[int]` 改为 `list[list[int]]`（外层按图，内层按 block）。
-- ImgSlot 启用时每个 block 的 token 数固定为 `img_slot_m + img_slot_k`；禁用时按 `image_grid_thw.prod() // spatial_merge_size²` 计算。
-- ImgSlot 训练侧 prefill 不再对 `visual_pool` 和 `text_tokens` 做 `detach()`：选中的 Top-K 视觉 token 可将梯度传回 vision tower，文本条件化分支也可将梯度传回文本 embedding / LoRA 路径。decode runtime state 中保存的 `A`/`V`/`T`/缓存投影仍使用 `detach()`，仅用于推理刷新状态。
+- `_project_imgslot_kv()` 输入必须是 2D token 张量 `[seq, hidden]`，输出固定为 `[1, num_heads, seq, head_dim]`。
+- `_build_imgslot_states_for_sample()` 要求 `text_tokens` 非空，并要求 `len(visual_pools) == len(visual_spans)`。
+- 每个 visual pool 的 token 数必须至少为 `img_slot_k`；不足时显式报错，提示增大 tile size、减小 `img_slot_k` 或提高 block 分辨率。
+- prefill 期间 Top-K 选择不 detach `visual_pool` / `text_tokens`，梯度可以回到 vision tower、text embedding 和 LoRA 路径。
+- runtime 中缓存的 `A`、`V`、`V_k`、`V_v`、`V_topk`、`score_prev`、`topk_idx` 是 detach 后的状态，只用于 generation refresh。
+- `use_cache=True` generation 首轮通过 `imgslot_first_prefill` 标记强制进入 embedding rewrite；后续 decode 每 `img_slot_delta` 步只刷新 full-attention layers 的 KV cache。
 
-### ChatML 模板
+不要重新加入 legacy tuple/list cache 支持、Top-K padding、空文本 fallback 或宽松 `getattr(..., default)` 配置兜底，除非 THX 明确要求。
 
-训练和评测共用：
+---
 
-```
+## 训练流程
+
+`scripts/ft3.sh` 当前关键行为：
+
+- 设置 `PYTHONPATH="$PROJECT_ROOT/src"`。
+- 使用 `torchrun --nproc_per_node=1 -m qwen35_hf.train.sft`。
+- 自动根据 CUDA 能力选择 bf16、fp16 或 fp32 参数。
+- 从 `FT3_OUTPUT_DIR` / 默认 `checkpoints/fovea-ft3-imgslot` 查找最新 `checkpoint-*` 并传 `--resume_from_checkpoint`。
+- 固定 `--max_image_tokens 8196`、`--lora_enable true`、`--unfreeze_vision true`、`--gradient_checkpointing true`、`--attn_implementation flash_attention_2`、`--model_max_length 32768`。
+- 同时传 `--max_steps "$FT3_MAX_STEPS"`；分段停止由 `FT3_STOP_STEP` callback 负责。
+
+`src/qwen35_hf/train/sft.py` 当前关键行为：
+
+- 加载 `FoveaTokenizer` 和 `FoveaForConditionalGeneration`。
+- 将 `img_slot_*` CLI/default 参数传给 `from_pretrained()`，并再次写回 `model.config`。
+- 训练时设置 `model.config.use_cache = False`。
+- 先冻结全模型；`--unfreeze_vision true` 时解冻 vision tower。
+- LoRA target modules 覆盖 attention、MLP 和 linear-attention 相关投影。
+- ImgSlot 子模块不作为 LoRA target，而是放入 `modules_to_save`，并在 PEFT 包装后显式保持 trainable。
+
+LoRA / checkpoint 注意点：
+
+- `adapter_model.safetensors` 保存 LoRA 权重和 `modules_to_save` 中的 ImgSlot 子模块。
+- vision tower 可训练权重由 DeepSpeed checkpoint 的 `global_step*/mp_rank_00_model_states.pt` 保存；评测 adapter 会尝试从这里加载 `model.visual*` 权重。
+- 修改可训练模块列表时，必须同步训练保存逻辑和评测加载逻辑。
+
+---
+
+## 数据与 ChatML
+
+训练数据由 `LazySupervisedDataset` 懒加载：
+
+- JSON 顶层必须是 list。
+- 每条样本至少包含 `conversations`，可选 `image`。
+- `image` 可以是字符串或字符串列表，路径相对 `image_folder`。
+- `<image>` 占位会被移动到 user message 开头（当消息中恰好一个 `<image>` 且不在开头时）。
+- 多图样本按 `<image>` 出现顺序依次消费；如果只有一个 `<image>` 但样本提供多张图，会把多张图的 block placeholders 连到同一个占位处。
+
+assistant 监督模板固定为：
+
+```text
 <|im_start|>assistant
 <think>
 
@@ -142,60 +245,59 @@ FoveaForConditionalGeneration ← Qwen3VLForConditionalGeneration
 {answer}<|im_end|>
 ```
 
-### 评测适配器
+label 策略：
 
-`lmms_eval/models/simple/fovea.py`：
-- 接受全部 `img_slot_*` 参数（字符串/数值均可，内部做类型转换）。
-- `LocalVisionImageProcessor` 记录每张图的 block 数（`_last_image_block_counts`），供 token 对齐使用。
-- LoRA 评测：先加载 `BASE_MODEL`，再 `PeftModel.from_pretrained(LORA_CHECKPOINT)`。
-- 评测 limit 当前为 500 条（master 为 200）。
+- system / user 全部 mask 为 `IGNORE_INDEX=-100`。
+- assistant role prefix 和空 thinking scaffold mask。
+- answer 内容和 `<|im_end|>` 参与监督。
+
+`DataCollatorForQwen3_5SFT` 会右 padding 文本字段，截断到 `model_max_length`，并把不同样本的 `pixel_values` / `image_grid_thw` 沿视觉 patch / grid 维拼接，不做视觉 padding。
+
+---
+
+## 评测路径
+
+`scripts/eval.sh` 默认运行：
+
+```text
+accelerate launch -m lmms_eval --model fovea --tasks xlrs-lite
+```
+
+`lmms_eval/models/simple/fovea.py` 当前行为：
+
+- 加载 `FoveaForConditionalGeneration`，可选 `peft=...` 加载 LoRA adapter。
+- `use_cache` 默认允许为 `True`，依赖 ImgSlot 首轮 prefill + 后续 refresh 逻辑。
+- `LocalVisionImageProcessor` 复用训练侧 `VisionPacker`，并记录 `_last_image_block_counts`，用于 processor 把一张原图映射到多个 block spans。
+- ImgSlot 启用时 processor 不返回 `mm_token_type_ids`；模型会走 embedding rewrite 路径。
+- 当前 adapter 只支持 image inputs；video 输入会直接报错。
+- `max_image_tokens` 默认 128，但 `eval.sh` 显式传 8196。
+
+`xlrs-lite` 当前在 `lmms_eval/tasks/xlrs/mcq_utils.py` 中通过 `xlrs_process_docs()` 每个 `doc["category"]` 最多保留 60 条，任务 YAML 不使用 CLI `--limit`。答案解析会把 `(A)` 这类格式归一为 `A`。
 
 ---
 
 ## 修改原则
 
-- **直接修改 `modeling_qwen3_5.py`**，不修改 `modular_qwen3_5.py`。
-- **训练与评测 ImgSlot 参数必须同步**：修改任一侧的参数默认值或逻辑，同步更新另一侧。
-- **Qwen3.5 专用评测逻辑放在 `lmms_eval/models/simple/fovea.py`**，不修改通用 `qwen3_vl.py`。
-- **每次修改代码后更新本文档**，重点更新受影响的架构说明、参数约定或命令。
-- **遇到不确定的代码设计问题时，必须先询问 THX，不得直接行动。**
-- **不能写兼容性代码，除非你明确要求。**
-- **代码必须简洁，优先选择直接、清晰的实现，避免不必要的抽象和分支。**
-- **代码中应添加必要注释**：重点解释关键数据流、张量变换、边界条件与设计意图，避免无信息量注释。
-- **涉及张量或多维结构的关键变量必须标注形状**，尤其是在 reshape、permute、split、cat、scatter、mask 等操作附近。
+- 新模型入口、processor、tokenizer 代码使用 `Fovea*` 命名；仅为兼容保留 `Qwen3_5*` alias。
+- `modeling_qwen3_5.py` 是基础 Qwen3.5 text/vision/backbone 实现；`modeling_fovea.py` 是 Fovea 条件生成和 ImgSlot runtime 实现。不要把 ImgSlot 主逻辑塞回基础 backbone。
+- Qwen3.5/Fovea 专用评测逻辑放在 `lmms_eval/models/simple/fovea.py` 或对应 simple adapter；不要改通用 `qwen3_vl.py` 来服务 Fovea。
+- 训练、评测、processor 的 ImgSlot placeholder 约定必须同步：anchor span、block span、`image_grid_thw` 行数和 `visual_pools` 数量必须一致。
+- 遇到不确定的代码设计问题时，必须先询问 THX，不要自行引入兼容层或备用分支。
+- 不能写兼容性代码，除非 THX 明确要求。
+- 代码必须简洁，优先直接清晰的实现。避免“为了稳妥”添加未被当前输入结构使用的防御性路径。
+- 涉及张量 reshape、permute、split、cat、scatter、mask、KV cache 写入时，关键变量附近必须标注形状。
+- 注释只解释关键数据流、边界条件和设计意图；不要写无信息量注释。
+- 修改 `img_slot_*` 默认值时，至少同步检查 `configuration_fovea.py`、`sft.py`、`VisionPacker`、`FoveaProcessor`、`lmms_eval/models/simple/fovea.py`、脚本文档和本文件。
+- 修改 LoRA trainable / `modules_to_save` 时，同步检查 `sft.py` 的保存范围和 `fovea.py` 的 Deepspeed trainables 加载逻辑。
+- 修改脚本可配置环境变量时，同步更新本文件的命令说明。
 
-- ImgSlot 核心实现已收敛为 **sample-batched 主路径**：prefill 初始化与 decode refresh 都优先按 sample 内全部 blocks 批量处理，不再维护独立的单 block helper 分支。
-- ImgSlot 文本条件化与视觉打分统一使用 batched helper，避免重复维护单块版和批量版逻辑。
-- ImgSlot 的文本/视觉 KV 投影 helper 输入约定为 **2D token 张量 `[seq, hidden]`**，输出必须显式补 batch 维，固定为 **`[1, num_heads, seq, head_dim]`**；不能按 `tokens.shape[:-1]` 泛化保形，否则会把序列长度错当 batch 维，在 `_run_imgslot_attention` 中触发 `matmul` 维度错误。
-
-- ImgSlot decode refresh 的空文本分支必须按 **每个 block 各自的 `V`** 构造 fallback text KV，不能错误地复用第一个 block 的视觉池，否则多 block 样本会发生条件化串扰。
-
-- `eval.sh` 通过 `lmms_eval/models/simple/fovea.py` 间接调用本地 `modeling_qwen3_5.py`；评测入口不是直接执行模型定义文件。
-- 当前评测适配器在 ImgSlot 启用时 **允许 `use_cache`**，以便评测路径对齐当前实现的缓存/refresh 行为；但仍不向模型传 `mm_token_type_ids`。
-
-- ImgSlot generation 在 `use_cache=True` 时，首轮 prefill 必须由 `FoveaForConditionalGeneration.forward()` 的 embedding-rewrite 分支接管；当前实现通过 generation 输入中的 `imgslot_first_prefill` 标记显式触发该分支，随后 decode 再进入 cache / refresh 路径。
-- 评测适配器 `lmms_eval/models/simple/fovea.py` 现在允许 `use_cache=True`，前提是上述首轮 prefill 接管逻辑保持有效。
-
-- `xlrs-lite` 当前在 task 层通过 `process_docs` 预裁剪数据：按 `doc["category"]`（即 task/subtask 组合键）每类最多保留 60 条，而不是用 CLI `--limit` 对整个聚合任务统一截断。
-
-- `FoveaForConditionalGeneration` 中的 ImgSlot 兼容/兜底逻辑已移除：不再保留 `_sanitize_imgslot_tensor`、空文本 fallback、Top-K padding、legacy tuple/list cache 支持等防御性路径；代码只支持当前仓库明确使用的输入与 cache 结构。
-
-- ImgSlot 配置读取也已收紧：`FoveaForConditionalGeneration` 不再用 `getattr(..., default)` 提供默认超参，运行时要求 `config` 显式包含 `img_slot_*` 字段，并默认 `_imgslot_runtime`/`layer_types` 等结构始终存在且符合当前仓库约定。
-
-- `imgslot_a_tokens` 是 `nn.Embedding` 子模块，不再是根模块裸 `nn.Parameter`；它通过标准 module 初始化路径初始化，权重名为 `imgslot_a_tokens.weight`。
-
-- LoRA 训练在 `LoraConfig.modules_to_save` 中包含全部 ImgSlot 子模块（`imgslot_a_tokens`、文本/视觉投影、norm、FFN），因此 `adapter_model.safetensors` 会随 LoRA adapter 保存和恢复完整 ImgSlot 权重；不再遗漏 `imgslot_img_v_proj` / `imgslot_img_o_proj` 这类可训练视觉投影。
-- `train_eval_loop.sh` 现在必须在训练或评测失败时立即退出；循环脚本启用 `set -euo pipefail`，且 `eval.sh` 失败会中断后续训练分段，不能静默继续。
-- `train_eval_loop.sh` 透传的 `FT3_*` 参数（如 `FT3_RUN_NAME`、`FT3_OUTPUT_DIR`、`FT3_JSON_PATH`、`FT3_IMAGE_FOLDER`、`FT3_CKPT_PATH`、`FT3_IMG_SLOT_TILE_SIZE`、`FT3_SAVE_STEPS`、`FT3_MAX_STEPS`、`FT3_IMG_SLOT_LAMBDA`）必须由 `scripts/ft3.sh` 显式读取；循环控制不能依赖脚本内硬编码默认值。
-- `ft3.sh` 现在同时向 Trainer 传 `--max_steps`，因此分段训练既受 `FT3_STOP_STEP` 控制，也受全局最大步数约束；不能只靠 epoch 长度碰运气达到目标 step。
-- 配置默认值已与当前主入口统一：`FoveaConfig` 默认使用 `img_slot_enable=True`、`img_slot_m=8`、`img_slot_k=128`、`img_slot_delta=129`、`img_slot_lambda=0.9`、`img_slot_tile_size=1024`，避免非脚本入口与脚本入口分叉。
-- 脚本入口现在不再显式传任何 `img_slot_*` 参数；训练与评测都直接依赖 `FoveaConfig` / checkpoint config。若要调整 ImgSlot 行为，应修改配置或在显式调用模型/适配器时覆盖，而不是在 `ft3.sh` / `eval.sh` 里重复传参。
-- ImgSlot 目前要求每个 visual pool 的 token 数至少为 `img_slot_k`；若 block 太小导致池化后 token 数不足，会直接报错并提示增大 `img_slot_tile_size`、减小 `img_slot_k` 或提高 block 分辨率，而不是在 `torch.topk` 处崩溃。
+---
 
 ## 已知注意事项
 
+- 根目录当前不是标准可编辑 Python 包；脚本依赖 `PYTHONPATH`。
+- `configuration_fovea.py` 的类 docstring 若与类属性默认值不一致，应以类属性和实际入口为准，并在下次触碰该文件时同步修正。
 - `warmup_ratio is deprecated` 是 Transformers 警告，不影响训练。
-- `NCCL_DEBUG=INFO` 产生大量日志属正常噪音，可调低为 `WARN`。
-- 参数打印中的 `device=cpu` 出现在 DeepSpeed prepare 之前，不代表训练在 CPU 上执行。
-- `xlrs-lite` 评测中 `(A)` 会被标准化为 `A`，两者均算正确。
-- `PIL.Image.MAX_IMAGE_PIXELS = None` 已在 `data.py` 中全局关闭，避免超大图报错。
+- `NCCL_DEBUG=INFO` 会产生大量日志；需要降噪时可改为 `WARN`。
+- 参数打印中出现 `device=cpu` 可能发生在 DeepSpeed prepare 之前，不代表最终训练在 CPU 上。
+- `PIL.Image.MAX_IMAGE_PIXELS = None` 已在训练数据路径全局关闭，用于避免超大图触发 PIL 限制。

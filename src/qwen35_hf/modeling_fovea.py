@@ -20,7 +20,15 @@ from .configuration_fovea import FoveaConfig
 
 
 class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-    """Multimodal causal LM head for text, image, and video generation."""
+    """Multimodal causal LM head for text, image, and video generation.
+
+    ImgSlot overview:
+    - Prefill: replace text-side image placeholder spans with one shared anchor span
+      plus one Top-K visual span per image block.
+    - Decode: keep a detached runtime state per sample, and every `delta` steps
+      refresh the slot tokens then overwrite their KV cache entries on
+      full-attention layers only.
+    """
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     accepts_loss_kwargs = False
     config: FoveaConfig
@@ -33,7 +41,11 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         num_anchor_tokens = max(1, int(config.img_slot_m))
         num_heads = next((h for h in (16, 12, 8, 6, 4, 3, 2, 1) if hidden_size % h == 0), 1)
         self.imgslot_num_heads = num_heads
+        # Anchor token table: [m, hidden].
         self.imgslot_a_tokens = nn.Embedding(num_anchor_tokens, hidden_size)
+        # Shared ImgSlot attention blocks. These do not replace decoder self-attn;
+        # they only synthesize/refresh slot tokens before writing them back into
+        # decoder KV cache.
         self.imgslot_text_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.imgslot_text_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.imgslot_text_v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -49,6 +61,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             nn.Linear(hidden_size * 4, hidden_size),
         )
         self.imgslot_ffn_norm = nn.LayerNorm(hidden_size)
+        # Runtime state used only during generation refresh.
+        # states: list[batch] -> list[visual_block_state]
+        # text_keys/text_values: per-sample cached text KV, each shaped
+        #   [1, num_heads, text_seq, head_dim]
         self._imgslot_runtime = {"enabled": False, "states": [], "delta": 1, "step": 0}
         self.post_init()
 
@@ -74,6 +90,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         }
 
     def _project_imgslot_kv(self, tokens, k_proj, v_proj):
+        # tokens: [seq, hidden]
+        # -> key/value: [1, num_heads, seq, head_dim]
         num_heads = self.imgslot_num_heads
         hidden_dim = tokens.shape[-1]
         head_dim = hidden_dim // num_heads
@@ -96,6 +114,12 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         )
 
     def _run_imgslot_attention(self, anchor_tokens, key_states, value_states, q_proj, o_proj, mask=None):
+        # anchor_tokens: [block_count, slot_seq, hidden]
+        # key_states/value_states: [block_count, num_heads, kv_seq, head_dim]
+        # mask: [block_count, kv_seq] where True means valid token.
+        # query: [block_count, num_heads, slot_seq, head_dim]
+        # attention_logits: [block_count, num_heads, slot_seq, kv_seq]
+        # context: [block_count, slot_seq, hidden]
         num_heads = self.imgslot_num_heads
         hidden_dim = anchor_tokens.shape[-1]
         head_dim = hidden_dim // num_heads
@@ -104,6 +128,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         attention_logits = torch.matmul(query.float(), key_states.float().transpose(-2, -1)) / math.sqrt(head_dim)
         if mask is not None:
             attention_logits = attention_logits.masked_fill(~mask[:, None, None, :], torch.finfo(attention_logits.dtype).min)
+        # Stabilize softmax over the kv dimension.
         attention_logits = attention_logits - attention_logits.amax(dim=-1, keepdim=True)
         attention_weights = torch.softmax(attention_logits, dim=-1).to(value_states.dtype)
         context = torch.matmul(attention_weights.float(), value_states.float()).transpose(1, 2).reshape(block_count, anchor_tokens.shape[1], hidden_dim)
@@ -132,12 +157,20 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             self.imgslot_img_o_proj,
             mask=visual_mask,
         )
+        # attention_weights: [block_count, num_heads, m, visual_seq]
+        # mean(1): average over heads -> [block_count, m, visual_seq]
+        # max(1): any anchor can nominate a visual token -> [block_count, visual_seq]
         scores = attention_weights.mean(1).max(1).values
         if visual_mask is not None:
             scores = scores.masked_fill(~visual_mask, torch.finfo(scores.dtype).min)
         return updated_anchor_tokens, scores
 
     def _pad_imgslot_visual_kv(self, visual_kv, device, dtype):
+        # visual_kv: list[(key, value)] where each key/value is
+        #   [1, num_heads, visual_seq_i, head_dim]
+        # After padding:
+        #   visual_keys_padded/visual_values_padded: [block_count, num_heads, max_visual_tokens, head_dim]
+        #   visual_mask: [block_count, max_visual_tokens]
         block_count = len(visual_kv)
         visual_lengths = [visual_key.shape[-2] for visual_key, _visual_value in visual_kv]
         max_visual_tokens = max(visual_lengths)
@@ -184,12 +217,15 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             raise ValueError(f"ImgSlot anchor span length {anchor_span_length} must equal m ({num_anchors}).")
         visual_device = visual_pools[0].device
         visual_dtype = visual_pools[0].dtype
+        # text_tokens: [text_seq, hidden]
         if text_tokens.numel() == 0:
             raise ValueError("ImgSlot requires non-empty text_tokens.")
         if text_key is None or text_value is None:
             text_key, text_value = self._project_imgslot_text_tokens(text_tokens.to(visual_dtype))
 
         block_count = len(visual_pools)
+        # Each visual_pool: [visual_seq_i, hidden]
+        # visual_kv entries: ([1, num_heads, visual_seq_i, head_dim], same for value)
         visual_kv = [self._project_imgslot_visual_pool(visual_pool) for visual_pool in visual_pools]
         visual_keys_padded, visual_values_padded, visual_mask = self._pad_imgslot_visual_kv(
             visual_kv,
@@ -197,10 +233,16 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             dtype=visual_dtype,
         )
 
+        # anchor_seed: [m, hidden] -> unsqueeze -> [1, m, hidden]
         anchor_seed = self.imgslot_a_tokens.weight[:num_anchors].to(device=visual_device, dtype=visual_dtype)
         text_key = text_key.to(device=visual_device, dtype=visual_dtype)
         text_value = text_value.to(device=visual_device, dtype=visual_dtype)
+        # anchor_text: [1, m, hidden]
         anchor_text = self._run_imgslot_text_blocks(anchor_seed.unsqueeze(0), text_key, text_value)
+        # Expand one shared anchor set to all visual blocks, then let each block attend
+        # its own visual pool.
+        # shared_anchor_tokens: [block_count, m, hidden]
+        # scores_padded: [block_count, max_visual_tokens]
         shared_anchor_tokens, scores_padded = self._run_imgslot_visual_blocks(
             anchor_text.expand(block_count, -1, -1),
             visual_keys_padded,
@@ -219,21 +261,25 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                     f"ImgSlot visual pool has {visual_pool.shape[0]} tokens, fewer than k ({topk_target}). "
                     "Increase tile size, reduce img_slot_k, or increase block resolution."
                 )
+            # scores: [visual_seq_i] -> topk_idx: [k] -> visual_topk: [k, hidden]
             scores = scores_padded[block_idx, : visual_pool.shape[0]]
             topk_idx = torch.topk(scores, k=topk_target, dim=0).indices
             visual_topk = visual_pool[topk_idx]
             visual_replacements.append(visual_topk)
             states.append(
                 {
+                    # Shared anchor span for the whole sample.
                     "anchor_span": (int(anchor_span_start), int(anchor_span_length)),
+                    # This visual block's text-side replacement span.
                     "span": (int(span_start), int(span_length)),
-                    "A": shared_anchor_tokens_single.detach(),
-                    "V": visual_pool.detach(),
-                    "V_k": visual_pair[0].detach(),
-                    "V_v": visual_pair[1].detach(),
-                    "V_topk": visual_topk.detach(),
-                    "score_prev": scores.detach(),
-                    "topk_idx": topk_idx.detach(),
+                    # Detached runtime state used only for generation refresh.
+                    "A": shared_anchor_tokens_single.detach(),  # [m, hidden]
+                    "V": visual_pool.detach(),  # [visual_seq_i, hidden]
+                    "V_k": visual_pair[0].detach(),  # [1, num_heads, visual_seq_i, head_dim]
+                    "V_v": visual_pair[1].detach(),  # [1, num_heads, visual_seq_i, head_dim]
+                    "V_topk": visual_topk.detach(),  # [k, hidden]
+                    "score_prev": scores.detach(),  # [visual_seq_i]
+                    "topk_idx": topk_idx.detach(),  # [k]
                 }
             )
         return shared_anchor_tokens_single, visual_replacements, states
@@ -250,8 +296,12 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         text_key = text_key.to(device=visual_device, dtype=visual_dtype)
         text_value = text_value.to(device=visual_device, dtype=visual_dtype)
+        # anchors_prev: [1, m, hidden]
         anchors_prev = states[0]["A"].to(device=visual_device, dtype=visual_dtype).unsqueeze(0)
+        # anchors_text: [1, m, hidden]
         anchors_text = self._run_imgslot_text_blocks(anchors_prev, text_key, text_value)
+        # Exponential-style smoothing between previous anchor state and the
+        # latest text-conditioned anchor update.
         anchors_text = (1.0 - imgslot_config["beta"]) * anchors_prev + imgslot_config["beta"] * anchors_text
 
         visual_kv = [(state["V_k"], state["V_v"]) for state in states]
@@ -260,6 +310,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             device=visual_device,
             dtype=visual_dtype,
         )
+        # anchors_new: [block_count, m, hidden]
+        # scores_current_padded: [block_count, max_visual_tokens]
         anchors_new, scores_current_padded = self._run_imgslot_visual_blocks(
             anchors_text.expand(block_count, -1, -1),
             visual_keys_padded,
@@ -282,6 +334,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                     f"ImgSlot visual pool has {visual_pool.shape[0]} tokens, fewer than k ({topk_target}). "
                     "Increase tile size, reduce img_slot_k, or increase block resolution."
                 )
+            # scores_current / score_prev: [visual_seq_i]
+            # topk_idx: [k], visual_topk: [k, hidden]
             scores_current = scores_current_padded[state_idx, : visual_pool.shape[0]]
             scores = imgslot_config["lam"] * state["score_prev"] + (1.0 - imgslot_config["lam"]) * scores_current
             topk_idx = torch.topk(scores, k=topk_target, dim=0).indices
@@ -330,6 +384,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             raise ValueError("ImgSlot visual block count must match placeholder visual span count.")
         batch_states: list[list[dict[str, Any]]] = []
         pool_index = 0
+        # new_inputs_embeds: [batch, seq, hidden]
         new_inputs_embeds = inputs_embeds.clone()
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
@@ -344,6 +399,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 runtime_text_values.append(inputs_embeds.new_zeros((1, self.imgslot_num_heads, 0, inputs_embeds.shape[-1] // self.imgslot_num_heads)).detach())
                 continue
             anchor_span, visual_spans = self._split_imgslot_sample_spans(spans)
+            # valid_text_mask: [seq]
+            # text_tokens: [text_seq, hidden], with image placeholders removed.
             valid_text_mask = (input_ids[batch_idx] != self.config.image_token_id) & attention_mask[batch_idx].bool()
             text_tokens = inputs_embeds[batch_idx][valid_text_mask][-max_text_tokens:]
             text_key = text_value = None
@@ -361,8 +418,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 text_key=text_key,
                 text_value=text_value,
             )
+            # Write one shared anchor block back into the first placeholder span.
             anchor_start, anchor_length = anchor_span
             new_inputs_embeds[batch_idx, anchor_start : anchor_start + anchor_length] = anchor_replacement.to(inputs_embeds.dtype)
+            # Write one Top-K visual block back into each remaining placeholder span.
             for replacement, (span_start, span_length) in zip(visual_replacements, visual_spans):
                 new_inputs_embeds[batch_idx, span_start : span_start + span_length] = replacement.to(inputs_embeds.dtype)
             batch_states.append(sample_states)
@@ -381,12 +440,17 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     def _slot_kv_for_layer(self, layer, slot_tokens, slot_positions):
         attention = layer.self_attn
         layer_device = next(layer.parameters()).device
+        # slot_tokens: [num_records, slot_seq, hidden]
+        # slot_positions: [num_records, slot_seq]
         slot_tokens = slot_tokens.to(device=layer_device)
         slot_positions = slot_positions.to(device=layer_device)
         input_shape = slot_tokens.shape[:-1]
         hidden_shape = (*input_shape, -1, attention.head_dim)
+        # key_states/value_states before RoPE: [num_records, num_kv_heads/num_heads, slot_seq, head_dim]
         key_states = attention.k_norm(attention.k_proj(slot_tokens).view(hidden_shape)).transpose(1, 2)
         value_states = attention.v_proj(slot_tokens).view(hidden_shape).transpose(1, 2)
+        # Rebuild per-layer KV exactly in the decoder layer's parameter space, then
+        # apply RoPE to key so the overwritten cache matches native full-attn cache layout.
         dummy_query = key_states.new_zeros((slot_tokens.shape[0], attention.config.num_attention_heads, slot_tokens.shape[1], attention.head_dim))
         position_embeddings = self.model.language_model.rotary_emb(slot_tokens, slot_positions)
         _, key_states = apply_rotary_pos_emb(dummy_query, key_states, *position_embeddings)
@@ -398,6 +462,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         values = cache_layer.values
         if keys.numel() == 0 or span_end > keys.shape[-2]:
             return False
+        # keys/values: [batch, num_kv_heads/num_heads, cache_seq, head_dim]
+        # key_states/value_states: [1, num_kv_heads/num_heads, slot_seq, head_dim]
         keys[batch_idx, :, span_start:span_end] = key_states[0].to(keys.dtype)
         values[batch_idx, :, span_start:span_end] = value_states[0].to(values.dtype)
         return True
@@ -465,6 +531,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if not anchor_records and not visual_records:
             return past_key_values
 
+        # Only overwrite layers that use native full attention. Non-full-attention
+        # layers keep their own state transition logic untouched.
         for layer_idx, layer in enumerate(layers):
             if layer_idx < len(layer_types) and layer_types[layer_idx] != "full_attention":
                 continue
@@ -478,6 +546,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             return
         if hidden_states.shape[1] == 0:
             return
+        # last_hidden: [batch, 1, hidden]
         last_hidden = hidden_states[:, -1:, :].detach()
         text_keys = runtime.setdefault("text_keys", [])
         text_values = runtime.setdefault("text_values", [])
@@ -485,7 +554,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             return
         max_text_tokens = int(self._imgslot_config()["max_text_tokens"])
         for batch_idx in range(last_hidden.shape[0]):
+            # last_hidden[batch_idx]: [1, hidden] -> new_key/new_value: [1, num_heads, 1, head_dim]
             new_key, new_value = self._project_imgslot_text_tokens(last_hidden[batch_idx])
+            # Append one new text token into the per-sample runtime KV memory, then
+            # keep only the latest max_text_tokens entries along seq dim (-2).
             text_keys[batch_idx] = torch.cat([text_keys[batch_idx].to(new_key.device, new_key.dtype), new_key], dim=-2)[:, :, -max_text_tokens:, :].detach()
             text_values[batch_idx] = torch.cat([text_values[batch_idx].to(new_value.device, new_value.dtype), new_value], dim=-2)[:, :, -max_text_tokens:, :].detach()
 
@@ -528,9 +600,18 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     ) -> tuple | Qwen3_5CausalLMOutputWithPast:
         pre_refresh_past_key_values = past_key_values
         imgslot_first_prefill = bool(kwargs.pop("imgslot_first_prefill", False))
+        # Decode path: refresh cached slot tokens before entering the decoder so the
+        # next token attends to the latest anchor/Top-K visual state.
         if self._imgslot_is_enabled() and past_key_values is not None:
             past_key_values = self._maybe_refresh_imgslot_cache(past_key_values)
 
+        # Prefill path with images:
+        # - input_ids: [batch, seq]
+        # - inputs_embeds: [batch, seq, hidden]
+        # - visual_pools: flat list over all image blocks in the batch, each item is
+        #   [visual_seq_i, hidden]
+        # This rewrites placeholder spans in inputs_embeds, then skips the normal
+        # Qwen multimodal scatter path by clearing pixel/grid/mm-token inputs.
         if self._imgslot_is_enabled() and (imgslot_first_prefill or past_key_values is None) and input_ids is not None and pixel_values is not None:
             if inputs_embeds is None:
                 inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -566,8 +647,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]
+        # hidden_states: [batch, step_seq, hidden]
         self._append_imgslot_text_hidden(hidden_states, pre_refresh_past_key_values)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # logits: [batch, kept_seq, vocab]
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
