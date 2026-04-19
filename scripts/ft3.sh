@@ -10,17 +10,23 @@ WORKSPACE_ROOT="$(cd -- "${PROJECT_ROOT}" && pwd)"
 export NNODES=1
 export NUM_GPUS=1
 export MASTER_ADDR="127.0.0.1"
-export MASTER_PORT=29599
+if [[ -v FT3_MASTER_PORT ]]; then
+    export MASTER_PORT="${FT3_MASTER_PORT}"
+else
+    export MASTER_PORT=29599
+fi
 export WORLD_SIZE=$((NNODES * NUM_GPUS))
 export RANK=0
 
-NUM_TRAIN_EPOCHS=1
-RUN_NAME="Qwen3.5-ft3-imgslot"
-JSON_PATH="/mnt/data/GeoLLaVA-Data/ft3_whole_shuffle.json"
-IMAGE_FOLDER="/mnt/data/GeoLLaVA-Data/jpg_images"
-CKPT_PATH="Qwen/Qwen3.5-9B"
-OUTPUT_DIR="${PROJECT_ROOT}/checkpoints/${RUN_NAME}"
-IMG_SLOT_TILE_SIZE=1024
+NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
+RUN_NAME="${FT3_RUN_NAME:-fovea-ft3-imgslot}"
+JSON_PATH="${FT3_JSON_PATH:-/mnt/data/GeoLLaVA-Data/ft3_whole_shuffle.json}"
+IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-/mnt/data/GeoLLaVA-Data/jpg_images}"
+CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
+OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
+IMG_SLOT_TILE_SIZE="${FT3_IMG_SLOT_TILE_SIZE:-1024}"
+SAVE_STEPS="${FT3_SAVE_STEPS:-200}"
+MAX_STEPS="${FT3_MAX_STEPS:--1}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src"
 
@@ -69,22 +75,16 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
     --unfreeze_vision true \
-    --img_slot_enable true \
-    --img_slot_m 8 \
-    --img_slot_k 128 \
-    --img_slot_delta 128 \
-    --img_slot_beta 0.3 \
-    --img_slot_lambda 0.5 \
-    --img_slot_tile_size "${IMG_SLOT_TILE_SIZE}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
     --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
+    --max_steps "${MAX_STEPS}" \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 4 \
     --eval_strategy no \
     --save_strategy steps \
-    --save_steps 500 \
+    --save_steps "${SAVE_STEPS}" \
     --save_total_limit 2 \
     --learning_rate 5e-6 \
     --weight_decay 0.0 \

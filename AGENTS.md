@@ -6,7 +6,7 @@
 
 ## 项目简介
 
-`qwen35-hf` 是将 HuggingFace Transformers 中 `qwen3_5` 实现提取为独立库的最小打包版本，附带 LoRA 微调流程和 lmms-eval 评测适配器。dev 分支新增了 **ImgSlot** 机制：将图像分块后用动态锚点 token + Top-K 视觉 token 替换原始图像占位，减少视觉 token 开销。
+`qwen35-hf` 当前已切换为 **Fovea** 命名主线：在保留 Qwen3.5 架构兼容配置别名的同时，对外主模型/processor/tokenizer 入口分别为 `FoveaForConditionalGeneration`、`FoveaProcessor`、`FoveaTokenizer`。dev 分支新增了 **ImgSlot** 机制：将图像分块后用动态锚点 token + Top-K 视觉 token 替换原始图像占位，减少视觉 token 开销。
 
 ---
 
@@ -49,12 +49,13 @@ bash -n scripts/eval.sh
 
 ```
 src/qwen35_hf/
-  __init__.py                  # 公共 API：导出模型、配置、tokenizer、processor
-  configuration_qwen3_5.py     # Qwen3_5Config（含 img_slot_* 字段）/ Text / Vision Config
-  modeling_qwen3_5.py          # 模型实现，直接在此修改（不改 modular_qwen3_5.py）
+  __init__.py                  # 公共 API：导出 Fovea 模型、配置、tokenizer、processor
+  configuration_fovea.py       # FoveaConfig / FoveaTextConfig / FoveaVisionConfig（含 img_slot_* 字段）
+  modeling_qwen3_5.py          # Qwen3.5 基础类与公共实现（不再包含条件生成主类）
+  modeling_fovea.py            # FoveaForConditionalGeneration（主模型入口，含 ImgSlot helper）
   modular_qwen3_5.py           # 原始模板文件，不修改
-  tokenization_qwen3_5.py      # Qwen3_5Tokenizer
-  processing_qwen3_vl.py       # Qwen3VLProcessor（视觉-语言预处理、token 构建工具）
+  tokenization_fovea.py        # FoveaTokenizer
+  processing_fovea.py          # FoveaProcessor（视觉-语言预处理、token 构建工具）
   train/
     sft.py                     # 训练入口（ModelArguments / DataArguments / TrainingArguments）
     data.py                    # 数据集加载、ChatML 编码、VisionPacker（含 ImgSlot 路径）
@@ -66,17 +67,17 @@ scripts/
   zero2_tp2.json               # DeepSpeed ZeRO-2 配置
 
 lmms-eval/
-  lmms_eval/models/simple/qwen35_hf.py   # lmms-eval 自定义模型适配器（含 ImgSlot 参数）
+  lmms_eval/models/simple/fovea.py   # lmms-eval 自定义模型适配器（含 ImgSlot 参数）
 ```
 
 ### 模型继承链
 
 ```
-Qwen3_5TextConfig   ← Qwen3NextConfig
-Qwen3_5VisionConfig ← Qwen3VLVisionConfig
-Qwen3_5Config       ← (组合 Text + Vision 配置，新增 img_slot_* 字段)
+FoveaTextConfig   ← Qwen3NextConfig
+FoveaVisionConfig ← Qwen3VLVisionConfig
+FoveaConfig       ← (组合 Text + Vision 配置，新增 img_slot_* 字段)
 
-Qwen3_5ForConditionalGeneration ← Qwen3VLForConditionalGeneration
+FoveaForConditionalGeneration ← Qwen3VLForConditionalGeneration
   ├── visual: Qwen3VLVisionModel      （vision tower，--unfreeze_vision 时解冻）
   ├── model:  Qwen3_5TextModel
   │     └── layers: Qwen3NextAttention + Qwen3NextGatedDeltaNet（线性注意力）
@@ -96,19 +97,19 @@ Qwen3_5ForConditionalGeneration ← Qwen3VLForConditionalGeneration
 1. `split_image_into_blocks(image, tile_size)` — 将原图按 `ceil(W/tile_size) × ceil(H/tile_size)` 均分为 blocks。
 2. 每个 block 走 `_pack_single_block`（normal 路径），得到 `pixel_values` 和 `image_grid_thw`（多 block 时 grid 为 2D tensor）。
 3. 数据编码时，每个 block 对应的 token 数固定为 `img_slot_m + img_slot_k`（不再使用 `image_grid_thw` 计算）。
-4. 训练时，`Qwen3_5ForConditionalGeneration` 将图像占位 span 替换为：
+4. 训练时，`FoveaForConditionalGeneration` 将图像占位 span 替换为：
    - `img_slot_m` 个动态锚点 token（由 `imgslot_a_tokens.weight` + 文本交叉注意力初始化）
    - `img_slot_k` 个 Top-K 视觉 token（由锚点对视觉池打分后选出）
 5. 推理时每隔 `img_slot_delta` 步用动量（`img_slot_lambda`）更新锚点和 Top-K 选择。
 
-**关键参数（`Qwen3_5Config` 中）：**
+**关键参数（`FoveaConfig` 中）：**
 
 | 参数 | 默认值 | 含义 |
 |------|--------|------|
 | `img_slot_enable` | `False` | 是否启用 ImgSlot |
 | `img_slot_m` | 8 | 每个 block 的动态锚点 token 数 |
 | `img_slot_k` | 128 | 每个 block 的 Top-K 视觉 token 数 |
-| `img_slot_delta` | 8 | 推理时刷新 KV 的解码步间隔 |
+| `img_slot_delta` | 129 | 推理时刷新 KV 的解码步间隔 |
 | `img_slot_beta` | 0.3 | 锚点动量更新强度 |
 | `img_slot_lambda` | 0.9 | 视觉 Top-K 分数动量系数 |
 | `img_slot_tile_size` | `None`（必填） | 原图切块边长（像素） |
@@ -143,7 +144,7 @@ Qwen3_5ForConditionalGeneration ← Qwen3VLForConditionalGeneration
 
 ### 评测适配器
 
-`lmms_eval/models/simple/qwen35_hf.py`：
+`lmms_eval/models/simple/fovea.py`：
 - 接受全部 `img_slot_*` 参数（字符串/数值均可，内部做类型转换）。
 - `LocalVisionImageProcessor` 记录每张图的 block 数（`_last_image_block_counts`），供 token 对齐使用。
 - LoRA 评测：先加载 `BASE_MODEL`，再 `PeftModel.from_pretrained(LORA_CHECKPOINT)`。
@@ -155,7 +156,7 @@ Qwen3_5ForConditionalGeneration ← Qwen3VLForConditionalGeneration
 
 - **直接修改 `modeling_qwen3_5.py`**，不修改 `modular_qwen3_5.py`。
 - **训练与评测 ImgSlot 参数必须同步**：修改任一侧的参数默认值或逻辑，同步更新另一侧。
-- **Qwen3.5 专用评测逻辑放在 `lmms_eval/models/simple/qwen35_hf.py`**，不修改通用 `qwen3_vl.py`。
+- **Qwen3.5 专用评测逻辑放在 `lmms_eval/models/simple/fovea.py`**，不修改通用 `qwen3_vl.py`。
 - **每次修改代码后更新本文档**，重点更新受影响的架构说明、参数约定或命令。
 - **遇到不确定的代码设计问题时，必须先询问 THX，不得直接行动。**
 - **不能写兼容性代码，除非你明确要求。**
@@ -165,26 +166,31 @@ Qwen3_5ForConditionalGeneration ← Qwen3VLForConditionalGeneration
 
 - ImgSlot 核心实现已收敛为 **sample-batched 主路径**：prefill 初始化与 decode refresh 都优先按 sample 内全部 blocks 批量处理，不再维护独立的单 block helper 分支。
 - ImgSlot 文本条件化与视觉打分统一使用 batched helper，避免重复维护单块版和批量版逻辑。
+- ImgSlot 的文本/视觉 KV 投影 helper 输入约定为 **2D token 张量 `[seq, hidden]`**，输出必须显式补 batch 维，固定为 **`[1, num_heads, seq, head_dim]`**；不能按 `tokens.shape[:-1]` 泛化保形，否则会把序列长度错当 batch 维，在 `_run_imgslot_attention` 中触发 `matmul` 维度错误。
 
 - ImgSlot decode refresh 的空文本分支必须按 **每个 block 各自的 `V`** 构造 fallback text KV，不能错误地复用第一个 block 的视觉池，否则多 block 样本会发生条件化串扰。
 
-- `eval.sh` 通过 `lmms_eval/models/simple/qwen35_hf.py` 间接调用本地 `modeling_qwen3_5.py`；评测入口不是直接执行模型定义文件。
+- `eval.sh` 通过 `lmms_eval/models/simple/fovea.py` 间接调用本地 `modeling_qwen3_5.py`；评测入口不是直接执行模型定义文件。
 - 当前评测适配器在 ImgSlot 启用时 **允许 `use_cache`**，以便评测路径对齐当前实现的缓存/refresh 行为；但仍不向模型传 `mm_token_type_ids`。
 
-- 评测适配器 `lmms_eval/models/simple/qwen35_hf.py` 目前在 ImgSlot 启用时必须保持 `use_cache=False`：否则 `generate()` 的 prefill 会落回原始 placeholder/image-feature 对齐路径，触发 `image tokens != image features` 错误。
-
-- ImgSlot generation 在 `use_cache=True` 时，首轮 prefill 必须由 `Qwen3_5ForConditionalGeneration.forward()` 的 embedding-rewrite 分支接管；当前实现通过 generation 输入中的 `imgslot_first_prefill` 标记显式触发该分支，随后 decode 再进入 cache / refresh 路径。
-- 评测适配器 `lmms_eval/models/simple/qwen35_hf.py` 现在允许 `use_cache=True`，前提是上述首轮 prefill 接管逻辑保持有效。
+- ImgSlot generation 在 `use_cache=True` 时，首轮 prefill 必须由 `FoveaForConditionalGeneration.forward()` 的 embedding-rewrite 分支接管；当前实现通过 generation 输入中的 `imgslot_first_prefill` 标记显式触发该分支，随后 decode 再进入 cache / refresh 路径。
+- 评测适配器 `lmms_eval/models/simple/fovea.py` 现在允许 `use_cache=True`，前提是上述首轮 prefill 接管逻辑保持有效。
 
 - `xlrs-lite` 当前在 task 层通过 `process_docs` 预裁剪数据：按 `doc["category"]`（即 task/subtask 组合键）每类最多保留 60 条，而不是用 CLI `--limit` 对整个聚合任务统一截断。
 
-- `Qwen3_5ForConditionalGeneration` 中的 ImgSlot 兼容/兜底逻辑已移除：不再保留 `_sanitize_imgslot_tensor`、空文本 fallback、Top-K padding、legacy tuple/list cache 支持等防御性路径；代码只支持当前仓库明确使用的输入与 cache 结构。
+- `FoveaForConditionalGeneration` 中的 ImgSlot 兼容/兜底逻辑已移除：不再保留 `_sanitize_imgslot_tensor`、空文本 fallback、Top-K padding、legacy tuple/list cache 支持等防御性路径；代码只支持当前仓库明确使用的输入与 cache 结构。
 
-- ImgSlot 配置读取也已收紧：`Qwen3_5ForConditionalGeneration` 不再用 `getattr(..., default)` 提供默认超参，运行时要求 `config` 显式包含 `img_slot_*` 字段，并默认 `_imgslot_runtime`/`layer_types` 等结构始终存在且符合当前仓库约定。
+- ImgSlot 配置读取也已收紧：`FoveaForConditionalGeneration` 不再用 `getattr(..., default)` 提供默认超参，运行时要求 `config` 显式包含 `img_slot_*` 字段，并默认 `_imgslot_runtime`/`layer_types` 等结构始终存在且符合当前仓库约定。
 
 - `imgslot_a_tokens` 是 `nn.Embedding` 子模块，不再是根模块裸 `nn.Parameter`；它通过标准 module 初始化路径初始化，权重名为 `imgslot_a_tokens.weight`。
 
-- LoRA 训练在 `LoraConfig.modules_to_save` 中包含全部 ImgSlot 子模块（`imgslot_a_tokens`、文本/视觉投影、norm、FFN），因此 `adapter_model.safetensors` 会随 LoRA adapter 保存和恢复完整 ImgSlot 权重；不再为 ImgSlot 维护额外 sidecar checkpoint 文件。
+- LoRA 训练在 `LoraConfig.modules_to_save` 中包含全部 ImgSlot 子模块（`imgslot_a_tokens`、文本/视觉投影、norm、FFN），因此 `adapter_model.safetensors` 会随 LoRA adapter 保存和恢复完整 ImgSlot 权重；不再遗漏 `imgslot_img_v_proj` / `imgslot_img_o_proj` 这类可训练视觉投影。
+- `train_eval_loop.sh` 现在必须在训练或评测失败时立即退出；循环脚本启用 `set -euo pipefail`，且 `eval.sh` 失败会中断后续训练分段，不能静默继续。
+- `train_eval_loop.sh` 透传的 `FT3_*` 参数（如 `FT3_RUN_NAME`、`FT3_OUTPUT_DIR`、`FT3_JSON_PATH`、`FT3_IMAGE_FOLDER`、`FT3_CKPT_PATH`、`FT3_IMG_SLOT_TILE_SIZE`、`FT3_SAVE_STEPS`、`FT3_MAX_STEPS`、`FT3_IMG_SLOT_LAMBDA`）必须由 `scripts/ft3.sh` 显式读取；循环控制不能依赖脚本内硬编码默认值。
+- `ft3.sh` 现在同时向 Trainer 传 `--max_steps`，因此分段训练既受 `FT3_STOP_STEP` 控制，也受全局最大步数约束；不能只靠 epoch 长度碰运气达到目标 step。
+- 配置默认值已与当前主入口统一：`FoveaConfig` 默认使用 `img_slot_enable=True`、`img_slot_m=8`、`img_slot_k=128`、`img_slot_delta=129`、`img_slot_lambda=0.9`、`img_slot_tile_size=1024`，避免非脚本入口与脚本入口分叉。
+- 脚本入口现在不再显式传任何 `img_slot_*` 参数；训练与评测都直接依赖 `FoveaConfig` / checkpoint config。若要调整 ImgSlot 行为，应修改配置或在显式调用模型/适配器时覆盖，而不是在 `ft3.sh` / `eval.sh` 里重复传参。
+- ImgSlot 目前要求每个 visual pool 的 token 数至少为 `img_slot_k`；若 block 太小导致池化后 token 数不足，会直接报错并提示增大 `img_slot_tile_size`、减小 `img_slot_k` 或提高 block 分辨率，而不是在 `torch.topk` 处崩溃。
 
 ## 已知注意事项
 

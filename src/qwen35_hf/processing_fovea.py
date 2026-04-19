@@ -13,7 +13,6 @@ DEFAULT_VISION_END = "<|vision_end|>"
 
 def image_token_count_from_grid(image_grid_thw, merge_size: int) -> int:
     """Convert one `(t, h, w)` image grid into text-side image token count."""
-
     merge_length = max(int(merge_size), 1) ** 2
     grid_prod = image_grid_thw.prod()
     if hasattr(grid_prod, "item"):
@@ -27,14 +26,12 @@ def build_visual_placeholder(
     vision_start_token: str = DEFAULT_VISION_START,
     vision_end_token: str = DEFAULT_VISION_END,
 ) -> str:
-    """Expand one logical image into the placeholder span expected by Qwen VL."""
-
+    """Expand one logical image into the placeholder span expected by Fovea."""
     return f"{vision_start_token}{image_token * num_image_tokens}{vision_end_token}"
 
 
 def build_mm_token_type_ids(input_ids, image_token_id: int, video_token_id: int | None = None):
     """Mark image placeholder token positions for the multimodal model."""
-
     if hasattr(input_ids, "new_zeros"):
         mm_token_type_ids = input_ids.new_zeros(input_ids.shape, dtype=getattr(input_ids, "dtype", None))
         mm_token_type_ids[input_ids == image_token_id] = 1
@@ -50,7 +47,7 @@ def build_mm_token_type_ids(input_ids, image_token_id: int, video_token_id: int 
     return mm_token_type_ids
 
 
-class Qwen3VLProcessor(ProcessorMixin):
+class FoveaProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer", "video_processor"]
     image_processor_class = "AutoImageProcessor"
     video_processor_class = "AutoVideoProcessor"
@@ -58,23 +55,16 @@ class Qwen3VLProcessor(ProcessorMixin):
 
     def __init__(self, image_processor=None, tokenizer=None, video_processor=None, chat_template=None):
         super().__init__(image_processor, tokenizer, video_processor, chat_template=chat_template)
-
         self.image_token = getattr(tokenizer, "image_token", "<|image_pad|>")
         self.video_token = getattr(tokenizer, "video_token", "<|video_pad|>")
         self.image_token_id = getattr(tokenizer, "image_token_id", tokenizer.convert_tokens_to_ids(self.image_token))
         self.video_token_id = getattr(tokenizer, "video_token_id", tokenizer.convert_tokens_to_ids(self.video_token))
         self.vision_start_token = getattr(tokenizer, "vision_start_token", "<|vision_start|>")
         self.vision_end_token = getattr(tokenizer, "vision_end_token", "<|vision_end|>")
-        self.vision_start_token_id = getattr(
-            tokenizer, "vision_start_token_id", tokenizer.convert_tokens_to_ids(self.vision_start_token)
-        )
-        self.vision_end_token_id = getattr(
-            tokenizer, "vision_end_token_id", tokenizer.convert_tokens_to_ids(self.vision_end_token)
-        )
+        self.vision_start_token_id = getattr(tokenizer, "vision_start_token_id", tokenizer.convert_tokens_to_ids(self.vision_start_token))
+        self.vision_end_token_id = getattr(tokenizer, "vision_end_token_id", tokenizer.convert_tokens_to_ids(self.vision_end_token))
 
     def image_token_counts_from_grids(self, image_grid_thw) -> list[int]:
-        """Return per-image text placeholder counts from processor grid metadata."""
-
         if image_grid_thw is None:
             return []
         if hasattr(image_grid_thw, "dim") and image_grid_thw.dim() == 1:
@@ -98,26 +88,36 @@ class Qwen3VLProcessor(ProcessorMixin):
         )
 
     def expand_image_pad_tokens(self, text: list[str], image_grid_thw) -> list[str]:
-        """Expand each single image pad in text to match packed visual tokens."""
-
         image_token_counts = self.image_token_counts_from_grids(image_grid_thw)
         image_block_counts = getattr(self.image_processor, "_last_image_block_counts", None)
         index = 0
         image_index = 0
         output = text.copy()
+
+        def take_block_counts() -> list[int]:
+            nonlocal index, image_index
+            if index >= len(image_token_counts):
+                raise ValueError("Text contains more image placeholders than image_grid_thw entries.")
+            block_count = 1
+            if image_block_counts is not None:
+                if image_index >= len(image_block_counts):
+                    raise ValueError("Text contains more image placeholders than image block metadata entries.")
+                block_count = int(image_block_counts[image_index])
+            block_counts = image_token_counts[index : index + block_count]
+            if len(block_counts) != block_count:
+                raise ValueError("image_grid_thw contains fewer blocks than expected for image placeholder.")
+            index += block_count
+            image_index += 1
+            return block_counts
+
         for i in range(len(output)):
+            anchor_count = getattr(self.image_processor, "img_slot_anchor_count", None)
+            anchor_placeholder = self.image_token * int(anchor_count) if anchor_count is not None else ""
+            has_image_placeholder = False
             full_placeholder = f"{self.vision_start_token}{self.image_token}{self.vision_end_token}"
             while full_placeholder in output[i]:
-                if index >= len(image_token_counts):
-                    raise ValueError("Text contains more image placeholders than image_grid_thw entries.")
-                block_count = 1
-                if image_block_counts is not None:
-                    if image_index >= len(image_block_counts):
-                        raise ValueError("Text contains more image placeholders than image block metadata entries.")
-                    block_count = int(image_block_counts[image_index])
-                block_counts = image_token_counts[index : index + block_count]
-                if len(block_counts) != block_count:
-                    raise ValueError("image_grid_thw contains fewer blocks than expected for image placeholder.")
+                has_image_placeholder = True
+                block_counts = take_block_counts()
                 replacement = "".join(
                     build_visual_placeholder(
                         count,
@@ -127,21 +127,11 @@ class Qwen3VLProcessor(ProcessorMixin):
                     )
                     for count in block_counts
                 )
-                index += block_count
-                image_index += 1
                 output[i] = output[i].replace(full_placeholder, replacement, 1)
             while self.image_token in output[i]:
-                if index >= len(image_token_counts):
-                    raise ValueError("Text contains more image placeholders than image_grid_thw entries.")
-                block_count = 1
-                if image_block_counts is not None:
-                    if image_index >= len(image_block_counts):
-                        raise ValueError("Text contains more image placeholders than image block metadata entries.")
-                    block_count = int(image_block_counts[image_index])
-                block_counts = image_token_counts[index : index + block_count]
-                if len(block_counts) != block_count:
-                    raise ValueError("image_grid_thw contains fewer blocks than expected for image placeholder.")
-                if block_count == 1:
+                has_image_placeholder = True
+                block_counts = take_block_counts()
+                if len(block_counts) == 1:
                     replacement = "<|placeholder|>" * block_counts[0]
                 else:
                     replacement = "".join(
@@ -154,9 +144,9 @@ class Qwen3VLProcessor(ProcessorMixin):
                         for count in block_counts
                     )
                 output[i] = output[i].replace(self.image_token, replacement, 1)
-                index += block_count
-                image_index += 1
             output[i] = output[i].replace("<|placeholder|>", self.image_token)
+            if anchor_placeholder and has_image_placeholder:
+                output[i] = anchor_placeholder + output[i]
         if index != len(image_token_counts):
             raise ValueError("image_grid_thw contains more images than text placeholders.")
         return output
@@ -217,7 +207,7 @@ __all__ = [
     "DEFAULT_IMAGE_PAD",
     "DEFAULT_VISION_END",
     "DEFAULT_VISION_START",
-    "Qwen3VLProcessor",
+    "FoveaProcessor",
     "build_mm_token_type_ids",
     "build_visual_placeholder",
     "image_token_count_from_grid",

@@ -13,7 +13,7 @@ from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
 
-from qwen35_hf import Qwen3_5ForConditionalGeneration, Qwen3_5Tokenizer, Qwen3VLProcessor
+from qwen35_hf import FoveaForConditionalGeneration, FoveaTokenizer, FoveaProcessor
 from qwen35_hf.train.data import VisionPacker
 
 
@@ -25,6 +25,7 @@ class LocalVisionImageProcessor(ImageProcessingMixin):
     def __init__(self, vision_packer: VisionPacker) -> None:
         self.vision_packer = vision_packer
         self.merge_size = vision_packer.local_config.spatial_merge_size
+        self.img_slot_anchor_count = vision_packer.img_slot_anchor_count if vision_packer.img_slot_enable else None
         self.img_slot_token_count = vision_packer.img_slot_token_count if vision_packer.img_slot_enable else None
         self._last_image_block_counts = []
 
@@ -60,13 +61,13 @@ class LocalNoOpVideoProcessor(BaseVideoProcessor):
 
     def __call__(self, videos=None, **kwargs):
         if videos is not None:
-            raise ValueError("qwen35_hf local adapter currently supports image inputs only.")
+            raise ValueError("Fovea local adapter currently supports image inputs only.")
         return {}
 
 
-@register_model("qwen35_hf")
-class Qwen35HF(Qwen3_VL):
-    """lmms-eval adapter for the local qwen35_hf implementation."""
+@register_model("fovea")
+class Fovea(Qwen3_VL):
+    """lmms-eval adapter for the local Fovea implementation."""
 
     DEFAULT_GEN_KWARGS = {
         "max_new_tokens": 1024,
@@ -89,13 +90,13 @@ class Qwen35HF(Qwen3_VL):
         enable_thinking: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
         max_image_tokens: int | None = 128,
-        img_slot_enable: bool = False,
-        img_slot_m: int = 4,
-        img_slot_k: int = 64,
-        img_slot_delta: int = 8,
-        img_slot_beta: float = 0.3,
-        img_slot_lambda: float = 0.9,
-        img_slot_tile_size: int | None = None,
+        img_slot_enable: bool = True,
+        img_slot_m: int | None = None,
+        img_slot_k: int | None = None,
+        img_slot_delta: int | None = None,
+        img_slot_beta: float | None = None,
+        img_slot_lambda: float | None = None,
+        img_slot_tile_size: int | None = 1024,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -106,6 +107,16 @@ class Qwen35HF(Qwen3_VL):
             raise ValueError(f"attn_implementation must be one of {valid_attn_implementations}, got {attn_implementation}")
         if isinstance(img_slot_enable, str):
             img_slot_enable = img_slot_enable.lower() in {"1", "true", "yes"}
+        if img_slot_m is not None:
+            img_slot_m = int(img_slot_m)
+        if img_slot_k is not None:
+            img_slot_k = int(img_slot_k)
+        if img_slot_delta is not None:
+            img_slot_delta = int(img_slot_delta)
+        if img_slot_beta is not None:
+            img_slot_beta = float(img_slot_beta)
+        if img_slot_lambda is not None:
+            img_slot_lambda = float(img_slot_lambda)
         if img_slot_enable and img_slot_tile_size is None:
             raise ValueError("img_slot_tile_size is required when img_slot_enable=true.")
         self.img_slot_enable = bool(img_slot_enable)
@@ -125,26 +136,27 @@ class Qwen35HF(Qwen3_VL):
         }
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
-        model_kwargs.update(
-            {
-                "img_slot_enable": self.img_slot_enable,
-                "img_slot_m": int(img_slot_m),
-                "img_slot_k": int(img_slot_k),
-                "img_slot_delta": int(img_slot_delta),
-                "img_slot_beta": float(img_slot_beta),
-                "img_slot_lambda": float(img_slot_lambda),
-                "img_slot_tile_size": None if img_slot_tile_size is None else int(img_slot_tile_size),
-            }
-        )
+        if self.img_slot_enable:
+            model_kwargs["img_slot_enable"] = True
+        if img_slot_m is not None:
+            model_kwargs["img_slot_m"] = img_slot_m
+        if img_slot_k is not None:
+            model_kwargs["img_slot_k"] = img_slot_k
+        if img_slot_delta is not None:
+            model_kwargs["img_slot_delta"] = img_slot_delta
+        if img_slot_beta is not None:
+            model_kwargs["img_slot_beta"] = img_slot_beta
+        if img_slot_lambda is not None:
+            model_kwargs["img_slot_lambda"] = img_slot_lambda
+        if img_slot_tile_size is not None:
+            model_kwargs["img_slot_tile_size"] = int(img_slot_tile_size)
 
-        self._model = Qwen3_5ForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
+        self._model = FoveaForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
         self._model.config.img_slot_enable = self.img_slot_enable
-        self._model.config.img_slot_m = int(img_slot_m)
-        self._model.config.img_slot_k = int(img_slot_k)
-        self._model.config.img_slot_delta = int(img_slot_delta)
-        self._model.config.img_slot_beta = float(img_slot_beta)
-        self._model.config.img_slot_lambda = float(img_slot_lambda)
-        self._model.config.img_slot_tile_size = None if img_slot_tile_size is None else int(img_slot_tile_size)
+        if img_slot_tile_size is not None:
+            self._model.config.img_slot_tile_size = int(img_slot_tile_size)
+        config_img_slot_m = int(self._model.config.img_slot_m)
+        config_img_slot_k = int(self._model.config.img_slot_k)
         if peft is not None:
             from peft import PeftModel
 
@@ -152,16 +164,16 @@ class Qwen35HF(Qwen3_VL):
             self._model = PeftModel.from_pretrained(self._model, peft)
         self._model = self._model.eval()
 
-        self._tokenizer = Qwen3_5Tokenizer.from_pretrained(pretrained)
+        self._tokenizer = FoveaTokenizer.from_pretrained(pretrained)
         vision_packer = VisionPacker(
             vision_config=self._model.config.vision_config,
             max_image_tokens=max_image_tokens,
             img_slot_enable=self.img_slot_enable,
-            img_slot_m=int(img_slot_m),
-            img_slot_k=int(img_slot_k),
+            img_slot_m=config_img_slot_m,
+            img_slot_k=config_img_slot_k,
             img_slot_tile_size=None if img_slot_tile_size is None else int(img_slot_tile_size),
         )
-        self.processor = Qwen3VLProcessor(
+        self.processor = FoveaProcessor(
             image_processor=LocalVisionImageProcessor(vision_packer),
             tokenizer=self._tokenizer,
             video_processor=LocalNoOpVideoProcessor(),
@@ -281,7 +293,7 @@ class Qwen35HF(Qwen3_VL):
                 sample_visuals = [visual_list[i]] if isinstance(visual_list[i], (Image.Image, str)) else visual_list[i]
                 for visual in sample_visuals:
                     if isinstance(visual, str) and visual.endswith((".mp4", ".avi", ".mov")):
-                        raise ValueError("qwen35_hf local adapter currently supports image inputs only.")
+                        raise ValueError("Fovea local adapter currently supports image inputs only.")
                     if isinstance(visual, Image.Image):
                         processed_visuals.append({"type": "image", "image": visual})
 

@@ -1,2 +1,2 @@
-"""Training utilities for qwen35_hf."""
+"""Training utilities for Fovea."""
 

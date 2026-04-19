@@ -10,7 +10,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
-from ..processing_qwen3_vl import (
+from ..processing_fovea import (
+    DEFAULT_IMAGE_PAD,
     build_mm_token_type_ids,
     build_visual_placeholder,
     image_token_count_from_grid,
@@ -136,6 +137,7 @@ def encode_chatml_example(
     conversations: Sequence[dict[str, Any]],
     image_token_counts: Sequence[int | Sequence[int]],
     system_message: str,
+    img_slot_anchor_count: int | None = None,
 ) -> tuple[torch.LongTensor, torch.LongTensor]:
     """Encode one conversation into causal-LM inputs and labels.
 
@@ -166,6 +168,9 @@ def encode_chatml_example(
             supervised_prefix_len = min(supervised_prefix_len, len(segment_ids))
             labels.extend([IGNORE_INDEX] * supervised_prefix_len)
             labels.extend(segment_ids[supervised_prefix_len:])
+
+    if img_slot_anchor_count is not None and image_token_counts:
+        append_segment(DEFAULT_IMAGE_PAD * int(img_slot_anchor_count), supervised_prefix_len=None)
 
     system_segment = f"<|im_start|>system\n{system_message}<|im_end|>\n"
     append_segment(system_segment, supervised_prefix_len=None)
@@ -214,13 +219,14 @@ class VisionPacker:
     ) -> None:
         self.max_image_tokens = max_image_tokens
         self.img_slot_enable = img_slot_enable
-        self.img_slot_token_count = int(img_slot_m) + int(img_slot_k)
+        self.img_slot_anchor_count = int(img_slot_m)
+        self.img_slot_token_count = int(img_slot_k)
         self.img_slot_tile_size = img_slot_tile_size
         if self.img_slot_enable:
             if self.img_slot_tile_size is None:
                 raise ValueError("img_slot_tile_size is required when img_slot_enable=true.")
-            if self.img_slot_token_count <= 0:
-                raise ValueError("img_slot_m + img_slot_k must be positive when ImgSlot is enabled.")
+            if self.img_slot_anchor_count <= 0 or self.img_slot_token_count <= 0:
+                raise ValueError("img_slot_m and img_slot_k must be positive when ImgSlot is enabled.")
 
         # Some configs expose scalar patch sizes while others expose tuples.
         patch_size = vision_config.patch_size if isinstance(vision_config.patch_size, int) else int(vision_config.patch_size[0])
@@ -324,10 +330,10 @@ class LazySupervisedDataset(Dataset):
                     grids_for_counts = list(packed_grid)
                     image_grid_list.extend(grids_for_counts)
                 current_image_token_counts: list[int] = []
-                # Convert `(t, h, w)` grid metadata into the number of text-side
-                # image placeholder tokens expected by the language model. The
-                # spatial merge size reduces how many visual patches survive into
-                # the final multimodal token sequence.
+                # Text-side visual span lengths: ImgSlot uses one shared
+                # sentence-level A span of length m plus fixed k-token spans for
+                # each block; the normal path derives counts from `(t, h, w)`
+                # grid metadata after spatial merge.
                 for grid in grids_for_counts:
                     if self.img_slot_enable:
                         current_image_token_counts.append(self.vision_packer.img_slot_token_count)
@@ -350,6 +356,7 @@ class LazySupervisedDataset(Dataset):
             conversations=record["conversations"],
             image_token_counts=image_token_counts,
             system_message=self.system_message,
+            img_slot_anchor_count=self.vision_packer.img_slot_anchor_count if self.img_slot_enable else None,
         )
         mm_token_type_ids = build_mm_token_type_ids(input_ids=input_ids, image_token_id=self.image_token_id)
 

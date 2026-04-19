@@ -3,6 +3,7 @@
 *.vscode
 *.pyc
 *.whl
+*.claude
 __pycache__/
 logs/
 checkpoints/

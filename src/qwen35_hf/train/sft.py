@@ -1,10 +1,11 @@
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 import transformers
 from transformers import HfArgumentParser, Trainer
 
-from qwen35_hf import Qwen3_5ForConditionalGeneration, Qwen3_5Tokenizer
+from qwen35_hf import FoveaForConditionalGeneration, FoveaTokenizer
 
 from .data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
 
@@ -17,13 +18,13 @@ class ModelArguments:
     lora_alpha: int = field(default=16)
     lora_dropout: float = field(default=0.05)
     unfreeze_vision: bool = field(default=True)
-    img_slot_enable: bool = field(default=False)
-    img_slot_m: int = field(default=4)
-    img_slot_k: int = field(default=64)
-    img_slot_delta: int = field(default=8)
+    img_slot_enable: bool = field(default=True)
+    img_slot_m: int = field(default=8)
+    img_slot_k: int = field(default=128)
+    img_slot_delta: int = field(default=129)
     img_slot_beta: float = field(default=0.3)
     img_slot_lambda: float = field(default=0.9)
-    img_slot_tile_size: Optional[int] = field(default=None)
+    img_slot_tile_size: Optional[int] = field(default=1024)
 
 
 @dataclass
@@ -42,7 +43,7 @@ class TrainingArguments(transformers.TrainingArguments):
     attn_implementation: str = field(default="sdpa")
 
 
-def freeze_for_vision_plus_lora(model: Qwen3_5ForConditionalGeneration, unfreeze_vision: bool) -> None:
+def freeze_for_vision_plus_lora(model: FoveaForConditionalGeneration, unfreeze_vision: bool) -> None:
     model.requires_grad_(False)
     if unfreeze_vision:
         get_visual_module(model).requires_grad_(True)
@@ -91,6 +92,8 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         "imgslot_text_o_proj",
         "imgslot_img_q_proj",
         "imgslot_img_k_proj",
+        "imgslot_img_v_proj",
+        "imgslot_img_o_proj",
         "imgslot_attn_norm",
         "imgslot_ffn",
         "imgslot_ffn_norm",
@@ -226,7 +229,7 @@ def print_parameter_summary(model) -> None:
         print(line)
 
 
-def sync_tokenizer_special_tokens_with_model(tokenizer: Qwen3_5Tokenizer, model: Qwen3_5ForConditionalGeneration) -> None:
+def sync_tokenizer_special_tokens_with_model(tokenizer: FoveaTokenizer, model: FoveaForConditionalGeneration) -> None:
     """Keep tokenizer special-token defaults aligned with the checkpoint config."""
 
     text_config = getattr(model.config, "text_config", model.config)
@@ -256,16 +259,37 @@ def sync_tokenizer_special_tokens_with_model(tokenizer: Qwen3_5Tokenizer, model:
         model.generation_config.pad_token_id = getattr(model.config, "pad_token_id", None)
 
 
+class StopAtStepCallback(transformers.TrainerCallback):
+    """Stop training cleanly at the requested global step.
+
+    Reads `FT3_STOP_STEP` from the environment so the shell loop can request
+    segmented training without changing the global max_steps schedule.
+    """
+
+    def __init__(self) -> None:
+        stop_step = os.environ.get("FT3_STOP_STEP")
+        self.stop_step = int(stop_step) if stop_step else None
+
+    def on_step_end(self, _args, state, control, **_kwargs):
+        if self.stop_step is None:
+            return control
+        if state.global_step >= self.stop_step:
+            control.should_save = True
+            control.should_training_stop = True
+        return control
+
+
+
 def main() -> None:
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    tokenizer = Qwen3_5Tokenizer.from_pretrained(
+    tokenizer = FoveaTokenizer.from_pretrained(
         model_args.model_name_or_path,
         model_max_length=training_args.model_max_length,
         padding_side="right",
     )
-    model, loading_info = Qwen3_5ForConditionalGeneration.from_pretrained(
+    model, loading_info = FoveaForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
         torch_dtype="auto",
         attn_implementation=training_args.attn_implementation,
@@ -336,6 +360,7 @@ def main() -> None:
         train_dataset=train_dataset,
         data_collator=data_collator,
         processing_class=tokenizer,
+        callbacks=[StopAtStepCallback],
     )
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_state()

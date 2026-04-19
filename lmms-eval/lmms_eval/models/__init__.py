@@ -82,7 +82,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "qwen3_omni": "Qwen3_Omni",
     "qwen3_vl": "Qwen3_VL",
     "qwen3_5": "Qwen3_5",
-    "qwen35_hf": "Qwen35HF",
+    "fovea": "Fovea",
     "reka": "Reka",
     "ross": "Ross",
     "sam3": "SAM3",
