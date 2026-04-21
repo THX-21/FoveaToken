@@ -36,11 +36,13 @@ abort_script() {
     exit "${code}"
 }
 
-break_loop() {
+exit_on_failure() {
+    local code="$1"
+    shift
     if [[ $# -gt 0 ]]; then
         echo "$*" >&2
     fi
-    break
+    exit "${code}"
 }
 
 while true; do
@@ -67,7 +69,11 @@ while true; do
     FT3_SAVE_STEPS="${SAVE_INTERVAL}" \
     FT3_MAX_STEPS="${TRAIN_EVAL_MAX_STEPS}" \
     FT3_STOP_STEP="${target_step}" \
-    bash "${SCRIPT_DIR}/ft3.sh" || break_loop "Training failed before reaching step ${target_step}."
+    bash "${SCRIPT_DIR}/ft3.sh"
+    status="$?"
+    if (( status != 0 )); then
+        exit_on_failure "${status}" "Training failed before reaching step ${target_step}."
+    fi
 
     trained_step="$(latest_checkpoint_step)"
     if [[ -z "${trained_step}" ]]; then
@@ -84,5 +90,9 @@ while true; do
     EVAL_TASKS="${TASKS}" \
     EVAL_OUTPUT_PATH="${OUTPUT_PATH}" \
     EVAL_LOG_SUFFIX="${LOG_PREFIX}_ckpt${trained_step}" \
-    bash "${SCRIPT_DIR}/eval.sh" || break_loop "Evaluation failed for ${checkpoint}."
+    bash "${SCRIPT_DIR}/eval.sh"
+    status="$?"
+    if (( status != 0 )); then
+        exit_on_failure "${status}" "Evaluation failed for ${checkpoint}."
+    fi
 done

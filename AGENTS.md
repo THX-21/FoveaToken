@@ -71,12 +71,20 @@ bash scripts/eval.sh
 - `EVAL_OUTPUT_PATH`
 - `EVAL_LOG_SUFFIX`
 
+**评测结果汇总脚本：**
+```bash
+python scripts/xlrs_eval_report.py logs/fovea-ft3-imgslot__checkpoint-6000/20260421_205615_samples_xlrs-lite.jsonl
+python scripts/xlrs_eval_report.py logs --latest-only --table-only
+```
+
+该脚本从 `*_samples_xlrs-lite.jsonl` 读取 `xlrs_micro_score` 字段，按 `lmms_eval/tasks/xlrs/mcq_utils.py` 的 13 个子任务口径统计准确率，并输出可直接粘贴到论文/表格里的 Markdown 表；末尾同时给出 `Micro Avg.`（整体准确率）和 `Macro Avg.`（13 个子任务准确率均值）。
+
 **分段训练 + 每段评测：**
 ```bash
 bash scripts/train_eval_loop.sh
 ```
 
-该脚本按 checkpoint step 推进训练，训练到目标 step 后评测最新 checkpoint。训练或评测失败时通过 `|| break_loop` 停止后续分段；脚本启用 `set -uo pipefail`。
+该脚本按 checkpoint step 推进训练，训练到目标 step 后评测最新 checkpoint。训练或评测失败时保留原始 stderr/traceback，随后用子命令的原始退出码退出；脚本启用 `set -uo pipefail`。
 
 **Qwen3.5 baseline 评测：**
 ```bash
