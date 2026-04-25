@@ -1,5 +1,7 @@
 from typing import Optional, Union
 
+import torch
+
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
 
@@ -18,6 +20,12 @@ class Qwen3_5(Qwen3_VL):
         "top_k": 20,
     }
 
+    @staticmethod
+    def _pick_torch_dtype():
+        if torch.cuda.is_available():
+            return "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+        return "float32"
+
     def __init__(
         self,
         pretrained: str = "Qwen/Qwen3.5-4B",
@@ -28,6 +36,7 @@ class Qwen3_5(Qwen3_VL):
         max_num_frames: int = 768,
         max_frames: Optional[int] = None,
         enable_thinking: Optional[bool] = True,
+        attn_implementation: Optional[str] = "sdpa",
         **kwargs,
     ):
         # Accept max_frames as backward-compat alias for max_num_frames
@@ -41,5 +50,7 @@ class Qwen3_5(Qwen3_VL):
             total_pixels=total_pixels,
             max_num_frames=max_num_frames,
             enable_thinking=enable_thinking,
+            torch_dtype=self._pick_torch_dtype(),
+            attn_implementation=attn_implementation,
             **kwargs,
         )

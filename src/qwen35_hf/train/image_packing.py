@@ -128,7 +128,7 @@ def pack_single_image(
     if height % config.patch_size != 0 or width % config.patch_size != 0:
         raise ValueError(
             f"Image size {(width, height)} is not divisible by patch_size={config.patch_size}. "
-            "Resize to a valid normal resolution first."
+            "Increase max_image_tokens or use a size aligned to the patch grid."
         )
 
     grid_h = height // config.patch_size
@@ -137,7 +137,7 @@ def pack_single_image(
     if grid_h % merge_size != 0 or grid_w % merge_size != 0:
         raise ValueError(
             f"Patch grid {(grid_h, grid_w)} is not divisible by spatial_merge_size={merge_size}. "
-            "Use a padded resolution compatible with spatial merging first."
+            "Increase max_image_tokens or use a size compatible with spatial merging."
         )
 
     # Match Qwen2-VL/Qwen3.5 patch order. A still image is repeated across the

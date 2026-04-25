@@ -1106,20 +1106,23 @@ class Qwen3_5VisionAttention(nn.Module):
                 torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
             ]
 
-            attn_outputs = [
-                attention_interface(
+            attn_outputs = []
+            for q, k, v in zip(*splits):
+                # q/k/v chunks are [1, num_heads, chunk_seq, head_dim].
+                # SDPA backward can fail on split views, so pass contiguous chunks.
+                attn_output = attention_interface(
                     self,
-                    q,
-                    k,
-                    v,
+                    q.contiguous(),
+                    k.contiguous(),
+                    v.contiguous(),
                     attention_mask=None,
                     scaling=self.scaling,
                     dropout=0.0 if not self.training else self.attention_dropout,
                     is_causal=False,
                     **kwargs,
                 )[0]
-                for q, k, v in zip(*splits)
-            ]
+                # attention_interface returns [1, chunk_seq, num_heads, head_dim].
+                attn_outputs.append(attn_output)
             attn_output = torch.cat(attn_outputs, dim=1)
 
         # -> (total_patches, hidden_size)

@@ -82,6 +82,11 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         #   [1, num_attention_heads, text_seq, head_dim]
         self._imgslot_runtime = {"enabled": False, "states": [], "delta": 1, "step": 0}
         self._imgslot_aux = self._empty_imgslot_aux(device=self.lm_head.weight.device)
+        self.imgslot_aux_loss_coef = 0.01
+        self.imgslot_gate_sparsity_coef = 1.0
+        self.imgslot_expert_balance_coef = 1.0
+        self.imgslot_slot_balance_coef = 1.0
+        self.imgslot_route_entropy_coef = 0.1
         self.post_init()
 
     def get_input_embeddings(self):
@@ -110,11 +115,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             "slots_per_expert": int(self.config.img_slot_slots_per_expert),
             "gate_temperature": float(self.config.img_slot_gate_temperature),
             "route_temperature": float(self.config.img_slot_route_temperature),
-            "aux_loss_coef": float(self.config.img_slot_aux_loss_coef),
-            "gate_sparsity_coef": float(self.config.img_slot_gate_sparsity_coef),
-            "expert_balance_coef": float(self.config.img_slot_expert_balance_coef),
-            "slot_balance_coef": float(self.config.img_slot_slot_balance_coef),
-            "route_entropy_coef": float(self.config.img_slot_route_entropy_coef),
+            "topk_experts": int(self.config.img_slot_topk_experts),
+            "topk_subslots": int(self.config.img_slot_topk_subslots),
         }
 
     def _empty_imgslot_aux(self, device: torch.device) -> dict[str, torch.Tensor]:
@@ -123,6 +125,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             "aux_loss": zero,
             "gate_logit_mean": zero,
             "gate_logit_std": zero,
+            "gate_entropy": zero,
             "expert_balance": zero,
             "slot_balance": zero,
             "dispatch_entropy": zero,
@@ -265,23 +268,63 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         num_experts = int(imgslot_config["num_experts"])
         slots_per_expert = int(imgslot_config["slots_per_expert"])
         total_slots = int(imgslot_config["k"])
+        topk_experts = min(int(imgslot_config["topk_experts"]), num_experts)
+        topk_subslots = min(int(imgslot_config["topk_subslots"]), slots_per_expert)
 
         gate_input = visual_context * visual_gate_score.unsqueeze(-1).to(visual_context.dtype)
         gate_logits = self.imgslot_gate_proj(gate_input).squeeze(-1)
         expert_logits = self.imgslot_expert_proj(visual_context)
         subslot_logits = self.imgslot_subslot_proj(visual_context).view(*visual_context.shape[:2], num_experts, slots_per_expert)
-        slot_logits = (
+        combined_logits = (
             gate_logits.unsqueeze(-1).unsqueeze(-1) / gate_temperature
             + expert_logits.unsqueeze(-1) / route_temperature
             + subslot_logits / route_temperature
         )
         if visual_mask is not None:
-            slot_logits = slot_logits.masked_fill(~visual_mask.unsqueeze(-1).unsqueeze(-1), torch.finfo(slot_logits.dtype).min)
-        dispatch = F.softmax(slot_logits, dim=1)
+            invalid_fill = torch.finfo(combined_logits.dtype).min
+            combined_logits = combined_logits.masked_fill(~visual_mask.unsqueeze(-1).unsqueeze(-1), invalid_fill)
+            expert_logits = expert_logits.masked_fill(~visual_mask.unsqueeze(-1), invalid_fill)
+            subslot_logits = subslot_logits.masked_fill(~visual_mask.unsqueeze(-1).unsqueeze(-1), invalid_fill)
+
+        expert_topk_logits, expert_topk_idx = torch.topk(expert_logits, k=topk_experts, dim=-1)
+        gathered_combined = combined_logits.gather(
+            dim=2,
+            index=expert_topk_idx.unsqueeze(-1).expand(-1, -1, -1, slots_per_expert),
+        )
+        subslot_topk_logits, subslot_topk_idx = torch.topk(gathered_combined, k=topk_subslots, dim=-1)
+
+        sparse_logits = combined_logits.new_full(combined_logits.shape, torch.finfo(combined_logits.dtype).min)
+        sparse_logits.scatter_(
+            2,
+            expert_topk_idx.unsqueeze(-1).expand(-1, -1, -1, slots_per_expert),
+            gathered_combined,
+        )
+        sparse_logits = sparse_logits.reshape(visual_context.shape[0], visual_context.shape[1], total_slots)
+
+        selected_flat_idx = (
+            expert_topk_idx.unsqueeze(-1) * slots_per_expert + subslot_topk_idx
+        ).reshape(visual_context.shape[0], visual_context.shape[1], topk_experts * topk_subslots)
+        selected_flat_logits = subslot_topk_logits.reshape(
+            visual_context.shape[0], visual_context.shape[1], topk_experts * topk_subslots
+        )
+
+        # selected_flat_idx/selected_flat_logits: [block_count, visual_seq, topk_experts * topk_subslots]
+        # dispatch_flat: [block_count, visual_seq, total_slots].
+        # Only selected token-slot pairs may participate in token-wise routing.
+        selected_mask = torch.zeros(sparse_logits.shape, dtype=torch.bool, device=sparse_logits.device)
+        selected_mask.scatter_(2, selected_flat_idx, True)
+        dispatch_flat = sparse_logits.new_full(sparse_logits.shape, torch.finfo(sparse_logits.dtype).min)
+        dispatch_flat.scatter_(2, selected_flat_idx, selected_flat_logits)
         if visual_mask is not None:
-            dispatch = dispatch * visual_mask.unsqueeze(-1).unsqueeze(-1).to(dispatch.dtype)
-            dispatch = dispatch / dispatch.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        dispatch_flat = dispatch.reshape(dispatch.shape[0], dispatch.shape[1], total_slots)
+            selected_mask = selected_mask & visual_mask.unsqueeze(-1)
+            dispatch_flat = dispatch_flat.masked_fill(~visual_mask.unsqueeze(-1), torch.finfo(dispatch_flat.dtype).min)
+        dispatch_flat = dispatch_flat - dispatch_flat.amax(dim=1, keepdim=True)
+        dispatch_flat = torch.softmax(dispatch_flat, dim=1)
+        dispatch_flat = dispatch_flat * selected_mask.to(dispatch_flat.dtype)
+        if visual_mask is not None:
+            dispatch_flat = dispatch_flat * visual_mask.unsqueeze(-1).to(dispatch_flat.dtype)
+        dispatch_flat = dispatch_flat / dispatch_flat.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        dispatch = dispatch_flat.view(visual_context.shape[0], visual_context.shape[1], num_experts, slots_per_expert)
 
         value_states = self.imgslot_value_proj(visual_pool)
         slot_tokens = torch.einsum("bnes,bnh->besh", dispatch.float(), value_states.float())
@@ -292,33 +335,58 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         if visual_mask is not None:
             valid_gate_logits = gate_logits.masked_select(visual_mask)
+            valid_tokens = visual_mask.unsqueeze(-1).to(dispatch_flat.dtype)
         else:
             valid_gate_logits = gate_logits.reshape(-1)
+            valid_tokens = torch.ones_like(gate_logits, dtype=dispatch_flat.dtype).unsqueeze(-1)
         gate_logit_mean = valid_gate_logits.mean()
         gate_logit_std = valid_gate_logits.float().std(unbiased=False).to(gate_logits.dtype)
 
-        expert_usage = dispatch.sum(dim=(1, 3))
-        expert_usage_norm = expert_usage / expert_usage.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        expert_uniform = torch.full_like(expert_usage_norm, 1.0 / expert_usage_norm.shape[-1])
-        expert_balance_loss = ((expert_usage_norm - expert_uniform) ** 2).mean()
+        gate_prob = torch.softmax(gate_logits.float(), dim=1)
+        if visual_mask is not None:
+            gate_prob = gate_prob * visual_mask.unsqueeze(-1).squeeze(-1).to(gate_prob.dtype) if gate_prob.ndim > 2 else gate_prob * visual_mask.to(gate_prob.dtype)
+            gate_prob = gate_prob / gate_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        gate_entropy = -(gate_prob.clamp_min(1e-6) * gate_prob.clamp_min(1e-6).log()).sum(dim=1).mean()
 
-        slot_usage = dispatch_flat.sum(dim=1)
-        slot_usage_norm = slot_usage / slot_usage.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        slot_uniform = torch.full_like(slot_usage_norm, 1.0 / slot_usage_norm.shape[-1])
-        slot_balance_loss = ((slot_usage_norm - slot_uniform) ** 2).mean()
+        expert_prob = torch.softmax(expert_logits.float(), dim=-1)
+        if visual_mask is not None:
+            expert_prob = expert_prob * visual_mask.unsqueeze(-1).to(expert_prob.dtype)
+        expert_importance = expert_prob.sum(dim=1)
+        expert_importance = expert_importance / expert_importance.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        expert_assign = torch.zeros_like(expert_prob)
+        expert_assign.scatter_(2, expert_topk_idx, 1.0)
+        if visual_mask is not None:
+            expert_assign = expert_assign * visual_mask.unsqueeze(-1).to(expert_assign.dtype)
+        expert_load = expert_assign.sum(dim=1)
+        expert_load = expert_load / expert_load.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        expert_balance_loss = (expert_importance * expert_load).sum(dim=-1).mean() * num_experts
+
+        slot_prob = torch.softmax(combined_logits.reshape(visual_context.shape[0], visual_context.shape[1], total_slots).float(), dim=-1)
+        if visual_mask is not None:
+            slot_prob = slot_prob * visual_mask.unsqueeze(-1).to(slot_prob.dtype)
+        slot_importance = slot_prob.sum(dim=1)
+        slot_importance = slot_importance / slot_importance.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        slot_assign = torch.zeros_like(dispatch_flat)
+        slot_assign.scatter_(2, selected_flat_idx, 1.0)
+        if visual_mask is not None:
+            slot_assign = slot_assign * visual_mask.unsqueeze(-1).to(slot_assign.dtype)
+        slot_load = slot_assign.sum(dim=1)
+        slot_load = slot_load / slot_load.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        slot_balance_loss = (slot_importance * slot_load).sum(dim=-1).mean() * total_slots
 
         dispatch_entropy = -(dispatch.clamp_min(1e-6) * dispatch.clamp_min(1e-6).log()).sum(dim=1).mean()
 
         aux_loss = (
-            float(imgslot_config["gate_sparsity_coef"]) * gate_logits.sigmoid().mean()
-            + float(imgslot_config["expert_balance_coef"]) * expert_balance_loss
-            + float(imgslot_config["slot_balance_coef"]) * slot_balance_loss
-            + float(imgslot_config["route_entropy_coef"]) * dispatch_entropy
+            float(self.imgslot_gate_sparsity_coef) * gate_entropy
+            + float(self.imgslot_expert_balance_coef) * expert_balance_loss
+            + float(self.imgslot_slot_balance_coef) * slot_balance_loss
+            + float(self.imgslot_route_entropy_coef) * dispatch_entropy
         )
         return slot_tokens, slot_pos.to(visual_pos.dtype), {
             "aux_loss": aux_loss,
             "gate_logit_mean": gate_logit_mean,
             "gate_logit_std": gate_logit_std,
+            "gate_entropy": gate_entropy,
             "expert_balance": expert_balance_loss,
             "slot_balance": slot_balance_loss,
             "dispatch_entropy": dispatch_entropy,
@@ -332,12 +400,17 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             "aux_loss",
             "gate_logit_mean",
             "gate_logit_std",
+            "gate_entropy",
             "expert_balance",
             "slot_balance",
             "dispatch_entropy",
         ):
             merged[key] = torch.stack([item[key] for item in aux_stats]).mean()
-        merged["num_blocks"] = torch.tensor(float(len(aux_stats)), device=device)
+        block_counts = [item.get("num_blocks") for item in aux_stats]
+        if all(count is not None for count in block_counts):
+            merged["num_blocks"] = torch.stack([count.to(device) for count in block_counts]).sum()
+        else:
+            merged["num_blocks"] = torch.tensor(float(len(aux_stats)), device=device)
         return merged
 
     def _pad_imgslot_visual_kv(self, visual_kv, device, dtype):
@@ -918,7 +991,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         loss = None
         if labels is not None:
             lm_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
-            aux_loss = self._imgslot_aux["aux_loss"].to(lm_loss.device) * float(self.config.img_slot_aux_loss_coef)
+            aux_loss = self._imgslot_aux["aux_loss"].to(lm_loss.device) * float(self.imgslot_aux_loss_coef)
             loss = lm_loss + aux_loss
 
         return Qwen3_5CausalLMOutputWithPast(

@@ -12,7 +12,7 @@ LOG_SUFFIX="qwen35_xlrs_lite"
 
 accelerate launch --num_processes 1 --main_process_port 12345 -m lmms_eval \
   --model qwen3_5 \
-  --model_args "pretrained=${BASE_MODEL},device_map=auto,attn_implementation=flash_attention_2,enable_thinking=False,max_pixels=16777216" \
+  --model_args "pretrained=${BASE_MODEL},device_map=auto,attn_implementation=sdpa,enable_thinking=False,max_pixels=16777216" \
   --tasks "${TASKS}" \
   --batch_size 4 \
   --log_samples \

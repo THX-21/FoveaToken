@@ -139,16 +139,10 @@ class FoveaConfig(PreTrainedConfig):
         Temperature applied to route logits during soft compression. The first
         implementation keeps this as a compatibility field and uses it for the
         shared route/subslot softmax.
-    img_slot_aux_loss_coef (`float`, *optional*, defaults to 0.01):
-        Global multiplier for ImgSlot auxiliary losses.
-    img_slot_gate_sparsity_coef (`float`, *optional*, defaults to 1.0):
-        Weight for the gate sparsity auxiliary loss.
-    img_slot_expert_balance_coef (`float`, *optional*, defaults to 1.0):
-        Weight for the expert-usage balance auxiliary loss.
-    img_slot_slot_balance_coef (`float`, *optional*, defaults to 1.0):
-        Weight for the slot-usage balance auxiliary loss.
-    img_slot_route_entropy_coef (`float`, *optional*, defaults to 0.1):
-        Weight for the route sharpening auxiliary loss.
+    img_slot_topk_experts (`int`, *optional*, defaults to 2):
+        Number of experts retained per visual token before token-wise normalization.
+    img_slot_topk_subslots (`int`, *optional*, defaults to 4):
+        Number of subslots retained inside each selected expert.
     img_slot_use_entmax (`bool`, *optional*, defaults to `False`):
         Reserved flag for future entmax-style routing.
     img_slot_enable_hardening (`bool`, *optional*, defaults to `False`):
@@ -171,22 +165,19 @@ class FoveaConfig(PreTrainedConfig):
     vision_end_token_id: int = 248054
     tie_word_embeddings: bool = False
     img_slot_enable: bool = True
-    img_slot_m: int = 8
-    img_slot_k: int = 128
+    img_slot_m: int = 64
+    img_slot_k: int = 64
     img_slot_delta: int = 129
     img_slot_beta: float = 0.3
     img_slot_lambda: float = 0.9
     img_slot_max_text_tokens: int = 512
-    img_slot_tile_size: int | None = 1024
-    img_slot_num_experts: int = 8
+    img_slot_tile_size: int | None = 768
+    img_slot_num_experts: int = 4
     img_slot_slots_per_expert: int = 16
     img_slot_gate_temperature: float = 1.0
     img_slot_route_temperature: float = 1.0
-    img_slot_aux_loss_coef: float = 0.01
-    img_slot_gate_sparsity_coef: float = 1.0
-    img_slot_expert_balance_coef: float = 1.0
-    img_slot_slot_balance_coef: float = 1.0
-    img_slot_route_entropy_coef: float = 0.1
+    img_slot_topk_experts: int = 2
+    img_slot_topk_subslots: int = 4
     img_slot_use_entmax: bool = False
     img_slot_enable_hardening: bool = False
     img_slot_hardening_schedule: str = "none"

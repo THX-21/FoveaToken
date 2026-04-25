@@ -69,12 +69,11 @@ class LocalNoOpVideoProcessor(BaseVideoProcessor):
 class Fovea(Qwen3_VL):
     """lmms-eval adapter for the local Fovea implementation."""
 
-    DEFAULT_GEN_KWARGS = {
-        "max_new_tokens": 1024,
-        "temperature": 0.7,
-        "top_p": 0.8,
-        "top_k": 20,
-    }
+    @staticmethod
+    def _pick_torch_dtype():
+        if torch.cuda.is_available():
+            return "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+        return "float32"
 
     def __init__(
         self,
@@ -84,7 +83,7 @@ class Fovea(Qwen3_VL):
         device_map: Optional[str] = "auto",
         batch_size: Optional[Union[int, str]] = 1,
         use_cache=True,
-        attn_implementation: Optional[str] = None,
+        attn_implementation: Optional[str] = "sdpa",
         system_prompt: Optional[str] = "You are a helpful assistant.",
         interleave_visuals: Optional[bool] = False,
         enable_thinking: Optional[bool] = False,
@@ -131,7 +130,7 @@ class Fovea(Qwen3_VL):
             self.device_map = device_map if device_map else device
 
         model_kwargs = {
-            "torch_dtype": "bfloat16",
+            "torch_dtype": self._pick_torch_dtype(),
             "device_map": self.device_map,
         }
         if attn_implementation is not None:

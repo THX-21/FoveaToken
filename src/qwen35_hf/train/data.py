@@ -100,7 +100,7 @@ def replace_image_tokens_in_conversations(
     ]
     total_placeholders = sum(sentence["value"].count(DEFAULT_IMAGE_TOKEN) for sentence in conversations)
     if total_placeholders == 1 and len(image_token_groups) > 1:
-        joined_placeholder = "".join(build_visual_placeholder(count) for group in image_token_groups for count in group)
+        joined_placeholder = "\n".join(build_visual_placeholder(count) for group in image_token_groups for count in group)
         for sentence in conversations:
             value = sentence["value"]
             if DEFAULT_IMAGE_TOKEN in value:
