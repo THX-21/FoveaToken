@@ -8,3 +8,4 @@ __pycache__/
 logs/
 checkpoints/
 *.egg-info/
+PLAN.md

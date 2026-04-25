@@ -5,7 +5,6 @@ export NCCL_DEBUG=INFO
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-WORKSPACE_ROOT="$(cd -- "${PROJECT_ROOT}" && pwd)"
 
 export NNODES=1
 export NUM_GPUS=1
@@ -26,6 +25,15 @@ CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-200}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
+IMG_SLOT_NUM_EXPERTS="${FT3_IMG_SLOT_NUM_EXPERTS:-8}"
+IMG_SLOT_SLOTS_PER_EXPERT="${FT3_IMG_SLOT_SLOTS_PER_EXPERT:-16}"
+IMG_SLOT_GATE_TEMP="${FT3_IMG_SLOT_GATE_TEMP:-1.0}"
+IMG_SLOT_ROUTE_TEMP="${FT3_IMG_SLOT_ROUTE_TEMP:-1.0}"
+IMG_SLOT_AUX_LOSS_COEF="${FT3_IMG_SLOT_AUX_LOSS_COEF:-0.01}"
+IMG_SLOT_GATE_SPARSITY_COEF="${FT3_IMG_SLOT_GATE_SPARSITY_COEF:-1.0}"
+IMG_SLOT_EXPERT_BALANCE_COEF="${FT3_IMG_SLOT_EXPERT_BALANCE_COEF:-1.0}"
+IMG_SLOT_SLOT_BALANCE_COEF="${FT3_IMG_SLOT_SLOT_BALANCE_COEF:-1.0}"
+IMG_SLOT_ROUTE_ENTROPY_COEF="${FT3_IMG_SLOT_ROUTE_ENTROPY_COEF:-0.1}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src"
 
@@ -74,6 +82,15 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
     --unfreeze_vision true \
+    --img_slot_num_experts "${IMG_SLOT_NUM_EXPERTS}" \
+    --img_slot_slots_per_expert "${IMG_SLOT_SLOTS_PER_EXPERT}" \
+    --img_slot_gate_temperature "${IMG_SLOT_GATE_TEMP}" \
+    --img_slot_route_temperature "${IMG_SLOT_ROUTE_TEMP}" \
+    --img_slot_aux_loss_coef "${IMG_SLOT_AUX_LOSS_COEF}" \
+    --img_slot_gate_sparsity_coef "${IMG_SLOT_GATE_SPARSITY_COEF}" \
+    --img_slot_expert_balance_coef "${IMG_SLOT_EXPERT_BALANCE_COEF}" \
+    --img_slot_slot_balance_coef "${IMG_SLOT_SLOT_BALANCE_COEF}" \
+    --img_slot_route_entropy_coef "${IMG_SLOT_ROUTE_ENTROPY_COEF}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
     --output_dir "${OUTPUT_DIR}" \

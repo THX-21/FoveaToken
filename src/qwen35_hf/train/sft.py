@@ -25,6 +25,19 @@ class ModelArguments:
     img_slot_beta: float = field(default=0.3)
     img_slot_lambda: float = field(default=0.9)
     img_slot_tile_size: Optional[int] = field(default=1024)
+    img_slot_num_experts: int = field(default=8)
+    img_slot_slots_per_expert: int = field(default=16)
+    img_slot_gate_temperature: float = field(default=1.0)
+    img_slot_route_temperature: float = field(default=1.0)
+    img_slot_aux_loss_coef: float = field(default=0.01)
+    img_slot_gate_sparsity_coef: float = field(default=1.0)
+    img_slot_expert_balance_coef: float = field(default=1.0)
+    img_slot_slot_balance_coef: float = field(default=1.0)
+    img_slot_route_entropy_coef: float = field(default=0.1)
+    img_slot_use_entmax: bool = field(default=False)
+    img_slot_enable_hardening: bool = field(default=False)
+    img_slot_hardening_schedule: str = field(default="none")
+    img_slot_min_temperature: float = field(default=0.25)
 
 
 @dataclass
@@ -97,6 +110,12 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         "imgslot_attn_norm",
         "imgslot_ffn",
         "imgslot_ffn_norm",
+        "imgslot_visual_norm",
+        "imgslot_gate_proj",
+        "imgslot_expert_proj",
+        "imgslot_subslot_proj",
+        "imgslot_value_proj",
+        "imgslot_slot_out_proj",
     ]
     target_modules = [
         "q_proj",
@@ -279,6 +298,35 @@ class StopAtStepCallback(transformers.TrainerCallback):
         return control
 
 
+class ImgSlotMetricsCallback(transformers.TrainerCallback):
+    """Publish ImgSlot auxiliary metrics into Trainer logs when available."""
+
+    def on_log(self, _args, state, control, model=None, logs=None, **_kwargs):
+        if model is None or logs is None or not hasattr(model, "_imgslot_aux"):
+            return control
+        aux = getattr(model, "_imgslot_aux", None)
+        if not isinstance(aux, dict):
+            return control
+        for key in (
+            "aux_loss",
+            "gate_logit_mean",
+            "gate_logit_std",
+            "expert_balance",
+            "slot_balance",
+            "dispatch_entropy",
+            "num_blocks",
+        ):
+            value = aux.get(key)
+            if value is None:
+                continue
+            if hasattr(value, "detach"):
+                value = value.detach()
+            if hasattr(value, "item"):
+                value = value.item()
+            logs[f"imgslot/{key}"] = value
+        return control
+
+
 
 def main() -> None:
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
@@ -300,6 +348,19 @@ def main() -> None:
         img_slot_beta=model_args.img_slot_beta,
         img_slot_lambda=model_args.img_slot_lambda,
         img_slot_tile_size=model_args.img_slot_tile_size,
+        img_slot_num_experts=model_args.img_slot_num_experts,
+        img_slot_slots_per_expert=model_args.img_slot_slots_per_expert,
+        img_slot_gate_temperature=model_args.img_slot_gate_temperature,
+        img_slot_route_temperature=model_args.img_slot_route_temperature,
+        img_slot_aux_loss_coef=model_args.img_slot_aux_loss_coef,
+        img_slot_gate_sparsity_coef=model_args.img_slot_gate_sparsity_coef,
+        img_slot_expert_balance_coef=model_args.img_slot_expert_balance_coef,
+        img_slot_slot_balance_coef=model_args.img_slot_slot_balance_coef,
+        img_slot_route_entropy_coef=model_args.img_slot_route_entropy_coef,
+        img_slot_use_entmax=model_args.img_slot_use_entmax,
+        img_slot_enable_hardening=model_args.img_slot_enable_hardening,
+        img_slot_hardening_schedule=model_args.img_slot_hardening_schedule,
+        img_slot_min_temperature=model_args.img_slot_min_temperature,
         output_loading_info=True,
     )
     print_loading_summary(model, loading_info)
@@ -318,6 +379,19 @@ def main() -> None:
     model.config.img_slot_beta = model_args.img_slot_beta
     model.config.img_slot_lambda = model_args.img_slot_lambda
     model.config.img_slot_tile_size = model_args.img_slot_tile_size
+    model.config.img_slot_num_experts = model_args.img_slot_num_experts
+    model.config.img_slot_slots_per_expert = model_args.img_slot_slots_per_expert
+    model.config.img_slot_gate_temperature = model_args.img_slot_gate_temperature
+    model.config.img_slot_route_temperature = model_args.img_slot_route_temperature
+    model.config.img_slot_aux_loss_coef = model_args.img_slot_aux_loss_coef
+    model.config.img_slot_gate_sparsity_coef = model_args.img_slot_gate_sparsity_coef
+    model.config.img_slot_expert_balance_coef = model_args.img_slot_expert_balance_coef
+    model.config.img_slot_slot_balance_coef = model_args.img_slot_slot_balance_coef
+    model.config.img_slot_route_entropy_coef = model_args.img_slot_route_entropy_coef
+    model.config.img_slot_use_entmax = model_args.img_slot_use_entmax
+    model.config.img_slot_enable_hardening = model_args.img_slot_enable_hardening
+    model.config.img_slot_hardening_schedule = model_args.img_slot_hardening_schedule
+    model.config.img_slot_min_temperature = model_args.img_slot_min_temperature
     model.config.use_cache = False
     if training_args.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
@@ -360,7 +434,7 @@ def main() -> None:
         train_dataset=train_dataset,
         data_collator=data_collator,
         processing_class=tokenizer,
-        callbacks=[StopAtStepCallback],
+        callbacks=[StopAtStepCallback, ImgSlotMetricsCallback],
     )
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_state()

@@ -13,7 +13,7 @@
 - `FoveaProcessor`
 - `FoveaTokenizer`
 
-`Qwen3_5*` 名称仍作为兼容别名导出，但新代码优先使用 `Fovea*` 命名。核心实验功能是 **ImgSlot**：训练和推理时先把图像切成 block，再用一个样本级 anchor span + 每个 block 的 Top-K 视觉 token span 替代原始全量视觉占位，从而控制文本侧视觉 token 数。
+`Qwen3_5*` 名称仍作为兼容别名导出，但新代码优先使用 `Fovea*` 命名。核心实验功能是 **ImgSlot**：训练和推理时先把图像切成 block，再用一个样本级 anchor span + 每个 block 的固定压缩 slot span 替代原始全量视觉占位，从而控制文本侧视觉 token 数。当前主路径不再直接依赖每 block `torch.topk(...)` 选原始视觉 token，而是通过共享 router/scorer 先学习 token 重要性与软路由，再聚合成固定 slot 表示。
 
 仓库根目录当前没有 `pyproject.toml`、`setup.py` 或 `setup.cfg`。不要假设 `pip install -e .` 可用；训练和评测脚本通过 `PYTHONPATH` 指向 `src` / `lmms-eval` 运行本地代码。
 
@@ -41,7 +41,7 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 bash scripts/ft3.sh
 ```
 
-`ft3.sh` 固定走 `torchrun -m qwen35_hf.train.sft`、DeepSpeed ZeRO-2、单节点单卡默认配置。脚本不再显式传 `img_slot_*` 参数，训练入口使用 `ModelArguments` 默认值并写回 `model.config`。
+`ft3.sh` 固定走 `torchrun -m qwen35_hf.train.sft`、DeepSpeed ZeRO-2、单节点单卡默认配置。脚本会显式透传关键 `img_slot_*` 配置，并额外暴露软压缩 ablation 环境变量（expert 数、gate/route 温度、aux loss 系数等），训练入口仍会把这些值写回 `model.config`。
 
 可覆盖的训练环境变量：
 
@@ -55,6 +55,15 @@ bash scripts/ft3.sh
 - `FT3_SAVE_STEPS`
 - `FT3_MAX_STEPS`
 - `FT3_STOP_STEP`（由 `sft.py` 的 `StopAtStepCallback` 读取，用于分段训练）
+- `FT3_IMG_SLOT_NUM_EXPERTS`
+- `FT3_IMG_SLOT_SLOTS_PER_EXPERT`
+- `FT3_IMG_SLOT_GATE_TEMP`
+- `FT3_IMG_SLOT_ROUTE_TEMP`
+- `FT3_IMG_SLOT_AUX_LOSS_COEF`
+- `FT3_IMG_SLOT_GATE_SPARSITY_COEF`
+- `FT3_IMG_SLOT_EXPERT_BALANCE_COEF`
+- `FT3_IMG_SLOT_SLOT_BALANCE_COEF`
+- `FT3_IMG_SLOT_ROUTE_ENTROPY_COEF`
 
 **评测 LoRA checkpoint：**
 ```bash
@@ -141,7 +150,7 @@ lmms-eval/
 
 ## 模型结构
 
-`FoveaConfig`、`FoveaTextConfig`、`FoveaVisionConfig` 都继承 `PreTrainedConfig`；`Qwen3_5Config`、`Qwen3_5TextConfig`、`Qwen3_5VisionConfig` 是对应 Fovea 配置类的别名。
+`FoveaConfig`、`FoveaTextConfig`、`FoveaVisionConfig` 都继承 `PreTrainedConfig`；`Qwen3_5Config`、`Qwen3_5TextConfig`、`Qwen3_5VisionConfig` 是对应 Fovea 配置类的别名。`FoveaConfig.model_type` 维持 `fovea`，视觉子配置使用独立的 `fovea_vision`，避免和顶层配置共用同一 `model_type`。
 
 `FoveaForConditionalGeneration` 继承 `Qwen3_5PreTrainedModel` 和 `GenerationMixin`，内部结构是：
 
@@ -160,11 +169,17 @@ FoveaForConditionalGeneration
     imgslot_attn_norm
     imgslot_ffn
     imgslot_ffn_norm
+    imgslot_visual_norm
+    imgslot_gate_proj
+    imgslot_expert_proj
+    imgslot_subslot_proj
+    imgslot_value_proj
+    imgslot_slot_out_proj
 ```
 
 `Qwen3_5Model` 负责普通多模态路径：视觉 tower 输出 features，按 placeholder mask 写回 `inputs_embeds`，再构造 MRoPE position ids 并调用 `Qwen3_5TextModel`。如果普通多模态路径收到 `image_grid_thw` / `video_grid_thw`，必须有 `mm_token_type_ids`，否则会报错。
 
-`FoveaForConditionalGeneration` 在 ImgSlot 启用时绕过普通视觉 scatter：先计算 `visual_pools`，再把文本中的 image placeholder spans 改写为 anchor tokens 和 Top-K visual tokens，随后把 `pixel_values` / `image_grid_thw` / `mm_token_type_ids` 清空并继续走 text decoder。
+`FoveaForConditionalGeneration` 在 ImgSlot 启用时绕过普通视觉 scatter：先计算 `visual_pools`，再把文本中的 image placeholder spans 改写为 anchor tokens 和压缩后的 visual slots，并构造 ImgSlot 专用连续 MRoPE `position_ids`，随后把 `pixel_values` / `image_grid_thw` / `mm_token_type_ids` 清空并继续走 text decoder。
 
 ---
 
@@ -176,10 +191,10 @@ FoveaForConditionalGeneration
 | --- | --- | --- |
 | `img_slot_enable` | `True` | 是否启用 ImgSlot |
 | `img_slot_m` | `8` | 每个含图样本的共享 anchor token 数 |
-| `img_slot_k` | `128` | 每个 image block 保留的 Top-K 视觉 token 数 |
+| `img_slot_k` | `128` | 每个 image block 输出的压缩 slot 数（文本侧固定预算） |
 | `img_slot_delta` | `129` | decode 时刷新 KV cache 的步间隔 |
 | `img_slot_beta` | `0.3` | anchor 动量更新强度 |
-| `img_slot_lambda` | `0.9` | Top-K 分数动量系数 |
+| `img_slot_lambda` | `0.9` | decode refresh 时压缩 slot 的 EMA 平滑系数 |
 | `img_slot_max_text_tokens` | `512` | runtime 中保留的文本 token KV 上限 |
 | `img_slot_tile_size` | `1024` | 原图切块边长，启用 ImgSlot 时必须为正整数 |
 
@@ -195,9 +210,12 @@ FoveaForConditionalGeneration
 
 - `_project_imgslot_kv()` 输入必须是 2D token 张量 `[seq, hidden]`，输出固定为 `[1, num_heads, seq, head_dim]`。
 - `_build_imgslot_states_for_sample()` 要求 `text_tokens` 非空，并要求 `len(visual_pools) == len(visual_spans)`。
-- 每个 visual pool 的 token 数必须至少为 `img_slot_k`；不足时显式报错，提示增大 tile size、减小 `img_slot_k` 或提高 block 分辨率。
-- prefill 期间 Top-K 选择不 detach `visual_pool` / `text_tokens`，梯度可以回到 vision tower、text embedding 和 LoRA 路径。
-- runtime 中缓存的 `A`、`V`、`V_k`、`V_v`、`V_topk`、`score_prev`、`topk_idx` 是 detach 后的状态，只用于 generation refresh。
+- 每个 visual pool 的 token 数不需要再至少等于 `img_slot_k`；Soft-MoE / expert-choice dispatch 会把变长 visual pool 聚合为固定 `k` 个 slot。
+- ImgSlot dispatch 是 token 维 softmax：每个 `(expert, subslot)` 在当前 block 的所有 visual tokens 上归一化并聚合内容，不是每个 token 在 slot 维 softmax 后分配到 slots。
+- `router_input_i = LN(visual_pool_i + token_anchor_context_i)`；不新增 `pos_proj`，位置只通过统一 MRoPE 进入 attention。
+- slot 的连续 `t/h/w` position 由 dispatch 对原始 visual token MRoPE 坐标软聚合得到；anchor position 按当前序列末尾 `t + 1 + j` 确定性递增。
+- prefill 期间软压缩路径不 detach `visual_pool` / `text_tokens`，梯度可以回到 vision tower、text embedding 和 LoRA 路径。
+- runtime 中缓存的 `A`、`anchor_pos`、`V`、`visual_pos`、`compressed_slots`、`slot_pos`、`gate_logits`、`dispatch` 是 detach 后的状态，只用于 generation refresh。
 - `use_cache=True` generation 首轮通过 `imgslot_first_prefill` 标记强制进入 embedding rewrite；后续 decode 每 `img_slot_delta` 步只刷新 full-attention layers 的 KV cache。
 
 不要重新加入 legacy tuple/list cache 支持、Top-K padding、空文本 fallback 或宽松 `getattr(..., default)` 配置兜底，除非 THX 明确要求。
