@@ -253,11 +253,11 @@ FoveaForConditionalGeneration
 模型侧 runtime 约定：
 
 - `_project_imgslot_kv()` 输入必须是 `[seq, hidden]`，输出是 `[1, num_heads, seq, head_dim]`
-- `_build_imgslot_states_for_sample()` 要求 `text_tokens` 非空，且 `len(visual_pools) == len(visual_spans)`
+- `_build_imgslot_states_for_sample()` 允许 `text_tokens` 为空：空文本时直接退化为只用 anchor seed + visual routing；仍要求 `len(visual_pools) == len(visual_spans)`
 - prefill 阶段会直接把 anchor span 与 slot span 写回 `inputs_embeds`
-- generation 首轮通过 `imgslot_first_prefill` 强制走 embedding rewrite
+- generation 首轮通过 `imgslot_first_prefill` 强制走 embedding rewrite，并由本层接管 `pixel_values` / `image_grid_thw` / `mm_token_type_ids` / `image_block_counts`，避免基类把 packed 视觉张量按 batch 维错误 expand
 - decode 阶段每 `img_slot_delta` 步仅刷新 full-attention layers 的对应 KV cache
-- runtime 缓存里保存的是 detach 后状态，只用于 generation refresh
+- runtime 缓存里保存的是 detach 后状态，只用于 generation refresh；beam / group beam expand 与 reorder 会同步复制/重排 runtime state 与 `rope_deltas`
 - top-k sparse routing 中，只有选中的 token-slot pair 能参与 token 维 softmax；未选中的位置必须保持 mask，不得以 0 logit 参与归一化。
 
 辅助统计会保存在 `model._imgslot_aux` 中，并由 `ImgSlotMetricsCallback` 写到训练日志；其中 `imgslot/num_blocks` 表示当前 forward 中真实参与 ImgSlot 压缩的 image block 数。
@@ -278,6 +278,7 @@ FoveaForConditionalGeneration
 - ImgSlot 模块不作为 LoRA target，而是放入 `modules_to_save`
 - PEFT 包装后显式把 `imgslot_*` 参数重新设为 trainable
 - 注册 `StopAtStepCallback` 与 `ImgSlotMetricsCallback`
+- `ImgSlotMetricsCallback` 在 `on_log` 中会跳过 `meta` device 上的辅助统计，避免 DeepSpeed/Trainer 收尾阶段对 `meta tensor` 调 `.item()` 崩溃
 
 LoRA / checkpoint 注意点：
 
@@ -345,7 +346,7 @@ accelerate launch -m lmms_eval --model fovea --tasks xlrs-lite
 - 若提供 LoRA checkpoint，则尝试从 DeepSpeed model state 恢复 vision trainables
 - `use_cache` 默认允许为 `True`，依赖 ImgSlot prefill + refresh 机制
 - `LocalVisionImageProcessor` 复用训练侧 `VisionPacker`
-- 通过 `_last_image_block_counts` 追踪一张原图对应多少 block span
+- 通过 `_last_image_block_counts` 追踪一张原图对应多少 block span；评测侧多样本/多图 generation 还会显式传 `image_counts_per_sample`，该计数以实际送入 prompt / `image_inputs` 的图像顺序为准，用于把扁平图像列表重新按 sample 分组，并在 `return_tensors="pt"` 时把 `image_block_counts` 右侧补 0 后转成规则整型 tensor
 - ImgSlot 启用时 processor 不返回 `mm_token_type_ids`
 - 当前 adapter 只支持 image inputs；video 会直接报错
 - `max_image_tokens` adapter 默认是 `128`，但 `eval.sh` 显式传 `8196`

@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+import torch
 import transformers
 from transformers import HfArgumentParser, Trainer
 
@@ -308,6 +309,8 @@ class ImgSlotMetricsCallback(transformers.TrainerCallback):
                 continue
             if hasattr(value, "detach"):
                 value = value.detach()
+            if isinstance(value, torch.Tensor) and value.device.type == "meta":
+                continue
             if hasattr(value, "item"):
                 value = value.item()
             logs[f"imgslot/{key}"] = value

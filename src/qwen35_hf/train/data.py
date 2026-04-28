@@ -315,6 +315,7 @@ class LazySupervisedDataset(Dataset):
         pixel_values = None
         image_grid_thw = None
         image_token_counts: list[list[int]] = []
+        image_block_counts: list[int] = []
 
         if image_field is not None:
             image_names = image_field if isinstance(image_field, list) else [image_field]
@@ -329,6 +330,7 @@ class LazySupervisedDataset(Dataset):
                 else:
                     grids_for_counts = list(packed_grid)
                     image_grid_list.extend(grids_for_counts)
+                image_block_counts.append(len(grids_for_counts))
                 current_image_token_counts: list[int] = []
                 # Text-side visual span lengths: ImgSlot uses one shared
                 # sentence-level A span of length m plus fixed k-token spans for
@@ -366,6 +368,7 @@ class LazySupervisedDataset(Dataset):
             "mm_token_type_ids": mm_token_type_ids,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
+            "image_block_counts": torch.tensor(image_block_counts, dtype=torch.long) if image_block_counts else None,
         }
 
 

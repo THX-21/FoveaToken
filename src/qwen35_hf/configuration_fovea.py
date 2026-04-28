@@ -166,13 +166,13 @@ class FoveaConfig(PreTrainedConfig):
     tie_word_embeddings: bool = False
     img_slot_enable: bool = True
     img_slot_m: int = 64
-    img_slot_k: int = 64
-    img_slot_delta: int = 129
+    img_slot_k: int = 128
+    img_slot_delta: int = 128
     img_slot_beta: float = 0.3
     img_slot_lambda: float = 0.9
     img_slot_max_text_tokens: int = 512
-    img_slot_tile_size: int | None = 768
-    img_slot_num_experts: int = 4
+    img_slot_tile_size: int | None = 1280
+    img_slot_num_experts: int = 8
     img_slot_slots_per_expert: int = 16
     img_slot_gate_temperature: float = 1.0
     img_slot_route_temperature: float = 1.0

@@ -1,3 +1,4 @@
+import copy
 import math
 from typing import Any
 
@@ -19,6 +20,7 @@ from .modeling_qwen3_5 import (
     Unpack,
 )
 from .configuration_fovea import FoveaConfig
+from .train.data import IGNORE_INDEX
 
 
 class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
@@ -137,6 +139,97 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             self._imgslot_aux = self._empty_imgslot_aux(device)
             return
         self._imgslot_aux = aux_stats
+
+    def _reset_imgslot_runtime(self) -> None:
+        self._imgslot_runtime = {"enabled": False, "states": [], "delta": 1, "step": 0}
+
+    def _clone_imgslot_runtime_item(self, item, *, deep: bool):
+        if deep:
+            return copy.deepcopy(item)
+        if isinstance(item, torch.Tensor):
+            return item.clone()
+        return copy.deepcopy(item)
+
+    def _reorder_imgslot_runtime(self, beam_order: list[int]) -> None:
+        runtime = getattr(self, "_imgslot_runtime", None)
+        if not runtime or not runtime.get("enabled"):
+            return
+        for key in ("states", "text_keys", "text_values"):
+            items = runtime.get(key)
+            if not items:
+                continue
+            if len(items) != len(beam_order):
+                raise ValueError(f"ImgSlot runtime[{key}] batch {len(items)} does not match beam order length {len(beam_order)}.")
+            runtime[key] = [self._clone_imgslot_runtime_item(items[idx], deep=(key == "states")) for idx in beam_order]
+
+    def _expand_imgslot_runtime(self, expand_size: int) -> None:
+        runtime = getattr(self, "_imgslot_runtime", None)
+        if expand_size == 1 or not runtime or not runtime.get("enabled"):
+            return
+
+        for key in ("states", "text_keys", "text_values"):
+            items = runtime.get(key)
+            if not items:
+                continue
+            expanded = []
+            for item in items:
+                for _ in range(expand_size):
+                    expanded.append(self._clone_imgslot_runtime_item(item, deep=(key == "states")))
+            runtime[key] = expanded
+
+    def _expand_imgslot_packed_images(self, pixel_values, image_grid_thw, image_block_counts, expand_size: int):
+        if pixel_values is None or image_grid_thw is None or image_block_counts is None or expand_size == 1:
+            return pixel_values, image_grid_thw, image_block_counts
+
+        if not isinstance(image_block_counts, torch.Tensor):
+            if image_block_counts and isinstance(image_block_counts[0], (list, tuple)):
+                max_images = max(len(sample_counts) for sample_counts in image_block_counts)
+                padded_counts = [list(sample_counts) + [0] * (max_images - len(sample_counts)) for sample_counts in image_block_counts]
+                image_block_counts = torch.tensor(padded_counts, dtype=torch.long, device=image_grid_thw.device)
+            else:
+                image_block_counts = torch.tensor(image_block_counts, dtype=torch.long, device=image_grid_thw.device)
+        else:
+            image_block_counts = image_block_counts.to(device=image_grid_thw.device)
+
+        if image_block_counts.dim() == 1:
+            image_block_counts = image_block_counts.unsqueeze(0)
+        sample_block_counts = image_block_counts.sum(dim=1).tolist()
+        if sum(sample_block_counts) != image_grid_thw.shape[0]:
+            raise ValueError(
+                f"Expanded ImgSlot image metadata mismatch: summed block counts {sum(sample_block_counts)} != grid rows {image_grid_thw.shape[0]}."
+            )
+
+        grid_splits = torch.split(image_grid_thw, sample_block_counts, dim=0)
+        merge_size = int(getattr(self.model.visual, "spatial_merge_size", 1))
+        if merge_size <= 0:
+            raise ValueError(f"Invalid visual spatial_merge_size: {merge_size}.")
+        packed_patch_sizes = (image_grid_thw.prod(-1) // (merge_size**2)).to(device=pixel_values.device, dtype=torch.long).tolist()
+        block_patch_splits = torch.split(pixel_values, packed_patch_sizes, dim=0)
+        patch_splits = []
+        block_offset = 0
+        for block_count in sample_block_counts:
+            sample_blocks = block_patch_splits[block_offset : block_offset + block_count]
+            if len(sample_blocks) != block_count:
+                raise ValueError("Packed ImgSlot patch splits do not align with per-sample block counts.")
+            patch_splits.append(torch.cat(sample_blocks, dim=0))
+            block_offset += block_count
+        if block_offset != len(block_patch_splits):
+            raise ValueError("Packed ImgSlot patch splits contain extra blocks after sample grouping.")
+        if len(grid_splits) != len(sample_block_counts) or len(patch_splits) != len(sample_block_counts):
+            raise ValueError("Packed ImgSlot image splits do not align with per-sample block counts.")
+
+        expanded_grids = []
+        expanded_patches = []
+        expanded_counts = []
+        for sample_idx, block_count in enumerate(sample_block_counts):
+            sample_grids = grid_splits[sample_idx]
+            sample_patches = patch_splits[sample_idx]
+            sample_counts = image_block_counts[sample_idx : sample_idx + 1]
+            for _ in range(expand_size):
+                expanded_grids.append(sample_grids.clone())
+                expanded_patches.append(sample_patches.clone())
+                expanded_counts.append(sample_counts.clone())
+        return torch.cat(expanded_patches, dim=0), torch.cat(expanded_grids, dim=0), torch.cat(expanded_counts, dim=0)
 
     def _project_imgslot_kv(self, tokens, k_proj, v_proj):
         # tokens: [seq, hidden]
@@ -506,12 +599,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             raise ValueError(f"ImgSlot anchor span length {anchor_span_length} must equal m ({num_anchors}).")
         visual_device = visual_pools[0].device
         visual_dtype = visual_pools[0].dtype
-        # text_tokens: [text_seq, hidden]
-        if text_tokens.numel() == 0:
-            raise ValueError("ImgSlot requires non-empty text_tokens.")
-        if text_key is None or text_value is None:
-            text_key, text_value = self._project_imgslot_text_tokens(text_tokens.to(visual_dtype))
-
         block_count = len(visual_pools)
         # Each visual_pool: [visual_seq_i, hidden]
         visual_lengths = [visual_pool.shape[0] for visual_pool in visual_pools]
@@ -523,10 +610,15 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         # anchor_seed: [m, hidden] -> unsqueeze -> [1, m, hidden]
         anchor_seed = self.imgslot_a_tokens.weight[:num_anchors].to(device=visual_device, dtype=visual_dtype)
-        text_key = text_key.to(device=visual_device, dtype=visual_dtype)
-        text_value = text_value.to(device=visual_device, dtype=visual_dtype)
-        # anchor_text: [1, m, hidden]
-        anchor_text = self._run_imgslot_text_blocks(anchor_seed.unsqueeze(0), text_key, text_value)
+        if text_tokens.numel() == 0:
+            anchor_text = anchor_seed.unsqueeze(0)
+        else:
+            if text_key is None or text_value is None:
+                text_key, text_value = self._project_imgslot_text_tokens(text_tokens.to(visual_dtype))
+            text_key = text_key.to(device=visual_device, dtype=visual_dtype)
+            text_value = text_value.to(device=visual_device, dtype=visual_dtype)
+            # anchor_text: [1, m, hidden]
+            anchor_text = self._run_imgslot_text_blocks(anchor_seed.unsqueeze(0), text_key, text_value)
         anchor_positions = self._build_imgslot_anchor_positions(num_anchors, current_last_t, visual_device, torch.float32)
         # shared_anchor_tokens: [1, m, hidden]
         # visual_contexts: list[[1, visual_seq_i, hidden]]
@@ -589,15 +681,18 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         slot_target = int(imgslot_config["k"])
         num_anchors = int(imgslot_config["m"])
 
-        text_key = text_key.to(device=visual_device, dtype=visual_dtype)
-        text_value = text_value.to(device=visual_device, dtype=visual_dtype)
         # anchors_prev: [1, m, hidden]
         anchors_prev = states[0]["A"].to(device=visual_device, dtype=visual_dtype).unsqueeze(0)
-        # anchors_text: [1, m, hidden]
-        anchors_text = self._run_imgslot_text_blocks(anchors_prev, text_key, text_value)
-        # Exponential-style smoothing between previous anchor state and the
-        # latest text-conditioned anchor update.
-        anchors_text = (1.0 - imgslot_config["beta"]) * anchors_prev + imgslot_config["beta"] * anchors_text
+        if text_key is None or text_value is None or text_key.shape[-2] == 0:
+            anchors_text = anchors_prev
+        else:
+            text_key = text_key.to(device=visual_device, dtype=visual_dtype)
+            text_value = text_value.to(device=visual_device, dtype=visual_dtype)
+            # anchors_text: [1, m, hidden]
+            anchors_text = self._run_imgslot_text_blocks(anchors_prev, text_key, text_value)
+            # Exponential-style smoothing between previous anchor state and the
+            # latest text-conditioned anchor update.
+            anchors_text = (1.0 - imgslot_config["beta"]) * anchors_prev + imgslot_config["beta"] * anchors_text
 
         visual_pools = [state["V"].to(device=visual_device, dtype=visual_dtype) for state in states]
         visual_lengths = [visual_pool.shape[0] for visual_pool in visual_pools]
@@ -690,7 +785,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         image_outputs = self.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, return_dict=True)
         return list(image_outputs.pooler_output)
 
-    def _prebuild_imgslot_inputs(self, input_ids, attention_mask, inputs_embeds, visual_pools, image_grid_thw):
+    def _prebuild_imgslot_inputs(self, input_ids, attention_mask, inputs_embeds, visual_pools, image_grid_thw, labels=None):
         spans_by_sample = self._image_placeholder_spans(input_ids)
         if sum(max(0, len(spans) - 1) for spans in spans_by_sample) != len(visual_pools):
             raise ValueError("ImgSlot visual block count must match placeholder visual span count.")
@@ -721,8 +816,12 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 continue
             anchor_span, visual_spans = self._split_imgslot_sample_spans(spans)
             # valid_text_mask: [seq]
-            # text_tokens: [text_seq, hidden], with image placeholders removed.
+            # text_tokens: [text_seq, hidden], with image placeholders removed and
+            # supervision targets excluded so ImgSlot does not condition on future
+            # answer tokens during training.
             valid_text_mask = (input_ids[batch_idx] != self.config.image_token_id) & attention_mask[batch_idx].bool()
+            if labels is not None:
+                valid_text_mask = valid_text_mask & labels[batch_idx].eq(IGNORE_INDEX)
             text_tokens = inputs_embeds[batch_idx][valid_text_mask][-max_text_tokens:]
             text_key = text_value = None
             if text_tokens.numel() > 0:
@@ -754,8 +853,12 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 position_ids[1:, batch_idx, span_start : span_start + span_length] = slot_positions[:span_length].transpose(0, 1).to(position_ids.dtype)
             batch_states.append(sample_states)
             batch_aux_stats.append(sample_aux)
-            runtime_text_keys.append(text_key.detach())
-            runtime_text_values.append(text_value.detach())
+            if text_key is None or text_value is None:
+                runtime_text_keys.append(inputs_embeds.new_zeros((1, self.imgslot_num_heads, 0, self.imgslot_head_dim)).detach())
+                runtime_text_values.append(inputs_embeds.new_zeros((1, self.imgslot_num_heads, 0, self.imgslot_head_dim)).detach())
+            else:
+                runtime_text_keys.append(text_key.detach())
+                runtime_text_values.append(text_value.detach())
         self._imgslot_runtime = {
             "enabled": True,
             "states": batch_states,
@@ -935,8 +1038,12 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5CausalLMOutputWithPast:
+        kwargs.pop("image_block_counts", None)
         pre_refresh_past_key_values = past_key_values
         imgslot_first_prefill = bool(kwargs.pop("imgslot_first_prefill", False))
+        has_imgslot_prefill = self._imgslot_is_enabled() and (imgslot_first_prefill or past_key_values is None) and input_ids is not None and pixel_values is not None
+        if self._imgslot_is_enabled() and not has_imgslot_prefill and past_key_values is None:
+            self._reset_imgslot_runtime()
         # Decode path: refresh cached slot tokens before entering the decoder so the
         # next token attends to the latest anchor/Top-K visual state.
         if self._imgslot_is_enabled() and past_key_values is not None:
@@ -949,7 +1056,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         #   [visual_seq_i, hidden]
         # This rewrites placeholder spans in inputs_embeds, then skips the normal
         # Qwen multimodal scatter path by clearing pixel/grid/mm-token inputs.
-        if self._imgslot_is_enabled() and (imgslot_first_prefill or past_key_values is None) and input_ids is not None and pixel_values is not None:
+        if has_imgslot_prefill:
             if inputs_embeds is None:
                 inputs_embeds = self.get_input_embeddings()(input_ids)
             visual_pools = self._build_imgslot_visual_pools(pixel_values, image_grid_thw)
@@ -961,6 +1068,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 inputs_embeds=inputs_embeds,
                 visual_pools=visual_pools,
                 image_grid_thw=image_grid_thw,
+                labels=labels,
             )
             input_ids = None
             pixel_values = None
@@ -1015,24 +1123,36 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         pixel_values_videos=None,
         image_grid_thw=None,
         video_grid_thw=None,
+        image_block_counts=None,
         is_first_iteration=False,
         **kwargs,
     ):
+        mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+        image_block_counts = kwargs.pop("image_block_counts", None)
+        # Packed ImgSlot image tensors are not batch-major, so avoid the generic
+        # tensor repeat_interleave path during beam expansion. Keep them only for
+        # the first multimodal prefill and let forward() consume them once.
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
-            pixel_values=pixel_values,
+            pixel_values=None if is_first_iteration and pixel_values is not None else pixel_values,
             pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
+            image_grid_thw=None if is_first_iteration and image_grid_thw is not None else image_grid_thw,
             video_grid_thw=video_grid_thw,
             use_cache=use_cache,
             is_first_iteration=is_first_iteration,
+            mm_token_type_ids=None if is_first_iteration and pixel_values is not None else mm_token_type_ids,
+            image_block_counts=None if is_first_iteration and image_block_counts is not None else image_block_counts,
             **kwargs,
         )
         if self._imgslot_is_enabled() and is_first_iteration and pixel_values is not None:
+            model_inputs["pixel_values"] = pixel_values
+            model_inputs["image_grid_thw"] = image_grid_thw
+            model_inputs["image_block_counts"] = image_block_counts
+            model_inputs["mm_token_type_ids"] = mm_token_type_ids
             model_inputs["imgslot_first_prefill"] = True
         if not is_first_iteration and use_cache:
             model_inputs["pixel_values"] = None
@@ -1045,7 +1165,13 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if (cache := model_kwargs.get("past_key_values")) is not None:
             past_length = cache.get_seq_length()
         if past_length != 0 and self.model.rope_deltas is not None:
-            position_ids = text_positions[None, ...] + self.model.rope_deltas
+            batch_size = text_positions.shape[0]
+            delta = self.model.rope_deltas
+            if delta.shape[0] != batch_size:
+                if batch_size % delta.shape[0] != 0:
+                    raise ValueError(f"rope_deltas batch {delta.shape[0]} cannot expand to generation batch {batch_size}.")
+                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+            position_ids = text_positions[None, ...] + delta.to(device=text_positions.device)
             return position_ids
 
         if "input_ids" in model_kwargs and model_kwargs["input_ids"].shape[1] > 0:
@@ -1067,8 +1193,46 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     def _get_image_nums_and_video_nums(self, input_ids: torch.LongTensor | None, inputs_embeds: torch.Tensor | None = None):
         return super()._get_image_nums_and_video_nums(input_ids=input_ids, inputs_embeds=inputs_embeds)
 
+    def _reorder_cache(self, past_key_values, beam_idx):
+        if not hasattr(past_key_values, "reorder_cache"):
+            raise TypeError("past_key_values does not support reorder_cache required for beam search.")
+        past_key_values.reorder_cache(beam_idx)
+
+        beam_order = beam_idx.tolist()
+        if self.model.rope_deltas is not None:
+            if self.model.rope_deltas.shape[0] != len(beam_order):
+                raise ValueError(
+                    f"rope_deltas batch {self.model.rope_deltas.shape[0]} does not match beam order length {len(beam_order)}."
+                )
+            self.model.rope_deltas = self.model.rope_deltas.index_select(0, beam_idx.to(self.model.rope_deltas.device)).clone()
+
+        self._reorder_imgslot_runtime(beam_order)
+        return past_key_values
+
     def _expand_inputs_for_generation(self, expand_size: int = 1, is_encoder_decoder: bool = False, input_ids: torch.LongTensor | None = None, **model_kwargs):
-        return super()._expand_inputs_for_generation(expand_size=expand_size, is_encoder_decoder=is_encoder_decoder, input_ids=input_ids, **model_kwargs)
+        pixel_values = model_kwargs.pop("pixel_values", None)
+        image_grid_thw = model_kwargs.pop("image_grid_thw", None)
+        image_block_counts = model_kwargs.pop("image_block_counts", None)
+        input_ids, model_kwargs = super()._expand_inputs_for_generation(
+            expand_size=expand_size,
+            is_encoder_decoder=is_encoder_decoder,
+            input_ids=input_ids,
+            **model_kwargs,
+        )
+        pixel_values, image_grid_thw, image_block_counts = self._expand_imgslot_packed_images(
+            pixel_values,
+            image_grid_thw,
+            image_block_counts,
+            expand_size,
+        )
+        if pixel_values is not None:
+            model_kwargs["pixel_values"] = pixel_values
+        if image_grid_thw is not None:
+            model_kwargs["image_grid_thw"] = image_grid_thw
+        if image_block_counts is not None:
+            model_kwargs["image_block_counts"] = image_block_counts
+        self._expand_imgslot_runtime(expand_size)
+        return input_ids, model_kwargs
 
 
 __all__ = ["FoveaForConditionalGeneration"]

@@ -161,7 +161,9 @@ assistant 监督模板当前固定为：
 - 先从 vision tower 得到 `visual_pools`
 - 再用共享 ImgSlot attention + router，把每个 block 的变长视觉 token 软聚合成固定 `k` 个 slot
 - 然后把 anchor span 与压缩后的 slot span 直接写回 `inputs_embeds`
+- 若 text context 为空，ImgSlot 会退化为只用 anchor seed + visual routing，而不是报错
 - decode 时会保留 detach 后的 ImgSlot runtime state，并每隔 `img_slot_delta` 步刷新一次 full-attention 层里的相关 KV cache
+- beam / group beam generation 下，首轮 prefill 会由本层接管 packed `pixel_values` / `image_grid_thw` / `mm_token_type_ids` / `image_block_counts`，并按 sample 语义扩展与重排 runtime state 和 `rope_deltas`
 
 辅助损失会通过 `Trainer` 日志暴露为：
 
@@ -220,6 +222,7 @@ bash scripts/eval.sh
 - 会尝试从 Deepspeed checkpoint 恢复 `model.visual*` trainables
 - 复用训练侧 `VisionPacker`
 - ImgSlot 开启时，processor 不返回 `mm_token_type_ids`
+- processor 内部仍用扁平 block 计数展开文本侧 placeholder，但对 generation 额外输出按 sample 分组的 `image_block_counts`
 - 当前只支持 image 输入，不支持 video
 
 ## Qwen3.5 baseline 评测

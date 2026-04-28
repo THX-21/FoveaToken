@@ -6,11 +6,11 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 export HF_HUB_OFFLINE=1
 
-BASE_MODEL="${EVAL_BASE_MODEL:-/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a}"
-LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-ft3-imgslot/checkpoint-2000}"
+BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen3.5-9B}"
+LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-ft3-imgslot/checkpoint-10015}"
 TASKS="${EVAL_TASKS:-xlrs-lite}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
-LOG_SUFFIX="${EVAL_LOG_SUFFIX:-fovea_xlrs_lite_ckpt2000}"
+LOG_SUFFIX="${EVAL_LOG_SUFFIX:-fovea_xlrs_lite_ckpt10015}"
 
 echo "[eval] BASE_MODEL=${BASE_MODEL}"
 echo "[eval] LORA_CHECKPOINT=${LORA_CHECKPOINT}"

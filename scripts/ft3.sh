@@ -22,6 +22,7 @@ export RANK=0
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
 RUN_NAME="${FT3_RUN_NAME:-fovea-ft3-imgslot}"
 JSON_PATH="${FT3_JSON_PATH:-${PROJECT_ROOT}/data/ft3_whole_shuffle.json}"
+# JSON_PATH="${FT3_JSON_PATH:-${PROJECT_ROOT}/data/debug/ft3_step144_nearby.json}"
 IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/jpg_images}"
 CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"

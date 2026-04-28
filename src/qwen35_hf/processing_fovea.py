@@ -1,6 +1,7 @@
 from typing import Any
 
 import numpy as np
+import torch
 
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessorMixin
@@ -154,6 +155,38 @@ class FoveaProcessor(ProcessorMixin):
     def build_mm_token_type_ids(self, input_ids):
         return build_mm_token_type_ids(input_ids, self.image_token_id, self.video_token_id)
 
+    def _normalize_image_counts_per_sample(self, images, image_counts_per_sample):
+        if image_counts_per_sample is not None:
+            return image_counts_per_sample
+        if not isinstance(images, list):
+            images = [images]
+        return [len(sample_images) if isinstance(sample_images, (list, tuple)) else 1 for sample_images in images]
+
+    def _group_image_block_counts(self, flat_image_block_counts, image_counts_per_sample):
+        if flat_image_block_counts is None:
+            return None
+        grouped_image_block_counts = []
+        flat_index = 0
+        for num_images in image_counts_per_sample:
+            sample_counts = flat_image_block_counts[flat_index : flat_index + num_images]
+            if len(sample_counts) != num_images:
+                raise ValueError("Image block metadata does not align with per-sample image grouping.")
+            grouped_image_block_counts.append(sample_counts)
+            flat_index += num_images
+        if flat_index != len(flat_image_block_counts):
+            raise ValueError("Image block metadata contains extra entries after per-sample grouping.")
+        return grouped_image_block_counts
+
+    def _tensorize_grouped_image_block_counts(self, grouped_image_block_counts):
+        if grouped_image_block_counts is None:
+            return None
+        max_images = max((len(sample_counts) for sample_counts in grouped_image_block_counts), default=0)
+        padded_counts = [
+            list(sample_counts) + [0] * (max_images - len(sample_counts))
+            for sample_counts in grouped_image_block_counts
+        ]
+        return torch.tensor(padded_counts, dtype=torch.long)
+
     def __call__(
         self,
         images=None,
@@ -163,6 +196,7 @@ class FoveaProcessor(ProcessorMixin):
         return_tensors=None,
         **kwargs,
     ) -> BatchFeature:
+        image_counts_per_sample = kwargs.pop("image_counts_per_sample", None)
         if text is None:
             text = []
         if not isinstance(text, list):
@@ -171,9 +205,14 @@ class FoveaProcessor(ProcessorMixin):
 
         image_inputs = {}
         image_grid_thw = None
+        flat_image_block_counts = getattr(self.image_processor, "_last_image_block_counts", None)
+        grouped_image_block_counts = None
         if images is not None:
             image_inputs = self.image_processor(images=images, **kwargs)
             image_grid_thw = image_inputs["image_grid_thw"]
+            flat_image_block_counts = getattr(self.image_processor, "_last_image_block_counts", flat_image_block_counts)
+            image_counts_per_sample = self._normalize_image_counts_per_sample(images, image_counts_per_sample)
+            grouped_image_block_counts = self._group_image_block_counts(flat_image_block_counts, image_counts_per_sample)
 
         videos_inputs = {}
         if videos is not None and self.video_processor is not None:
@@ -193,10 +232,15 @@ class FoveaProcessor(ProcessorMixin):
             mm_token_type_ids = self.build_mm_token_type_ids(text_inputs["input_ids"])
             text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
 
+        image_block_counts = grouped_image_block_counts
+        if image_block_counts is not None and return_tensors is not None:
+            image_block_counts = self._tensorize_grouped_image_block_counts(image_block_counts)
+
         return BatchFeature(
             data={
                 **text_inputs,
                 **image_inputs,
+                **({"image_block_counts": image_block_counts} if image_block_counts is not None else {}),
                 **videos_inputs,
             },
             tensor_type=return_tensors,

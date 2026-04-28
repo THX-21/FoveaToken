@@ -1,6 +1,6 @@
-dataset_path: /mnt/data/XLRS-Bench-lite
+dataset_path: initiacms/XLRS-Bench-lite
 dataset_kwargs:
-  load_from_disk: true
+  cache_dir: /data108/user_thx/.cache/huggingface/datasets
 task: xlrs-lite
 process_docs: !function mcq_utils.xlrs_process_docs
 test_split: train

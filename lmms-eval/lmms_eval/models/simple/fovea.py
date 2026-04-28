@@ -277,6 +277,7 @@ class Fovea(Qwen3_VL):
 
         batched_messages = []
         image_inputs = []
+        image_counts_per_sample = []
         for i, context in enumerate(contexts):
             if "<image>" in context:
                 context = context.replace("<image>", "")
@@ -304,10 +305,12 @@ class Fovea(Qwen3_VL):
                     }
                 )
                 image_inputs.extend(part["image"] for part in processed_visuals)
+                image_counts_per_sample.append(len(processed_visuals))
             else:
                 image_placeholders = re.findall(r"<image \d+>", context)
                 content_parts = []
                 text_parts = re.split(r"<image \d+>", context)
+                sample_image_count = 0
                 if text_parts[0]:
                     content_parts.append({"type": "text", "text": text_parts[0]})
 
@@ -317,6 +320,7 @@ class Fovea(Qwen3_VL):
                     if processed_visuals and image_idx < len(processed_visuals):
                         content_parts.append(processed_visuals[image_idx])
                         image_inputs.append(processed_visuals[image_idx]["image"])
+                        sample_image_count += 1
                     if placeholder_idx + 1 < len(text_parts) and text_parts[placeholder_idx + 1]:
                         content_parts.append({"type": "text", "text": text_parts[placeholder_idx + 1]})
 
@@ -326,6 +330,7 @@ class Fovea(Qwen3_VL):
                         "content": content_parts,
                     }
                 )
+                image_counts_per_sample.append(sample_image_count)
 
             batched_messages.append(message)
 
@@ -333,6 +338,7 @@ class Fovea(Qwen3_VL):
         processor_kwargs = {
             "text": texts,
             "images": image_inputs or None,
+            "image_counts_per_sample": image_counts_per_sample,
             "return_mm_token_type_ids": not self.img_slot_enable,
             "return_tensors": "pt",
         }
