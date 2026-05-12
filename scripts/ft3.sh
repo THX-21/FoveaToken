@@ -1,5 +1,4 @@
 #!/bin/bash
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=8
 export NCCL_DEBUG=INFO
 # export DS_IGNORE_CUDA_DETECTION=1
@@ -19,7 +18,7 @@ fi
 export WORLD_SIZE=$((NNODES * NUM_GPUS))
 export RANK=0
 
-NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
+NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-3}"
 RUN_NAME="${FT3_RUN_NAME:-fovea-ft3-imgslot}"
 JSON_PATH="${FT3_JSON_PATH:-${PROJECT_ROOT}/data/ft3_whole_shuffle.json}"
 # JSON_PATH="${FT3_JSON_PATH:-${PROJECT_ROOT}/data/debug/ft3_step144_nearby.json}"
@@ -28,11 +27,7 @@ CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-200}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
-IMG_SLOT_AUX_LOSS_COEF="${FT3_IMG_SLOT_AUX_LOSS_COEF:-0.05}"
-IMG_SLOT_GATE_SPARSITY_COEF="${FT3_IMG_SLOT_GATE_SPARSITY_COEF:-0.8}"
-IMG_SLOT_EXPERT_BALANCE_COEF="${FT3_IMG_SLOT_EXPERT_BALANCE_COEF:-0.8}"
-IMG_SLOT_SLOT_BALANCE_COEF="${FT3_IMG_SLOT_SLOT_BALANCE_COEF:-0.8}"
-IMG_SLOT_ROUTE_ENTROPY_COEF="${FT3_IMG_SLOT_ROUTE_ENTROPY_COEF:-0.8}"
+ATTN_IMPLEMENTATION="${FT3_ATTN_IMPLEMENTATION:-sdpa}"
 
 echo "[ft3] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
 echo "[ft3] RUN_NAME=${RUN_NAME}"
@@ -41,12 +36,7 @@ echo "[ft3] IMAGE_FOLDER=${IMAGE_FOLDER}"
 echo "[ft3] CKPT_PATH=${CKPT_PATH}"
 echo "[ft3] OUTPUT_DIR=${OUTPUT_DIR}"
 echo "[ft3] SAVE_STEPS=${SAVE_STEPS}"
-echo "[ft3] MAX_STEPS=${MAX_STEPS}"
-echo "[ft3] IMG_SLOT_AUX_LOSS_COEF=${IMG_SLOT_AUX_LOSS_COEF}"
-echo "[ft3] IMG_SLOT_GATE_SPARSITY_COEF=${IMG_SLOT_GATE_SPARSITY_COEF}"
-echo "[ft3] IMG_SLOT_EXPERT_BALANCE_COEF=${IMG_SLOT_EXPERT_BALANCE_COEF}"
-echo "[ft3] IMG_SLOT_SLOT_BALANCE_COEF=${IMG_SLOT_SLOT_BALANCE_COEF}"
-echo "[ft3] IMG_SLOT_ROUTE_ENTROPY_COEF=${IMG_SLOT_ROUTE_ENTROPY_COEF}"
+echo "[ft3] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src"
 
@@ -85,7 +75,7 @@ if [[ -n "${LATEST_CHECKPOINT}" ]]; then
 fi
 
 ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
-    --deepspeed "${PROJECT_ROOT}/scripts/zero2_tp2_gpu.json" \
+    --deepspeed "${PROJECT_ROOT}/scripts/zero2_tp2.json" \
     --model_name_or_path "${CKPT_PATH}" \
     --data_path "${JSON_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
@@ -95,18 +85,13 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
     --unfreeze_vision true \
-    --img_slot_aux_loss_coef "${IMG_SLOT_AUX_LOSS_COEF}" \
-    --img_slot_gate_sparsity_coef "${IMG_SLOT_GATE_SPARSITY_COEF}" \
-    --img_slot_expert_balance_coef "${IMG_SLOT_EXPERT_BALANCE_COEF}" \
-    --img_slot_slot_balance_coef "${IMG_SLOT_SLOT_BALANCE_COEF}" \
-    --img_slot_route_entropy_coef "${IMG_SLOT_ROUTE_ENTROPY_COEF}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
     --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
     --max_steps "${MAX_STEPS}" \
-    --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 8 \
+    --per_device_train_batch_size 2 \
+    --gradient_accumulation_steps 4 \
     --eval_strategy no \
     --save_strategy steps \
     --save_steps "${SAVE_STEPS}" \
@@ -114,7 +99,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --learning_rate 5e-6 \
     --weight_decay 0.0 \
     --warmup_ratio 0.1 \
-    --attn_implementation sdpa \
+    --attn_implementation "${ATTN_IMPLEMENTATION}" \
     --lr_scheduler_type cosine \
     --logging_steps 1 \
     --model_max_length 32768 \

@@ -25,7 +25,6 @@ class LocalVisionImageProcessor(ImageProcessingMixin):
     def __init__(self, vision_packer: VisionPacker) -> None:
         self.vision_packer = vision_packer
         self.merge_size = vision_packer.local_config.spatial_merge_size
-        self.img_slot_anchor_count = vision_packer.img_slot_anchor_count if vision_packer.img_slot_enable else None
         self.img_slot_token_count = vision_packer.img_slot_token_count if vision_packer.img_slot_enable else None
         self._last_image_block_counts = []
 
@@ -90,7 +89,6 @@ class Fovea(Qwen3_VL):
         reasoning_prompt: Optional[str] = None,
         max_image_tokens: int | None = 128,
         img_slot_enable: bool = True,
-        img_slot_m: int | None = None,
         img_slot_k: int | None = None,
         img_slot_delta: int | None = None,
         img_slot_beta: float | None = None,
@@ -106,8 +104,6 @@ class Fovea(Qwen3_VL):
             raise ValueError(f"attn_implementation must be one of {valid_attn_implementations}, got {attn_implementation}")
         if isinstance(img_slot_enable, str):
             img_slot_enable = img_slot_enable.lower() in {"1", "true", "yes"}
-        if img_slot_m is not None:
-            img_slot_m = int(img_slot_m)
         if img_slot_k is not None:
             img_slot_k = int(img_slot_k)
         if img_slot_delta is not None:
@@ -126,8 +122,11 @@ class Fovea(Qwen3_VL):
             self._device = torch.device(f"cuda:{accelerator.local_process_index}")
             self.device_map = f"cuda:{accelerator.local_process_index}"
         else:
-            self._device = torch.device(device)
-            self.device_map = device_map if device_map else device
+            resolved_device = device
+            if resolved_device in {None, "cuda"} and device_map not in {None, "auto"}:
+                resolved_device = device_map
+            self._device = torch.device(resolved_device)
+            self.device_map = device_map if device_map else resolved_device
 
         model_kwargs = {
             "torch_dtype": self._pick_torch_dtype(),
@@ -137,8 +136,6 @@ class Fovea(Qwen3_VL):
             model_kwargs["attn_implementation"] = attn_implementation
         if self.img_slot_enable:
             model_kwargs["img_slot_enable"] = True
-        if img_slot_m is not None:
-            model_kwargs["img_slot_m"] = img_slot_m
         if img_slot_k is not None:
             model_kwargs["img_slot_k"] = img_slot_k
         if img_slot_delta is not None:
@@ -154,7 +151,6 @@ class Fovea(Qwen3_VL):
         self._model.config.img_slot_enable = self.img_slot_enable
         if img_slot_tile_size is not None:
             self._model.config.img_slot_tile_size = int(img_slot_tile_size)
-        config_img_slot_m = int(self._model.config.img_slot_m)
         config_img_slot_k = int(self._model.config.img_slot_k)
         if peft is not None:
             from peft import PeftModel
@@ -168,7 +164,6 @@ class Fovea(Qwen3_VL):
             vision_config=self._model.config.vision_config,
             max_image_tokens=max_image_tokens,
             img_slot_enable=self.img_slot_enable,
-            img_slot_m=config_img_slot_m,
             img_slot_k=config_img_slot_k,
             img_slot_tile_size=None if img_slot_tile_size is None else int(img_slot_tile_size),
         )
@@ -278,6 +273,7 @@ class Fovea(Qwen3_VL):
         batched_messages = []
         image_inputs = []
         image_counts_per_sample = []
+        logical_image_placeholder = self.processor.build_visual_placeholder(1)
         for i, context in enumerate(contexts):
             if "<image>" in context:
                 context = context.replace("<image>", "")
@@ -297,7 +293,36 @@ class Fovea(Qwen3_VL):
                     if isinstance(visual, Image.Image):
                         processed_visuals.append({"type": "image", "image": visual})
 
-            if self.interleave_visuals is False:
+            if self.img_slot_enable:
+                sample_text = context
+                sample_image_count = len(processed_visuals)
+                if self.interleave_visuals:
+                    image_placeholders = re.findall(r"<image \d+>", context)
+                    text_parts = re.split(r"<image \d+>", context)
+                    sample_text = text_parts[0] if text_parts else ""
+                    ordered_images = []
+                    for placeholder_idx, placeholder in enumerate(image_placeholders):
+                        img_idx = int(re.search(r"<image (\d+)>", placeholder).group(1)) - 1
+                        image_idx = min(img_idx, len(processed_visuals) - 1) if processed_visuals else 0
+                        if processed_visuals and image_idx < len(processed_visuals):
+                            ordered_images.append(processed_visuals[image_idx]["image"])
+                            sample_text += logical_image_placeholder
+                        if placeholder_idx + 1 < len(text_parts):
+                            sample_text += text_parts[placeholder_idx + 1]
+                    image_inputs.extend(ordered_images)
+                    sample_image_count = len(ordered_images)
+                else:
+                    sample_text = logical_image_placeholder * sample_image_count + context
+                    image_inputs.extend(part["image"] for part in processed_visuals)
+
+                message.append(
+                    {
+                        "role": "user",
+                        "content": sample_text,
+                    }
+                )
+                image_counts_per_sample.append(sample_image_count)
+            elif self.interleave_visuals is False:
                 message.append(
                     {
                         "role": "user",

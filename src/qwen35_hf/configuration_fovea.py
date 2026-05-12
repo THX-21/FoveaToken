@@ -113,11 +113,9 @@ class FoveaConfig(PreTrainedConfig):
     r"""
     img_slot_enable (`bool`, *optional*, defaults to `True`):
         Whether to enable block-based ImgSlot routing.
-    img_slot_m (`int`, *optional*, defaults to 8):
-        Number of dynamic anchor/query tokens per sample-level shared anchor span.
     img_slot_k (`int`, *optional*, defaults to 128):
-        Number of compressed visual slots written back per image block span.
-    img_slot_delta (`int`, *optional*, defaults to 129):
+        Number of shared internal A/query tokens and compressed visual slots written back per image block span.
+    img_slot_delta (`int`, *optional*, defaults to 128):
         Decode-step interval for refreshing ImgSlot KV entries.
     img_slot_beta (`float`, *optional*, defaults to 0.3):
         Update strength for the dynamic anchor tokens.
@@ -128,29 +126,6 @@ class FoveaConfig(PreTrainedConfig):
     img_slot_tile_size (`int`, *optional*):
         Required when ImgSlot is enabled. Original images are evenly split into
         blocks using `ceil(width / img_slot_tile_size)` and `ceil(height / img_slot_tile_size)`.
-    img_slot_num_experts (`int`, *optional*, defaults to 8):
-        Number of expert groups used by the shared ImgSlot router.
-    img_slot_slots_per_expert (`int`, *optional*, defaults to 16):
-        Number of subslots per expert; `img_slot_num_experts * img_slot_slots_per_expert`
-        must equal `img_slot_k`.
-    img_slot_gate_temperature (`float`, *optional*, defaults to 1.0):
-        Temperature applied to gate logits during soft compression.
-    img_slot_route_temperature (`float`, *optional*, defaults to 1.0):
-        Temperature applied to route logits during soft compression. The first
-        implementation keeps this as a compatibility field and uses it for the
-        shared route/subslot softmax.
-    img_slot_topk_experts (`int`, *optional*, defaults to 2):
-        Number of experts retained per visual token before token-wise normalization.
-    img_slot_topk_subslots (`int`, *optional*, defaults to 4):
-        Number of subslots retained inside each selected expert.
-    img_slot_use_entmax (`bool`, *optional*, defaults to `False`):
-        Reserved flag for future entmax-style routing.
-    img_slot_enable_hardening (`bool`, *optional*, defaults to `False`):
-        Reserved flag for future near-hard routing / inference hardening.
-    img_slot_hardening_schedule (`str`, *optional*, defaults to `"none"`):
-        Reserved schedule name for future hardening/annealing.
-    img_slot_min_temperature (`float`, *optional*, defaults to 0.25):
-        Lower bound for future gate/route temperature annealing.
     """
     model_type = "fovea"
     sub_configs = {"vision_config": FoveaVisionConfig, "text_config": FoveaTextConfig}
@@ -165,23 +140,12 @@ class FoveaConfig(PreTrainedConfig):
     vision_end_token_id: int = 248054
     tie_word_embeddings: bool = False
     img_slot_enable: bool = True
-    img_slot_m: int = 64
     img_slot_k: int = 128
     img_slot_delta: int = 128
     img_slot_beta: float = 0.3
     img_slot_lambda: float = 0.9
     img_slot_max_text_tokens: int = 512
     img_slot_tile_size: int | None = 1280
-    img_slot_num_experts: int = 8
-    img_slot_slots_per_expert: int = 16
-    img_slot_gate_temperature: float = 1.0
-    img_slot_route_temperature: float = 1.0
-    img_slot_topk_experts: int = 2
-    img_slot_topk_subslots: int = 4
-    img_slot_use_entmax: bool = False
-    img_slot_enable_hardening: bool = False
-    img_slot_hardening_schedule: str = "none"
-    img_slot_min_temperature: float = 0.25
 
     def __post_init__(self, **kwargs):
         if isinstance(self.vision_config, dict):

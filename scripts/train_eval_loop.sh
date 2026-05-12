@@ -1,21 +1,21 @@
 #!/bin/bash
-set -uo pipefail
+# set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-RUN_NAME="fovea-ft3-imgslot"
-OUTPUT_DIR="${PROJECT_ROOT}/checkpoints/${RUN_NAME}"
-STEP_INTERVAL=1000
-SAVE_INTERVAL=500
-TRAIN_EVAL_MAX_STEPS=20030
-LOG_PREFIX="fovea_xlrs_lite"
-JSON_PATH="/mnt/data/GeoLLaVA-Data/ft3_whole_shuffle.json"
-IMAGE_FOLDER="/mnt/data/GeoLLaVA-Data/jpg_images"
-CKPT_PATH="Qwen/Qwen3.5-9B"
-BASE_MODEL="/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a"
-TASKS="xlrs-lite"
-OUTPUT_PATH="${PROJECT_ROOT}/logs"
+RUN_NAME="${FT3_RUN_NAME:-fovea-ft3-imgslot}"
+OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
+STEP_INTERVAL="${TRAIN_EVAL_STEP_INTERVAL:-200}"
+SAVE_INTERVAL="${FT3_SAVE_STEPS:-200}"
+NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-3}"
+LOG_PREFIX="${TRAIN_EVAL_LOG_PREFIX:-fovea_xlrs_lite}"
+JSON_PATH="${FT3_JSON_PATH:-${PROJECT_ROOT}/data/ft3_whole_shuffle.json}"
+IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/jpg_images}"
+CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
+BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen3.5-9B}"
+TASKS="${EVAL_TASKS:-xlrs-lite}"
+OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 
 latest_checkpoint_step() {
     find "${OUTPUT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' 2>/dev/null \
@@ -50,24 +50,18 @@ while true; do
     if [[ -z "${current_step}" ]]; then
         current_step=0
     fi
-    if (( current_step >= TRAIN_EVAL_MAX_STEPS )); then
-        echo "Training already reached checkpoint-${current_step}; target is ${TRAIN_EVAL_MAX_STEPS}."
-        break
-    fi
 
     target_step=$(( ((current_step / STEP_INTERVAL) + 1) * STEP_INTERVAL ))
-    if (( target_step > TRAIN_EVAL_MAX_STEPS )); then
-        target_step="${TRAIN_EVAL_MAX_STEPS}"
-    fi
 
-    echo "Training until global step ${target_step}..."
+    echo "Training until global step ${target_step} or epoch ${NUM_TRAIN_EPOCHS} end..."
     FT3_RUN_NAME="${RUN_NAME}" \
     FT3_OUTPUT_DIR="${OUTPUT_DIR}" \
     FT3_JSON_PATH="${JSON_PATH}" \
     FT3_IMAGE_FOLDER="${IMAGE_FOLDER}" \
     FT3_CKPT_PATH="${CKPT_PATH}" \
     FT3_SAVE_STEPS="${SAVE_INTERVAL}" \
-    FT3_MAX_STEPS="${TRAIN_EVAL_MAX_STEPS}" \
+    FT3_NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS}" \
+    FT3_MAX_STEPS="-1" \
     FT3_STOP_STEP="${target_step}" \
     bash "${SCRIPT_DIR}/ft3.sh"
     status="$?"
@@ -94,5 +88,10 @@ while true; do
     status="$?"
     if (( status != 0 )); then
         exit_on_failure "${status}" "Evaluation failed for ${checkpoint}."
+    fi
+
+    if (( trained_step < target_step )); then
+        echo "Training finished at checkpoint-${trained_step} before reaching target step ${target_step}."
+        break
     fi
 done

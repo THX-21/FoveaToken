@@ -5,15 +5,19 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn import init
 
 from .modeling_qwen3_5 import (
+    ALL_ATTENTION_FUNCTIONS,
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5Model,
     Qwen3_5PreTrainedModel,
+    Qwen3_5RMSNorm,
     apply_rotary_pos_emb,
     auto_docstring,
     can_return_tuple,
     Cache,
+    eager_attention_forward,
     GenerationMixin,
     rotate_half,
     TransformersKwargs,
@@ -27,8 +31,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     """Multimodal causal LM head for text, image, and video generation.
 
     ImgSlot overview:
-    - Prefill: replace text-side image placeholder spans with one shared anchor span
-      plus one compressed visual span per image block.
+    - Prefill: replace text-side image placeholder spans with one compressed visual span per image block.
     - Decode: keep a detached runtime state per sample, and every `delta` steps
       refresh the slot tokens then overwrite their KV cache entries on
       full-attention layers only.
@@ -42,29 +45,31 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         self.model = Qwen3_5Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         hidden_size = config.text_config.hidden_size
-        num_anchor_tokens = max(1, int(config.img_slot_m))
-        imgslot_num_experts = int(config.img_slot_num_experts)
-        imgslot_slots_per_expert = int(config.img_slot_slots_per_expert)
-        imgslot_total_slots = imgslot_num_experts * imgslot_slots_per_expert
-        if imgslot_total_slots != int(config.img_slot_k):
-            raise ValueError("img_slot_num_experts * img_slot_slots_per_expert must equal img_slot_k.")
+        num_slot_tokens = max(1, int(config.img_slot_k))
         self.imgslot_num_heads = int(config.text_config.num_attention_heads)
         self.imgslot_head_dim = int(getattr(config.text_config, "head_dim", hidden_size // self.imgslot_num_heads))
         if self.imgslot_num_heads * self.imgslot_head_dim != hidden_size:
             raise ValueError("ImgSlot attention requires num_attention_heads * head_dim to equal hidden_size.")
-        # Anchor token table: [m, hidden].
-        self.imgslot_a_tokens = nn.Embedding(num_anchor_tokens, hidden_size)
+        # Shared internal A/query token table: [k, hidden].
+        self.imgslot_a_tokens = nn.Embedding(num_slot_tokens, hidden_size)
         # Shared ImgSlot attention blocks. These do not replace decoder self-attn;
         # they only synthesize/refresh slot tokens before writing them back into
         # decoder KV cache.
-        self.imgslot_text_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.imgslot_text_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.imgslot_text_v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.imgslot_text_o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.imgslot_img_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.imgslot_img_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.imgslot_img_v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.imgslot_img_o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.imgslot_text_q_proj = nn.Linear(hidden_size, hidden_size * 2, bias=config.text_config.attention_bias)
+        self.imgslot_text_k_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
+        self.imgslot_text_v_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
+        self.imgslot_text_o_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
+        self.imgslot_text_q_norm = Qwen3_5RMSNorm(self.imgslot_head_dim, eps=config.text_config.rms_norm_eps)
+        self.imgslot_text_k_norm = Qwen3_5RMSNorm(self.imgslot_head_dim, eps=config.text_config.rms_norm_eps)
+        self.imgslot_img_q_proj = nn.Linear(hidden_size, hidden_size * 2, bias=config.text_config.attention_bias)
+        self.imgslot_img_k_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
+        self.imgslot_img_v_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
+        self.imgslot_img_o_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
+        self.imgslot_img_q_norm = Qwen3_5RMSNorm(self.imgslot_head_dim, eps=config.text_config.rms_norm_eps)
+        self.imgslot_img_k_norm = Qwen3_5RMSNorm(self.imgslot_head_dim, eps=config.text_config.rms_norm_eps)
+        self.imgslot_attention_dropout = config.text_config.attention_dropout
+        self.imgslot_scaling = self.imgslot_head_dim**-0.5
+        self.num_key_value_groups = 1
         self.imgslot_attn_norm = nn.LayerNorm(hidden_size)
         self.imgslot_ffn = nn.Sequential(
             nn.Linear(hidden_size, hidden_size * 4),
@@ -73,23 +78,25 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         )
         self.imgslot_ffn_norm = nn.LayerNorm(hidden_size)
         self.imgslot_visual_norm = nn.LayerNorm(hidden_size)
-        self.imgslot_gate_proj = nn.Linear(hidden_size, 1, bias=False)
-        self.imgslot_expert_proj = nn.Linear(hidden_size, imgslot_num_experts, bias=False)
-        self.imgslot_subslot_proj = nn.Linear(hidden_size, imgslot_total_slots, bias=False)
-        self.imgslot_value_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.imgslot_slot_out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         # Runtime state used only during generation refresh.
         # states: list[batch] -> list[visual_block_state]
         # text_keys/text_values: per-sample cached text KV, each shaped
         #   [1, num_attention_heads, text_seq, head_dim]
         self._imgslot_runtime = {"enabled": False, "states": [], "delta": 1, "step": 0}
         self._imgslot_aux = self._empty_imgslot_aux(device=self.lm_head.weight.device)
-        self.imgslot_aux_loss_coef = 0.01
-        self.imgslot_gate_sparsity_coef = 1.0
-        self.imgslot_expert_balance_coef = 1.0
-        self.imgslot_slot_balance_coef = 1.0
-        self.imgslot_route_entropy_coef = 0.1
         self.post_init()
+        self._init_imgslot_modules()
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        output_loading_info = bool(kwargs.get("output_loading_info", False))
+        loaded = super().from_pretrained(*args, **kwargs)
+        if output_loading_info:
+            model, loading_info = loaded
+            model._repair_imgslot_init()
+            return model, loading_info
+        loaded._repair_imgslot_init()
+        return loaded
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -103,34 +110,18 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     def _imgslot_config(self) -> dict[str, float | int]:
         if self._imgslot_is_enabled() and self.config.img_slot_tile_size is None:
             raise ValueError("img_slot_tile_size is required when img_slot_enable=true.")
-        total_slots = int(self.config.img_slot_num_experts) * int(self.config.img_slot_slots_per_expert)
-        if total_slots != int(self.config.img_slot_k):
-            raise ValueError("img_slot_num_experts * img_slot_slots_per_expert must equal img_slot_k.")
         return {
-            "m": int(self.config.img_slot_m),
             "k": int(self.config.img_slot_k),
             "delta": int(self.config.img_slot_delta),
             "beta": float(self.config.img_slot_beta),
             "lam": float(self.config.img_slot_lambda),
             "max_text_tokens": int(self.config.img_slot_max_text_tokens),
-            "num_experts": int(self.config.img_slot_num_experts),
-            "slots_per_expert": int(self.config.img_slot_slots_per_expert),
-            "gate_temperature": float(self.config.img_slot_gate_temperature),
-            "route_temperature": float(self.config.img_slot_route_temperature),
-            "topk_experts": int(self.config.img_slot_topk_experts),
-            "topk_subslots": int(self.config.img_slot_topk_subslots),
         }
 
     def _empty_imgslot_aux(self, device: torch.device) -> dict[str, torch.Tensor]:
         zero = torch.zeros((), device=device)
         return {
-            "aux_loss": zero,
-            "gate_logit_mean": zero,
-            "gate_logit_std": zero,
-            "gate_entropy": zero,
-            "expert_balance": zero,
-            "slot_balance": zero,
-            "dispatch_entropy": zero,
+            "attention_entropy": zero,
             "num_blocks": zero,
         }
 
@@ -139,6 +130,99 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             self._imgslot_aux = self._empty_imgslot_aux(device)
             return
         self._imgslot_aux = aux_stats
+
+    @torch.no_grad()
+    def _init_imgslot_modules(self) -> None:
+        """Explicitly initialize newly-added ImgSlot weights.
+
+        Qwen/Qwen3.5 checkpoints do not contain ImgSlot parameters. Reinitialize
+        them here so missing-key load paths start from the same small-random
+        distribution as the rest of the model instead of silently landing on
+        zero weights.
+        """
+
+        std = float(getattr(self.config.text_config, "initializer_range", 0.02))
+        linear_modules = (
+            self.imgslot_text_q_proj,
+            self.imgslot_text_k_proj,
+            self.imgslot_text_v_proj,
+            self.imgslot_text_o_proj,
+            self.imgslot_img_q_proj,
+            self.imgslot_img_k_proj,
+            self.imgslot_img_v_proj,
+            self.imgslot_img_o_proj,
+            self.imgslot_ffn[0],
+            self.imgslot_ffn[2],
+        )
+        norm_modules = (
+            self.imgslot_text_q_norm,
+            self.imgslot_text_k_norm,
+            self.imgslot_img_q_norm,
+            self.imgslot_img_k_norm,
+        )
+        layer_norm_modules = (
+            self.imgslot_attn_norm,
+            self.imgslot_ffn_norm,
+            self.imgslot_visual_norm,
+        )
+
+        init.normal_(self.imgslot_a_tokens.weight, mean=0.0, std=std)
+        for module in linear_modules:
+            init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+        for module in norm_modules:
+            init.zeros_(module.weight)
+        for module in layer_norm_modules:
+            init.ones_(module.weight)
+            init.zeros_(module.bias)
+
+    @torch.no_grad()
+    def _repair_imgslot_init(self) -> None:
+        """Fix ImgSlot missing-key tensors left uninitialized by some loaders."""
+
+        std = float(getattr(self.config.text_config, "initializer_range", 0.02))
+        random_weight_modules = (
+            self.imgslot_a_tokens,
+            self.imgslot_text_q_proj,
+            self.imgslot_text_k_proj,
+            self.imgslot_text_v_proj,
+            self.imgslot_text_o_proj,
+            self.imgslot_img_q_proj,
+            self.imgslot_img_k_proj,
+            self.imgslot_img_v_proj,
+            self.imgslot_img_o_proj,
+            self.imgslot_ffn[0],
+            self.imgslot_ffn[2],
+        )
+        for module in random_weight_modules:
+            weight = module.weight
+            if torch.isfinite(weight).all() and weight.float().std() > 0:
+                continue
+            init.normal_(weight, mean=0.0, std=std)
+            if getattr(module, "bias", None) is not None:
+                init.zeros_(module.bias)
+
+        norm_modules = (
+            self.imgslot_text_q_norm,
+            self.imgslot_text_k_norm,
+            self.imgslot_img_q_norm,
+            self.imgslot_img_k_norm,
+        )
+        for module in norm_modules:
+            if not torch.isfinite(module.weight).all():
+                init.zeros_(module.weight)
+
+        layer_norm_modules = (
+            self.imgslot_attn_norm,
+            self.imgslot_ffn_norm,
+            self.imgslot_visual_norm,
+        )
+        for module in layer_norm_modules:
+            if not torch.isfinite(module.weight).all():
+                init.ones_(module.weight)
+            if not torch.isfinite(module.bias).all():
+                init.zeros_(module.bias)
 
     def _reset_imgslot_runtime(self) -> None:
         self._imgslot_runtime = {"enabled": False, "states": [], "delta": 1, "step": 0}
@@ -177,22 +261,26 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                     expanded.append(self._clone_imgslot_runtime_item(item, deep=(key == "states")))
             runtime[key] = expanded
 
+    def _image_block_counts_tensor(self, image_block_counts, device) -> torch.Tensor | None:
+        if image_block_counts is None:
+            return None
+        if isinstance(image_block_counts, torch.Tensor):
+            image_block_counts = image_block_counts.to(device=device, dtype=torch.long)
+        elif image_block_counts and isinstance(image_block_counts[0], (list, tuple)):
+            max_images = max(len(sample_counts) for sample_counts in image_block_counts)
+            padded_counts = [list(sample_counts) + [0] * (max_images - len(sample_counts)) for sample_counts in image_block_counts]
+            image_block_counts = torch.tensor(padded_counts, dtype=torch.long, device=device)
+        else:
+            image_block_counts = torch.tensor(image_block_counts, dtype=torch.long, device=device)
+        if image_block_counts.dim() == 1:
+            image_block_counts = image_block_counts.unsqueeze(0)
+        return image_block_counts
+
     def _expand_imgslot_packed_images(self, pixel_values, image_grid_thw, image_block_counts, expand_size: int):
         if pixel_values is None or image_grid_thw is None or image_block_counts is None or expand_size == 1:
             return pixel_values, image_grid_thw, image_block_counts
 
-        if not isinstance(image_block_counts, torch.Tensor):
-            if image_block_counts and isinstance(image_block_counts[0], (list, tuple)):
-                max_images = max(len(sample_counts) for sample_counts in image_block_counts)
-                padded_counts = [list(sample_counts) + [0] * (max_images - len(sample_counts)) for sample_counts in image_block_counts]
-                image_block_counts = torch.tensor(padded_counts, dtype=torch.long, device=image_grid_thw.device)
-            else:
-                image_block_counts = torch.tensor(image_block_counts, dtype=torch.long, device=image_grid_thw.device)
-        else:
-            image_block_counts = image_block_counts.to(device=image_grid_thw.device)
-
-        if image_block_counts.dim() == 1:
-            image_block_counts = image_block_counts.unsqueeze(0)
+        image_block_counts = self._image_block_counts_tensor(image_block_counts, device=image_grid_thw.device)
         sample_block_counts = image_block_counts.sum(dim=1).tolist()
         if sum(sample_block_counts) != image_grid_thw.shape[0]:
             raise ValueError(
@@ -231,13 +319,16 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 expanded_counts.append(sample_counts.clone())
         return torch.cat(expanded_patches, dim=0), torch.cat(expanded_grids, dim=0), torch.cat(expanded_counts, dim=0)
 
-    def _project_imgslot_kv(self, tokens, k_proj, v_proj):
+    def _project_imgslot_kv(self, tokens, k_proj, v_proj, k_norm):
         # tokens: [seq, hidden]
         # -> key/value: [1, num_attention_heads, seq, head_dim]
+        proj_k = k_proj(tokens)
+        proj_v = v_proj(tokens)
         num_heads = self.imgslot_num_heads
         head_dim = self.imgslot_head_dim
-        key = k_proj(tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
-        value = v_proj(tokens).view(1, -1, num_heads, head_dim).transpose(1, 2)
+        hidden_shape = (1, tokens.shape[0], -1, head_dim)
+        key = k_norm(proj_k.view(hidden_shape)).transpose(1, 2)
+        value = proj_v.view(hidden_shape).transpose(1, 2)
         return key, value
 
     def _project_imgslot_text_tokens(self, text_tokens):
@@ -245,6 +336,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             text_tokens,
             self.imgslot_text_k_proj,
             self.imgslot_text_v_proj,
+            self.imgslot_text_k_norm,
         )
 
     def _project_imgslot_visual_pool(self, visual_pool):
@@ -252,6 +344,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             visual_pool,
             self.imgslot_img_k_proj,
             self.imgslot_img_v_proj,
+            self.imgslot_img_k_norm,
         )
 
     def _apply_imgslot_rope(self, states: torch.Tensor, positions: torch.Tensor | None) -> torch.Tensor:
@@ -264,8 +357,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             positions = positions[None, ...].expand(3, batch_size, seq_len)
         dummy = states.new_zeros((batch_size, seq_len, self.config.text_config.hidden_size))
         cos, sin = self.model.language_model.rotary_emb(dummy, positions.to(device=states.device))
-        cos = cos.unsqueeze(1).to(states.dtype)
-        sin = sin.unsqueeze(1).to(states.dtype)
+        cos = cos.unsqueeze(1).to(device=states.device, dtype=states.dtype)
+        sin = sin.unsqueeze(1).to(device=states.device, dtype=states.dtype)
         rotary_dim = cos.shape[-1]
         states_rot, states_pass = states[..., :rotary_dim], states[..., rotary_dim:]
         states_embed = (states_rot * cos) + (rotate_half(states_rot) * sin)
@@ -277,6 +370,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         key_states,
         value_states,
         q_proj,
+        q_norm,
         o_proj,
         mask=None,
         query_positions=None,
@@ -285,27 +379,65 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         # anchor_tokens: [block_count, slot_seq, hidden]
         # key_states/value_states: [block_count, num_attention_heads, kv_seq, head_dim]
         # mask: [block_count, kv_seq] where True means valid token.
-        # query: [block_count, num_heads, slot_seq, head_dim]
-        # attention_logits: [block_count, num_heads, slot_seq, kv_seq]
-        # context: [block_count, slot_seq, hidden]
-        num_heads = self.imgslot_num_heads
         hidden_dim = anchor_tokens.shape[-1]
         head_dim = self.imgslot_head_dim
-        block_count = anchor_tokens.shape[0]
-        query = q_proj(anchor_tokens).view(block_count, -1, num_heads, head_dim).transpose(1, 2)
-        query = self._apply_imgslot_rope(query, query_positions)
+        input_shape = anchor_tokens.shape[:-1]
+        block_count, slot_seq = input_shape
+        hidden_shape = (*input_shape, -1, head_dim)
+        query_states, gate = torch.chunk(
+            q_proj(anchor_tokens).view(*input_shape, -1, head_dim * 2),
+            2,
+            dim=-1,
+        )
+        gate = gate.reshape(*input_shape, -1)
+        query_states = q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        query_states = self._apply_imgslot_rope(query_states, query_positions)
         key_states = self._apply_imgslot_rope(key_states, key_positions)
-        attention_logits = torch.matmul(query.float(), key_states.float().transpose(-2, -1)) / math.sqrt(head_dim)
+        key_states = key_states.to(device=query_states.device, dtype=query_states.dtype)
+        value_states = value_states.to(device=query_states.device, dtype=query_states.dtype)
+
+        attention_mask = None
         if mask is not None:
-            attention_logits = attention_logits.masked_fill(~mask[:, None, None, :], torch.finfo(attention_logits.dtype).min)
-        # Stabilize softmax over the kv dimension.
-        attention_logits = attention_logits - attention_logits.amax(dim=-1, keepdim=True)
-        attention_weights = torch.softmax(attention_logits, dim=-1).to(value_states.dtype)
-        context = torch.matmul(attention_weights.float(), value_states.float()).transpose(1, 2).reshape(block_count, anchor_tokens.shape[1], hidden_dim)
-        context = context.to(anchor_tokens.dtype)
+            mask = mask.to(device=query_states.device)
+            attention_mask = query_states.new_full(
+                (block_count, 1, 1, key_states.shape[-2]),
+                torch.finfo(query_states.dtype).min,
+            )
+            attention_mask = attention_mask.masked_fill(mask[:, None, None, :], 0)
+
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config.text_config._attn_implementation,
+            eager_attention_forward,
+        )
+        use_eager_attention = attention_interface is eager_attention_forward
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.imgslot_attention_dropout,
+            scaling=self.imgslot_scaling,
+            is_causal=False,
+        )
+        if attn_weights is None:
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.imgslot_attention_dropout,
+                scaling=self.imgslot_scaling,
+                is_causal=False,
+            )
+        elif not use_eager_attention:
+            attn_output = attn_output.to(query_states.dtype)
+        context = attn_output.reshape(block_count, slot_seq, hidden_dim).contiguous()
+        context = (context * torch.sigmoid(gate)).to(anchor_tokens.dtype)
         updated_anchor_tokens = self.imgslot_attn_norm(anchor_tokens + o_proj(context))
         updated_anchor_tokens = self.imgslot_ffn_norm(updated_anchor_tokens + self.imgslot_ffn(updated_anchor_tokens))
-        return updated_anchor_tokens, attention_weights
+        return updated_anchor_tokens, attn_weights
 
     def _run_imgslot_text_blocks(self, anchor_tokens, text_key, text_value, text_mask=None):
         updated_anchor_tokens, _attention_weights = self._run_imgslot_attention(
@@ -313,6 +445,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             text_key,
             text_value,
             self.imgslot_text_q_proj,
+            self.imgslot_text_q_norm,
             self.imgslot_text_o_proj,
             mask=text_mask,
         )
@@ -334,6 +467,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             visual_key,
             visual_value,
             self.imgslot_img_q_proj,
+            self.imgslot_img_q_norm,
             self.imgslot_img_o_proj,
             mask=visual_mask,
             query_positions=anchor_positions,
@@ -350,155 +484,46 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         visual_token_scores = list(token_scores.split(visual_lengths, dim=1))
         return updated_anchor_tokens, visual_contexts, visual_token_scores, attention_weights
 
-    def _compress_imgslot_visual_tokens(self, visual_context, visual_pool, visual_pos, visual_mask, visual_gate_score):
-        # visual_context/visual_pool: [block_count, visual_seq, hidden]
+    def _compress_imgslot_visual_tokens(self, shared_a_tokens, visual_pool, visual_pos, visual_mask=None):
+        # shared_a_tokens: [block_count, k, hidden]
+        # visual_pool: [block_count, visual_seq, hidden]
         # visual_pos: [block_count, visual_seq, 3]
         # visual_mask: [block_count, visual_seq]
-        # visual_gate_score: [block_count, visual_seq]
-        imgslot_config = self._imgslot_config()
-        gate_temperature = max(float(imgslot_config["gate_temperature"]), float(self.config.img_slot_min_temperature))
-        route_temperature = max(float(imgslot_config["route_temperature"]), float(self.config.img_slot_min_temperature))
-        num_experts = int(imgslot_config["num_experts"])
-        slots_per_expert = int(imgslot_config["slots_per_expert"])
-        total_slots = int(imgslot_config["k"])
-        topk_experts = min(int(imgslot_config["topk_experts"]), num_experts)
-        topk_subslots = min(int(imgslot_config["topk_subslots"]), slots_per_expert)
-
-        gate_input = visual_context * visual_gate_score.unsqueeze(-1).to(visual_context.dtype)
-        gate_logits = self.imgslot_gate_proj(gate_input).squeeze(-1)
-        expert_logits = self.imgslot_expert_proj(visual_context)
-        subslot_logits = self.imgslot_subslot_proj(visual_context).view(*visual_context.shape[:2], num_experts, slots_per_expert)
-        combined_logits = (
-            gate_logits.unsqueeze(-1).unsqueeze(-1) / gate_temperature
-            + expert_logits.unsqueeze(-1) / route_temperature
-            + subslot_logits / route_temperature
+        block_keys = []
+        block_values = []
+        for block_idx in range(visual_pool.shape[0]):
+            key, value = self._project_imgslot_visual_pool(visual_pool[block_idx])
+            block_keys.append(key)
+            block_values.append(value)
+        key_states = torch.cat(block_keys, dim=0)
+        value_states = torch.cat(block_values, dim=0)
+        updated_a_tokens, attention_weights = self._run_imgslot_attention(
+            shared_a_tokens,
+            key_states,
+            value_states,
+            self.imgslot_img_q_proj,
+            self.imgslot_img_q_norm,
+            self.imgslot_img_o_proj,
+            mask=visual_mask,
+            key_positions=visual_pos.permute(2, 0, 1),
         )
-        if visual_mask is not None:
-            invalid_fill = torch.finfo(combined_logits.dtype).min
-            combined_logits = combined_logits.masked_fill(~visual_mask.unsqueeze(-1).unsqueeze(-1), invalid_fill)
-            expert_logits = expert_logits.masked_fill(~visual_mask.unsqueeze(-1), invalid_fill)
-            subslot_logits = subslot_logits.masked_fill(~visual_mask.unsqueeze(-1).unsqueeze(-1), invalid_fill)
-
-        expert_topk_logits, expert_topk_idx = torch.topk(expert_logits, k=topk_experts, dim=-1)
-        gathered_combined = combined_logits.gather(
-            dim=2,
-            index=expert_topk_idx.unsqueeze(-1).expand(-1, -1, -1, slots_per_expert),
-        )
-        subslot_topk_logits, subslot_topk_idx = torch.topk(gathered_combined, k=topk_subslots, dim=-1)
-
-        sparse_logits = combined_logits.new_full(combined_logits.shape, torch.finfo(combined_logits.dtype).min)
-        sparse_logits.scatter_(
-            2,
-            expert_topk_idx.unsqueeze(-1).expand(-1, -1, -1, slots_per_expert),
-            gathered_combined,
-        )
-        sparse_logits = sparse_logits.reshape(visual_context.shape[0], visual_context.shape[1], total_slots)
-
-        selected_flat_idx = (
-            expert_topk_idx.unsqueeze(-1) * slots_per_expert + subslot_topk_idx
-        ).reshape(visual_context.shape[0], visual_context.shape[1], topk_experts * topk_subslots)
-        selected_flat_logits = subslot_topk_logits.reshape(
-            visual_context.shape[0], visual_context.shape[1], topk_experts * topk_subslots
-        )
-
-        # selected_flat_idx/selected_flat_logits: [block_count, visual_seq, topk_experts * topk_subslots]
-        # dispatch_flat: [block_count, visual_seq, total_slots].
-        # Only selected token-slot pairs may participate in token-wise routing.
-        selected_mask = torch.zeros(sparse_logits.shape, dtype=torch.bool, device=sparse_logits.device)
-        selected_mask.scatter_(2, selected_flat_idx, True)
-        dispatch_flat = sparse_logits.new_full(sparse_logits.shape, torch.finfo(sparse_logits.dtype).min)
-        dispatch_flat.scatter_(2, selected_flat_idx, selected_flat_logits)
-        if visual_mask is not None:
-            selected_mask = selected_mask & visual_mask.unsqueeze(-1)
-            dispatch_flat = dispatch_flat.masked_fill(~visual_mask.unsqueeze(-1), torch.finfo(dispatch_flat.dtype).min)
-        dispatch_flat = dispatch_flat - dispatch_flat.amax(dim=1, keepdim=True)
-        dispatch_flat = torch.softmax(dispatch_flat, dim=1)
-        dispatch_flat = dispatch_flat * selected_mask.to(dispatch_flat.dtype)
-        if visual_mask is not None:
-            dispatch_flat = dispatch_flat * visual_mask.unsqueeze(-1).to(dispatch_flat.dtype)
-        dispatch_flat = dispatch_flat / dispatch_flat.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        dispatch = dispatch_flat.view(visual_context.shape[0], visual_context.shape[1], num_experts, slots_per_expert)
-
-        value_states = self.imgslot_value_proj(visual_pool)
-        slot_tokens = torch.einsum("bnes,bnh->besh", dispatch.float(), value_states.float())
-        slot_tokens = slot_tokens.reshape(visual_context.shape[0], total_slots, value_states.shape[-1])
-        slot_tokens = self.imgslot_slot_out_proj(slot_tokens.to(visual_pool.dtype))
-        slot_pos = torch.einsum("bnes,bnc->besc", dispatch.float(), visual_pos.float())
-        slot_pos = slot_pos.reshape(visual_context.shape[0], total_slots, visual_pos.shape[-1])
-
-        if visual_mask is not None:
-            valid_gate_logits = gate_logits.masked_select(visual_mask)
-            valid_tokens = visual_mask.unsqueeze(-1).to(dispatch_flat.dtype)
-        else:
-            valid_gate_logits = gate_logits.reshape(-1)
-            valid_tokens = torch.ones_like(gate_logits, dtype=dispatch_flat.dtype).unsqueeze(-1)
-        gate_logit_mean = valid_gate_logits.mean()
-        gate_logit_std = valid_gate_logits.float().std(unbiased=False).to(gate_logits.dtype)
-
-        gate_prob = torch.softmax(gate_logits.float(), dim=1)
-        if visual_mask is not None:
-            gate_prob = gate_prob * visual_mask.unsqueeze(-1).squeeze(-1).to(gate_prob.dtype) if gate_prob.ndim > 2 else gate_prob * visual_mask.to(gate_prob.dtype)
-            gate_prob = gate_prob / gate_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        gate_entropy = -(gate_prob.clamp_min(1e-6) * gate_prob.clamp_min(1e-6).log()).sum(dim=1).mean()
-
-        expert_prob = torch.softmax(expert_logits.float(), dim=-1)
-        if visual_mask is not None:
-            expert_prob = expert_prob * visual_mask.unsqueeze(-1).to(expert_prob.dtype)
-        expert_importance = expert_prob.sum(dim=1)
-        expert_importance = expert_importance / expert_importance.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        expert_assign = torch.zeros_like(expert_prob)
-        expert_assign.scatter_(2, expert_topk_idx, 1.0)
-        if visual_mask is not None:
-            expert_assign = expert_assign * visual_mask.unsqueeze(-1).to(expert_assign.dtype)
-        expert_load = expert_assign.sum(dim=1)
-        expert_load = expert_load / expert_load.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        expert_balance_loss = (expert_importance * expert_load).sum(dim=-1).mean() * num_experts
-
-        slot_prob = torch.softmax(combined_logits.reshape(visual_context.shape[0], visual_context.shape[1], total_slots).float(), dim=-1)
-        if visual_mask is not None:
-            slot_prob = slot_prob * visual_mask.unsqueeze(-1).to(slot_prob.dtype)
-        slot_importance = slot_prob.sum(dim=1)
-        slot_importance = slot_importance / slot_importance.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        slot_assign = torch.zeros_like(dispatch_flat)
-        slot_assign.scatter_(2, selected_flat_idx, 1.0)
-        if visual_mask is not None:
-            slot_assign = slot_assign * visual_mask.unsqueeze(-1).to(slot_assign.dtype)
-        slot_load = slot_assign.sum(dim=1)
-        slot_load = slot_load / slot_load.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        slot_balance_loss = (slot_importance * slot_load).sum(dim=-1).mean() * total_slots
-
-        dispatch_entropy = -(dispatch.clamp_min(1e-6) * dispatch.clamp_min(1e-6).log()).sum(dim=1).mean()
-
-        aux_loss = (
-            float(self.imgslot_gate_sparsity_coef) * gate_entropy
-            + float(self.imgslot_expert_balance_coef) * expert_balance_loss
-            + float(self.imgslot_slot_balance_coef) * slot_balance_loss
-            + float(self.imgslot_route_entropy_coef) * dispatch_entropy
-        )
-        return slot_tokens, slot_pos.to(visual_pos.dtype), {
-            "aux_loss": aux_loss,
-            "gate_logit_mean": gate_logit_mean,
-            "gate_logit_std": gate_logit_std,
-            "gate_entropy": gate_entropy,
-            "expert_balance": expert_balance_loss,
-            "slot_balance": slot_balance_loss,
-            "dispatch_entropy": dispatch_entropy,
-        }, gate_logits, dispatch_flat
+        attention_scores = attention_weights.float().mean(dim=1)
+        slot_tokens = updated_a_tokens
+        slot_pos = torch.matmul(attention_scores, visual_pos.float()).to(visual_pos.dtype)
+        attention_prob = attention_scores.clamp_min(1e-6)
+        attention_entropy = -(attention_prob * attention_prob.log()).sum(dim=-1).mean()
+        aux_stats = {
+            "attention_entropy": attention_entropy.to(slot_tokens.dtype),
+            "num_blocks": torch.tensor(float(visual_pool.shape[0]), device=visual_pool.device),
+        }
+        return slot_tokens, slot_pos, aux_stats
 
     def _merge_imgslot_aux_stats(self, aux_stats: list[dict[str, torch.Tensor]], device: torch.device) -> dict[str, torch.Tensor]:
         if not aux_stats:
             return self._empty_imgslot_aux(device)
-        merged = {}
-        for key in (
-            "aux_loss",
-            "gate_logit_mean",
-            "gate_logit_std",
-            "gate_entropy",
-            "expert_balance",
-            "slot_balance",
-            "dispatch_entropy",
-        ):
-            merged[key] = torch.stack([item[key] for item in aux_stats]).mean()
+        merged = {
+            "attention_entropy": torch.stack([item["attention_entropy"] for item in aux_stats]).mean(),
+        }
         block_counts = [item.get("num_blocks") for item in aux_stats]
         if all(count is not None for count in block_counts):
             merged["num_blocks"] = torch.stack([count.to(device) for count in block_counts]).sum()
@@ -527,25 +552,41 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             visual_mask[block_idx, :visual_len] = True
         return visual_keys_padded, visual_values_padded, visual_mask
 
-    def _build_imgslot_visual_positions(self, visual_grids, visual_spans, device, dtype):
+    def _build_imgslot_visual_positions(self, visual_grids, visual_spans, device, dtype, visual_lengths=None):
         spatial_merge_size = int(self.config.vision_config.spatial_merge_size)
         visual_positions = []
-        for grid, (span_start, _span_length) in zip(visual_grids, visual_spans):
+        for grid_idx, (grid, (span_start, _span_length)) in enumerate(zip(visual_grids, visual_spans)):
+            grid = grid.detach().reshape(-1).to(device="cpu", dtype=torch.long)
+            use_linear_fallback = grid.numel() != 3 or torch.any(grid <= 0)
+            expected_len = None
+            if not use_linear_fallback:
+                expected_len = int(grid.prod().item() // (spatial_merge_size**2))
+                use_linear_fallback = expected_len <= 0 or expected_len > 1_000_000
+            if use_linear_fallback:
+                if visual_lengths is None:
+                    raise ValueError(f"Invalid ImgSlot visual grid: {grid.tolist()}.")
+                visual_len = int(visual_lengths[grid_idx])
+                linear_pos = torch.arange(int(span_start), int(span_start) + visual_len, device=device)
+                positions = torch.stack(
+                    [
+                        torch.full_like(linear_pos, int(span_start)),
+                        torch.full_like(linear_pos, int(span_start)),
+                        linear_pos,
+                    ],
+                    dim=1,
+                )
+                visual_positions.append(positions.to(device=device, dtype=dtype))
+                continue
             # positions: [3, visual_seq] -> [visual_seq, 3]
             positions = self.model.get_vision_position_ids(
                 int(span_start),
-                grid,
+                grid.to(device=device),
                 1,
                 spatial_merge_size,
                 device=device,
             ).transpose(0, 1)
             visual_positions.append(positions.to(device=device, dtype=dtype))
         return visual_positions
-
-    def _build_imgslot_anchor_positions(self, num_anchors: int, current_last_t: int | float, device, dtype):
-        anchor_t = torch.arange(num_anchors, device=device, dtype=dtype) + float(current_last_t) + 1.0
-        # Text-like anchor coordinates: temporal/height/width share the same deterministic sequence.
-        return torch.stack([anchor_t, anchor_t, anchor_t], dim=-1)
 
     def _build_imgslot_prefill_position_ids(self, input_ids, attention_mask, device, dtype):
         batch_size, seq_len = input_ids.shape
@@ -556,29 +597,20 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             text_pos = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1)
         return text_pos.unsqueeze(0).expand(4, -1, -1).clone()
 
-    def _split_imgslot_sample_spans(self, spans: list[tuple[int, int]]) -> tuple[tuple[int, int], list[tuple[int, int]]]:
-        imgslot_config = self._imgslot_config()
-        num_anchors = int(imgslot_config["m"])
-        topk_target = int(imgslot_config["k"])
+    def _split_imgslot_sample_spans(self, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        topk_target = int(self._imgslot_config()["k"])
         if not spans:
-            raise ValueError("ImgSlot sample must contain one anchor span and at least one visual span.")
-        anchor_span = spans[0]
-        if anchor_span[1] != num_anchors:
-            raise ValueError(f"ImgSlot anchor span length {anchor_span[1]} must equal m ({num_anchors}).")
-        visual_spans = spans[1:]
-        if not visual_spans:
             raise ValueError("ImgSlot sample must contain at least one visual span.")
-        for _, span_length in visual_spans:
+        for _, span_length in spans:
             if span_length != topk_target:
                 raise ValueError(f"ImgSlot visual span length {span_length} must equal k ({topk_target}).")
-        return anchor_span, visual_spans
+        return spans
 
     def _build_imgslot_states_for_sample(
         self,
         visual_pools,
         visual_grids,
         text_tokens,
-        anchor_span,
         visual_spans,
         text_key=None,
         text_value=None,
@@ -592,63 +624,49 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             raise ValueError("ImgSlot sample must contain at least one visual pool.")
 
         imgslot_config = self._imgslot_config()
-        num_anchors = int(imgslot_config["m"])
         slot_target = int(imgslot_config["k"])
-        anchor_span_start, anchor_span_length = anchor_span
-        if anchor_span_length != num_anchors:
-            raise ValueError(f"ImgSlot anchor span length {anchor_span_length} must equal m ({num_anchors}).")
         visual_device = visual_pools[0].device
         visual_dtype = visual_pools[0].dtype
-        block_count = len(visual_pools)
-        # Each visual_pool: [visual_seq_i, hidden]
         visual_lengths = [visual_pool.shape[0] for visual_pool in visual_pools]
         visual_tokens_global = torch.cat([visual_pool.to(device=visual_device, dtype=visual_dtype) for visual_pool in visual_pools], dim=0).unsqueeze(0)
-        visual_positions = self._build_imgslot_visual_positions(visual_grids, visual_spans, visual_device, torch.float32)
+        visual_positions = self._build_imgslot_visual_positions(visual_grids, visual_spans, visual_device, torch.float32, visual_lengths)
         visual_positions_global = torch.cat(visual_positions, dim=0).unsqueeze(0)
         visual_key_global, visual_value_global = self._project_imgslot_visual_pool(visual_tokens_global[0])
         visual_mask_global = torch.ones((1, visual_tokens_global.shape[1]), dtype=torch.bool, device=visual_device)
 
-        # anchor_seed: [m, hidden] -> unsqueeze -> [1, m, hidden]
-        anchor_seed = self.imgslot_a_tokens.weight[:num_anchors].to(device=visual_device, dtype=visual_dtype)
+        shared_a_seed = self.imgslot_a_tokens.weight[:slot_target].to(device=visual_device, dtype=visual_dtype)
         if text_tokens.numel() == 0:
-            anchor_text = anchor_seed.unsqueeze(0)
+            shared_a_text = shared_a_seed.unsqueeze(0)
         else:
             if text_key is None or text_value is None:
                 text_key, text_value = self._project_imgslot_text_tokens(text_tokens.to(visual_dtype))
             text_key = text_key.to(device=visual_device, dtype=visual_dtype)
             text_value = text_value.to(device=visual_device, dtype=visual_dtype)
-            # anchor_text: [1, m, hidden]
-            anchor_text = self._run_imgslot_text_blocks(anchor_seed.unsqueeze(0), text_key, text_value)
-        anchor_positions = self._build_imgslot_anchor_positions(num_anchors, current_last_t, visual_device, torch.float32)
-        # shared_anchor_tokens: [1, m, hidden]
-        # visual_contexts: list[[1, visual_seq_i, hidden]]
-        shared_anchor_tokens, visual_contexts, visual_gate_scores, _anchor_attn = self._run_imgslot_visual_blocks(
-            anchor_text,
+            shared_a_text = self._run_imgslot_text_blocks(shared_a_seed.unsqueeze(0), text_key, text_value)
+        shared_a_tokens, _visual_contexts, _visual_scores, _anchor_attn = self._run_imgslot_visual_blocks(
+            shared_a_text,
             visual_key_global.to(device=visual_device, dtype=visual_dtype),
             visual_value_global.to(device=visual_device, dtype=visual_dtype),
             visual_tokens_global,
             visual_lengths,
             visual_mask=visual_mask_global,
-            anchor_positions=anchor_positions.transpose(0, 1).unsqueeze(1),
             visual_positions=visual_positions_global.permute(2, 0, 1),
         )
-        shared_anchor_tokens_single = shared_anchor_tokens[0]
+        shared_a_tokens_single = shared_a_tokens[0]
 
         visual_replacements = []
         visual_slot_positions = []
         states = []
         aux_stats = []
-        for block_idx, ((span_start, span_length), visual_pool, visual_pos) in enumerate(zip(visual_spans, visual_pools, visual_positions)):
+        for (span_start, span_length), visual_pool, visual_pos in zip(visual_spans, visual_pools, visual_positions):
             if span_length != slot_target:
                 raise ValueError(f"ImgSlot visual span length {span_length} must equal k ({slot_target}).")
             block_mask = torch.ones((1, visual_pool.shape[0]), dtype=torch.bool, device=visual_device)
-            block_context = visual_contexts[block_idx]
-            compressed_slots, slot_pos, block_aux, gate_logits, dispatch = self._compress_imgslot_visual_tokens(
-                block_context,
+            compressed_slots, slot_pos, block_aux = self._compress_imgslot_visual_tokens(
+                shared_a_tokens_single.unsqueeze(0),
                 visual_pool.unsqueeze(0),
                 visual_pos.unsqueeze(0),
                 block_mask,
-                visual_gate_scores[block_idx],
             )
             compressed_slots = compressed_slots[0]
             slot_pos = slot_pos[0]
@@ -657,42 +675,33 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             aux_stats.append(block_aux)
             states.append(
                 {
-                    "anchor_span": (int(anchor_span_start), int(anchor_span_length)),
                     "span": (int(span_start), int(span_length)),
-                    "A": shared_anchor_tokens_single.detach(),  # [m, hidden]
-                    "anchor_pos": anchor_positions.detach(),  # [m, 3]
-                    "V": visual_pool.detach(),  # [visual_seq_i, hidden]
-                    "visual_pos": visual_pos.detach(),  # [visual_seq_i, 3]
-                    "compressed_slots": compressed_slots.detach(),  # [k, hidden]
-                    "slot_pos": slot_pos.detach(),  # [k, 3]
-                    "gate_logits": gate_logits[0].detach(),
-                    "dispatch": dispatch[0].detach(),
+                    "A": shared_a_tokens_single.detach(),
+                    "V": visual_pool.detach(),
+                    "visual_pos": visual_pos.detach(),
+                    "compressed_slots": compressed_slots.detach(),
+                    "slot_pos": slot_pos.detach(),
                 }
             )
-        return shared_anchor_tokens_single, anchor_positions, visual_replacements, visual_slot_positions, states, self._merge_imgslot_aux_stats(aux_stats, visual_device)
+        return visual_replacements, visual_slot_positions, states, self._merge_imgslot_aux_stats(aux_stats, visual_device)
 
     def _refresh_imgslot_states_for_sample(self, states: list[dict[str, Any]], text_key, text_value, current_last_t: int | float):
         if not states:
-            return None, [], None
+            return [], None
 
         imgslot_config = self._imgslot_config()
         visual_dtype = states[0]["V"].dtype
         visual_device = states[0]["V"].device
         slot_target = int(imgslot_config["k"])
-        num_anchors = int(imgslot_config["m"])
 
-        # anchors_prev: [1, m, hidden]
-        anchors_prev = states[0]["A"].to(device=visual_device, dtype=visual_dtype).unsqueeze(0)
+        shared_a_prev = states[0]["A"].to(device=visual_device, dtype=visual_dtype).unsqueeze(0)
         if text_key is None or text_value is None or text_key.shape[-2] == 0:
-            anchors_text = anchors_prev
+            shared_a_text = shared_a_prev
         else:
             text_key = text_key.to(device=visual_device, dtype=visual_dtype)
             text_value = text_value.to(device=visual_device, dtype=visual_dtype)
-            # anchors_text: [1, m, hidden]
-            anchors_text = self._run_imgslot_text_blocks(anchors_prev, text_key, text_value)
-            # Exponential-style smoothing between previous anchor state and the
-            # latest text-conditioned anchor update.
-            anchors_text = (1.0 - imgslot_config["beta"]) * anchors_prev + imgslot_config["beta"] * anchors_text
+            shared_a_text = self._run_imgslot_text_blocks(shared_a_prev, text_key, text_value)
+            shared_a_text = (1.0 - imgslot_config["beta"]) * shared_a_prev + imgslot_config["beta"] * shared_a_text
 
         visual_pools = [state["V"].to(device=visual_device, dtype=visual_dtype) for state in states]
         visual_lengths = [visual_pool.shape[0] for visual_pool in visual_pools]
@@ -701,52 +710,36 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         visual_positions_global = torch.cat(visual_positions, dim=0).unsqueeze(0)
         visual_key_global, visual_value_global = self._project_imgslot_visual_pool(visual_tokens_global[0])
         visual_mask_global = torch.ones((1, visual_tokens_global.shape[1]), dtype=torch.bool, device=visual_device)
-        anchor_positions = self._build_imgslot_anchor_positions(num_anchors, current_last_t, visual_device, torch.float32)
-        # anchors_new: [1, m, hidden]
-        # visual_contexts: list[[1, visual_seq_i, hidden]]
-        anchors_new, visual_contexts, visual_gate_scores, _anchor_attn = self._run_imgslot_visual_blocks(
-            anchors_text,
+        shared_a_new, _visual_contexts, _visual_scores, _anchor_attn = self._run_imgslot_visual_blocks(
+            shared_a_text,
             visual_key_global.to(device=visual_device, dtype=visual_dtype),
             visual_value_global.to(device=visual_device, dtype=visual_dtype),
             visual_tokens_global,
             visual_lengths,
             visual_mask=visual_mask_global,
-            anchor_positions=anchor_positions.transpose(0, 1).unsqueeze(1),
             visual_positions=visual_positions_global.permute(2, 0, 1),
         )
-        shared_anchor_tokens = anchors_new[0]
+        shared_a_tokens = shared_a_new[0]
 
-        anchor_start, anchor_length = states[0]["anchor_span"]
-        anchor_record = {
-            "span_start": anchor_start,
-            "span_length": anchor_length,
-            "slot_tokens": shared_anchor_tokens[:anchor_length],
-            "slot_positions": anchor_positions[:anchor_length],
-        }
         visual_records = []
         aux_stats = []
         for state_idx, state in enumerate(states):
             visual_pool = visual_pools[state_idx]
             visual_pos = visual_positions[state_idx]
             block_mask = torch.ones((1, visual_pool.shape[0]), dtype=torch.bool, device=visual_device)
-            block_context = visual_contexts[state_idx]
-            compressed_slots, slot_pos, block_aux, gate_logits, dispatch = self._compress_imgslot_visual_tokens(
-                block_context,
+            compressed_slots, slot_pos, block_aux = self._compress_imgslot_visual_tokens(
+                shared_a_tokens.unsqueeze(0),
                 visual_pool.unsqueeze(0),
                 visual_pos.unsqueeze(0),
                 block_mask,
-                visual_gate_scores[state_idx],
             )
             compressed_slots = compressed_slots[0]
             slot_pos = slot_pos[0]
             prev_slots = state["compressed_slots"].to(device=visual_device, dtype=visual_dtype)
             compressed_slots = imgslot_config["lam"] * prev_slots + (1.0 - imgslot_config["lam"]) * compressed_slots
-            state["A"] = shared_anchor_tokens.detach()
-            state["anchor_pos"] = anchor_positions.detach()
+            state["A"] = shared_a_tokens.detach()
             state["compressed_slots"] = compressed_slots.detach()
             state["slot_pos"] = slot_pos.detach()
-            state["gate_logits"] = gate_logits[0].detach()
-            state["dispatch"] = dispatch[0].detach()
             states[state_idx] = state
             span_start, span_length = state["span"]
             if span_length != slot_target:
@@ -760,7 +753,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 }
             )
             aux_stats.append(block_aux)
-        return anchor_record, visual_records, self._merge_imgslot_aux_stats(aux_stats, visual_device)
+        return visual_records, self._merge_imgslot_aux_stats(aux_stats, visual_device)
 
     def _image_placeholder_spans(self, input_ids: torch.Tensor) -> list[list[tuple[int, int]]]:
         image_token_id = self.config.image_token_id
@@ -786,9 +779,24 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         return list(image_outputs.pooler_output)
 
     def _prebuild_imgslot_inputs(self, input_ids, attention_mask, inputs_embeds, visual_pools, image_grid_thw, labels=None):
+        embed_device = inputs_embeds.device
+        # With device_map="auto", token tensors can stay on cuda:0 while the
+        # embedding shard that produced inputs_embeds lives on another GPU.
+        # All masks used to index inputs_embeds must follow inputs_embeds.
+        input_ids = input_ids.to(device=embed_device)
+        if attention_mask is None:
+            attention_mask = input_ids.new_ones(input_ids.shape)
+        else:
+            attention_mask = attention_mask.to(device=embed_device)
+        if labels is not None:
+            labels = labels.to(device=embed_device)
         spans_by_sample = self._image_placeholder_spans(input_ids)
-        if sum(max(0, len(spans) - 1) for spans in spans_by_sample) != len(visual_pools):
-            raise ValueError("ImgSlot visual block count must match placeholder visual span count.")
+        if sum(len(spans) for spans in spans_by_sample) != len(visual_pools):
+            span_counts = [len(spans) for spans in spans_by_sample]
+            raise ValueError(
+                f"ImgSlot visual block count must match placeholder visual span count: "
+                f"visual_blocks={len(visual_pools)}, span_counts={span_counts}."
+            )
         if image_grid_thw is None or image_grid_thw.shape[0] != len(visual_pools):
             raise ValueError("ImgSlot image_grid_thw row count must match visual pool count.")
         batch_states: list[list[dict[str, Any]]] = []
@@ -799,11 +807,9 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         position_ids = self._build_imgslot_prefill_position_ids(
             input_ids,
             attention_mask,
-            inputs_embeds.device,
+            embed_device,
             torch.float32,
         )
-        if attention_mask is None:
-            attention_mask = input_ids.new_ones(input_ids.shape)
         imgslot_config = self._imgslot_config()
         max_text_tokens = int(imgslot_config["max_text_tokens"])
         runtime_text_keys: list[torch.Tensor] = []
@@ -814,7 +820,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 runtime_text_keys.append(inputs_embeds.new_zeros((1, self.imgslot_num_heads, 0, self.imgslot_head_dim)).detach())
                 runtime_text_values.append(inputs_embeds.new_zeros((1, self.imgslot_num_heads, 0, self.imgslot_head_dim)).detach())
                 continue
-            anchor_span, visual_spans = self._split_imgslot_sample_spans(spans)
+            visual_spans = self._split_imgslot_sample_spans(spans)
             # valid_text_mask: [seq]
             # text_tokens: [text_seq, hidden], with image placeholders removed and
             # supervision targets excluded so ImgSlot does not condition on future
@@ -833,21 +839,15 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 sample_visual_grids.append(image_grid_thw[pool_index].to(device=inputs_embeds.device))
                 pool_index += 1
             current_last_t = float(position_ids[1:, batch_idx, attention_mask[batch_idx].bool()].max().item())
-            anchor_replacement, anchor_positions, visual_replacements, visual_slot_positions, sample_states, sample_aux = self._build_imgslot_states_for_sample(
+            visual_replacements, visual_slot_positions, sample_states, sample_aux = self._build_imgslot_states_for_sample(
                 sample_visual_pools,
                 sample_visual_grids,
                 text_tokens,
-                anchor_span,
                 visual_spans,
                 text_key=text_key,
                 text_value=text_value,
                 current_last_t=current_last_t,
             )
-            # Write one shared anchor block back into the first placeholder span.
-            anchor_start, anchor_length = anchor_span
-            new_inputs_embeds[batch_idx, anchor_start : anchor_start + anchor_length] = anchor_replacement.to(inputs_embeds.dtype)
-            position_ids[1:, batch_idx, anchor_start : anchor_start + anchor_length] = anchor_positions[:anchor_length].transpose(0, 1).to(position_ids.dtype)
-            # Write one compressed visual block back into each remaining placeholder span.
             for replacement, slot_positions, (span_start, span_length) in zip(visual_replacements, visual_slot_positions, visual_spans):
                 new_inputs_embeds[batch_idx, span_start : span_start + span_length] = replacement.to(inputs_embeds.dtype)
                 position_ids[1:, batch_idx, span_start : span_start + span_length] = slot_positions[:span_length].transpose(0, 1).to(position_ids.dtype)
@@ -930,23 +930,18 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     def _collect_imgslot_refresh_records(self, runtime, current_last_t: int | float):
         text_keys_by_batch = runtime["text_keys"]
         text_values_by_batch = runtime["text_values"]
-        anchor_records = []
         visual_records = []
         aux_stats = []
         aux_device = None
         for batch_idx, states in enumerate(runtime["states"]):
             if batch_idx >= len(text_keys_by_batch) or batch_idx >= len(text_values_by_batch):
                 continue
-            anchor_record, sample_visual_records, sample_aux = self._refresh_imgslot_states_for_sample(
+            sample_visual_records, sample_aux = self._refresh_imgslot_states_for_sample(
                 states,
                 text_keys_by_batch[batch_idx],
                 text_values_by_batch[batch_idx],
                 current_last_t,
             )
-            if anchor_record is not None:
-                anchor_record["batch_idx"] = batch_idx
-                anchor_records.append(anchor_record)
-                aux_device = anchor_record["slot_tokens"].device
             for record in sample_visual_records:
                 record["batch_idx"] = batch_idx
                 visual_records.append(record)
@@ -955,7 +950,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 aux_stats.append(sample_aux)
         if aux_device is not None:
             self._store_imgslot_aux(self._merge_imgslot_aux_stats(aux_stats, aux_device), aux_device)
-        return anchor_records, visual_records
+        return visual_records
 
     def _maybe_refresh_imgslot_cache(self, past_key_values):
         runtime = self._imgslot_runtime
@@ -967,8 +962,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         layers = self.model.language_model.layers
         layer_types = self.config.text_config.layer_types
         current_last_t = max(0, past_key_values.get_seq_length() - 1)
-        anchor_records, visual_records = self._collect_imgslot_refresh_records(runtime, current_last_t)
-        if not anchor_records and not visual_records:
+        visual_records = self._collect_imgslot_refresh_records(runtime, current_last_t)
+        if not visual_records:
             return past_key_values
 
         # Only overwrite layers that use native full attention. Non-full-attention
@@ -976,7 +971,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         for layer_idx, layer in enumerate(layers):
             if layer_idx < len(layer_types) and layer_types[layer_idx] != "full_attention":
                 continue
-            self._write_imgslot_records_for_layer(past_key_values, layer_idx, layer, anchor_records)
             self._write_imgslot_records_for_layer(past_key_values, layer_idx, layer, visual_records)
         return past_key_values
 
@@ -1035,10 +1029,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
+        image_block_counts: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5CausalLMOutputWithPast:
-        kwargs.pop("image_block_counts", None)
         pre_refresh_past_key_values = past_key_values
         imgslot_first_prefill = bool(kwargs.pop("imgslot_first_prefill", False))
         has_imgslot_prefill = self._imgslot_is_enabled() and (imgslot_first_prefill or past_key_values is None) and input_ids is not None and pixel_values is not None
@@ -1098,9 +1092,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            lm_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
-            aux_loss = self._imgslot_aux["aux_loss"].to(lm_loss.device) * float(self.imgslot_aux_loss_coef)
-            loss = lm_loss + aux_loss
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 
         return Qwen3_5CausalLMOutputWithPast(
             loss=loss,
@@ -1123,12 +1115,11 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         pixel_values_videos=None,
         image_grid_thw=None,
         video_grid_thw=None,
+        mm_token_type_ids=None,
         image_block_counts=None,
         is_first_iteration=False,
         **kwargs,
     ):
-        mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
-        image_block_counts = kwargs.pop("image_block_counts", None)
         # Packed ImgSlot image tensors are not batch-major, so avoid the generic
         # tensor repeat_interleave path during beam expansion. Keep them only for
         # the first multimodal prefill and let forward() consume them once.
@@ -1144,11 +1135,13 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             video_grid_thw=video_grid_thw,
             use_cache=use_cache,
             is_first_iteration=is_first_iteration,
-            mm_token_type_ids=None if is_first_iteration and pixel_values is not None else mm_token_type_ids,
-            image_block_counts=None if is_first_iteration and image_block_counts is not None else image_block_counts,
             **kwargs,
         )
         if self._imgslot_is_enabled() and is_first_iteration and pixel_values is not None:
+            # ImgSlot prefill must see the full prompt because image placeholders
+            # are rewritten in-place before normal decoding starts.
+            model_inputs["input_ids"] = input_ids
+            model_inputs["attention_mask"] = attention_mask
             model_inputs["pixel_values"] = pixel_values
             model_inputs["image_grid_thw"] = image_grid_thw
             model_inputs["image_block_counts"] = image_block_counts

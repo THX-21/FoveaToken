@@ -20,11 +20,6 @@ class ModelArguments:
     lora_dropout: float = field(default=0.05)
     unfreeze_vision: bool = field(default=True)
     img_slot_enable: bool = field(default=True)
-    img_slot_aux_loss_coef: float = field(default=0.01)
-    img_slot_gate_sparsity_coef: float = field(default=1.0)
-    img_slot_expert_balance_coef: float = field(default=1.0)
-    img_slot_slot_balance_coef: float = field(default=1.0)
-    img_slot_route_entropy_coef: float = field(default=0.1)
 
 
 @dataclass
@@ -90,19 +85,18 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         "imgslot_text_k_proj",
         "imgslot_text_v_proj",
         "imgslot_text_o_proj",
+        "imgslot_text_q_norm",
+        "imgslot_text_k_norm",
         "imgslot_img_q_proj",
         "imgslot_img_k_proj",
         "imgslot_img_v_proj",
         "imgslot_img_o_proj",
+        "imgslot_img_q_norm",
+        "imgslot_img_k_norm",
         "imgslot_attn_norm",
         "imgslot_ffn",
         "imgslot_ffn_norm",
         "imgslot_visual_norm",
-        "imgslot_gate_proj",
-        "imgslot_expert_proj",
-        "imgslot_subslot_proj",
-        "imgslot_value_proj",
-        "imgslot_slot_out_proj",
     ]
     target_modules = [
         "q_proj",
@@ -295,13 +289,7 @@ class ImgSlotMetricsCallback(transformers.TrainerCallback):
         if not isinstance(aux, dict):
             return control
         for key in (
-            "aux_loss",
-            "gate_logit_mean",
-            "gate_logit_std",
-            "gate_entropy",
-            "expert_balance",
-            "slot_balance",
-            "dispatch_entropy",
+            "attention_entropy",
             "num_blocks",
         ):
             value = aux.get(key)
@@ -342,11 +330,6 @@ def main() -> None:
 
     if model_args.img_slot_enable and model.config.img_slot_tile_size is None:
         raise ValueError("ImgSlot config requires img_slot_tile_size when enabled.")
-    model.imgslot_aux_loss_coef = model_args.img_slot_aux_loss_coef
-    model.imgslot_gate_sparsity_coef = model_args.img_slot_gate_sparsity_coef
-    model.imgslot_expert_balance_coef = model_args.img_slot_expert_balance_coef
-    model.imgslot_slot_balance_coef = model_args.img_slot_slot_balance_coef
-    model.imgslot_route_entropy_coef = model_args.img_slot_route_entropy_coef
     model.config.use_cache = False
     if training_args.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
@@ -364,7 +347,6 @@ def main() -> None:
         vision_config=model.config.vision_config,
         max_image_tokens=data_args.max_image_tokens,
         img_slot_enable=model_args.img_slot_enable,
-        img_slot_m=model.config.img_slot_m,
         img_slot_k=model.config.img_slot_k,
         img_slot_tile_size=model.config.img_slot_tile_size,
     )

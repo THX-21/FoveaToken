@@ -56,12 +56,12 @@ class FoveaProcessor(ProcessorMixin):
 
     def __init__(self, image_processor=None, tokenizer=None, video_processor=None, chat_template=None):
         super().__init__(image_processor, tokenizer, video_processor, chat_template=chat_template)
-        self.image_token = getattr(tokenizer, "image_token", "<|image_pad|>")
-        self.video_token = getattr(tokenizer, "video_token", "<|video_pad|>")
+        self.image_token = getattr(tokenizer, "image_token", None) or "<|image_pad|>"
+        self.video_token = getattr(tokenizer, "video_token", None) or "<|video_pad|>"
         self.image_token_id = getattr(tokenizer, "image_token_id", tokenizer.convert_tokens_to_ids(self.image_token))
         self.video_token_id = getattr(tokenizer, "video_token_id", tokenizer.convert_tokens_to_ids(self.video_token))
-        self.vision_start_token = getattr(tokenizer, "vision_start_token", "<|vision_start|>")
-        self.vision_end_token = getattr(tokenizer, "vision_end_token", "<|vision_end|>")
+        self.vision_start_token = getattr(tokenizer, "vision_start_token", None) or "<|vision_start|>"
+        self.vision_end_token = getattr(tokenizer, "vision_end_token", None) or "<|vision_end|>"
         self.vision_start_token_id = getattr(tokenizer, "vision_start_token_id", tokenizer.convert_tokens_to_ids(self.vision_start_token))
         self.vision_end_token_id = getattr(tokenizer, "vision_end_token_id", tokenizer.convert_tokens_to_ids(self.vision_end_token))
 
@@ -88,9 +88,8 @@ class FoveaProcessor(ProcessorMixin):
             vision_end_token=self.vision_end_token,
         )
 
-    def expand_image_pad_tokens(self, text: list[str], image_grid_thw) -> list[str]:
+    def expand_image_pad_tokens(self, text: list[str], image_grid_thw, image_block_counts=None) -> list[str]:
         image_token_counts = self.image_token_counts_from_grids(image_grid_thw)
-        image_block_counts = getattr(self.image_processor, "_last_image_block_counts", None)
         index = 0
         image_index = 0
         output = text.copy()
@@ -112,12 +111,8 @@ class FoveaProcessor(ProcessorMixin):
             return block_counts
 
         for i in range(len(output)):
-            anchor_count = getattr(self.image_processor, "img_slot_anchor_count", None)
-            anchor_placeholder = self.image_token * int(anchor_count) if anchor_count is not None else ""
-            has_image_placeholder = False
             full_placeholder = f"{self.vision_start_token}{self.image_token}{self.vision_end_token}"
             while full_placeholder in output[i]:
-                has_image_placeholder = True
                 block_counts = take_block_counts()
                 replacement = "".join(
                     build_visual_placeholder(
@@ -130,7 +125,6 @@ class FoveaProcessor(ProcessorMixin):
                 )
                 output[i] = output[i].replace(full_placeholder, replacement, 1)
             while self.image_token in output[i]:
-                has_image_placeholder = True
                 block_counts = take_block_counts()
                 if len(block_counts) == 1:
                     replacement = "<|placeholder|>" * block_counts[0]
@@ -146,8 +140,6 @@ class FoveaProcessor(ProcessorMixin):
                     )
                 output[i] = output[i].replace(self.image_token, replacement, 1)
             output[i] = output[i].replace("<|placeholder|>", self.image_token)
-            if anchor_placeholder and has_image_placeholder:
-                output[i] = anchor_placeholder + output[i]
         if index != len(image_token_counts):
             raise ValueError("image_grid_thw contains more images than text placeholders.")
         return output
@@ -219,7 +211,7 @@ class FoveaProcessor(ProcessorMixin):
             videos_inputs = self.video_processor(videos=videos, **kwargs)
 
         if image_grid_thw is not None:
-            text = self.expand_image_pad_tokens(text, image_grid_thw)
+            text = self.expand_image_pad_tokens(text, image_grid_thw, flat_image_block_counts)
 
         text_inputs = self.tokenizer(text, return_tensors=return_tensors, **kwargs)
 

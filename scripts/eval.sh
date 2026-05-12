@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -7,18 +6,35 @@ export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 export HF_HUB_OFFLINE=1
 
 BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen3.5-9B}"
-LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-ft3-imgslot/checkpoint-10015}"
+LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-ft3-imgslot/checkpoint-15600}"
 TASKS="${EVAL_TASKS:-xlrs-lite}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
-LOG_SUFFIX="${EVAL_LOG_SUFFIX:-fovea_xlrs_lite_ckpt10015}"
+ATTN_IMPLEMENTATION="${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
+DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:0}"
+DEVICE="${EVAL_DEVICE:-${DEVICE_MAP}}"
+BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
+LOG_SUFFIX="${EVAL_LOG_SUFFIX:-$(basename "${LORA_CHECKPOINT}")}"
+if command -v accelerate >/dev/null 2>&1; then
+  ACCELERATE_BIN="accelerate"
+elif [[ -x "${PROJECT_ROOT}/.venv/bin/accelerate" ]]; then
+  ACCELERATE_BIN="${PROJECT_ROOT}/.venv/bin/accelerate"
+else
+  echo "[eval] accelerate not found in PATH or ${PROJECT_ROOT}/.venv/bin" >&2
+  exit 127
+fi
 
 echo "[eval] BASE_MODEL=${BASE_MODEL}"
 echo "[eval] LORA_CHECKPOINT=${LORA_CHECKPOINT}"
 echo "[eval] TASKS=${TASKS}"
 echo "[eval] OUTPUT_PATH=${OUTPUT_PATH}"
+echo "[eval] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
+echo "[eval] DEVICE=${DEVICE}"
+echo "[eval] DEVICE_MAP=${DEVICE_MAP}"
+echo "[eval] BATCH_SIZE=${BATCH_SIZE}"
 echo "[eval] LOG_SUFFIX=${LOG_SUFFIX}"
+echo "[eval] ACCELERATE_BIN=${ACCELERATE_BIN}"
 
-accelerate launch \
+"${ACCELERATE_BIN}" launch \
   --num_processes 1 \
   --num_machines 1 \
   --mixed_precision bf16 \
@@ -26,9 +42,9 @@ accelerate launch \
   --main_process_port 12345 \
   -m lmms_eval \
   --model fovea \
-  --model_args "pretrained=${BASE_MODEL},peft=${LORA_CHECKPOINT},device_map=auto,attn_implementation=sdpa,enable_thinking=False,max_image_tokens=8196" \
+  --model_args "pretrained=${BASE_MODEL},peft=${LORA_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=False,max_image_tokens=8196" \
   --tasks "${TASKS}" \
-  --batch_size 4 \
+  --batch_size "${BATCH_SIZE}" \
   --log_samples \
   --log_samples_suffix "${LOG_SUFFIX}" \
   --output_path "${OUTPUT_PATH}"

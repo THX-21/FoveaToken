@@ -1,5 +1,4 @@
 import re
-from collections import defaultdict
 from contextlib import contextmanager
 
 import datasets
@@ -7,8 +6,6 @@ from loguru import logger as eval_logger
 from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = 10_0000_0000
-
-XLRS_MAX_SAMPLES_PER_CATEGORY = 60
 
 TASK_PAIRs = [
     "Complex reasoning/Anomaly Detection and Interpretation",
@@ -32,17 +29,7 @@ def xlrs_doc_to_visual(doc):
 
 
 def xlrs_process_docs(dataset: datasets.Dataset) -> datasets.Dataset:
-    """Keep at most a fixed number of docs for each XLRS category."""
-    category_to_indices = defaultdict(list)
-    for index, category in enumerate(dataset["category"]):
-        if len(category_to_indices[category]) < XLRS_MAX_SAMPLES_PER_CATEGORY:
-            category_to_indices[category].append(index)
-
-    selected_indices = []
-    for category in TASK_PAIRs:
-        selected_indices.extend(category_to_indices.get(category, []))
-
-    return dataset.select(selected_indices)
+    return dataset
 
 
 def xlrs_doc_to_text(doc, lmms_eval_specific_kwargs=None):
