@@ -74,3 +74,4 @@ lmms-eval/
 - 修改脚本环境变量、默认入口或使用方式时，必须同步更新 `AGENTS.md` 和 `README.md`。
 - 当前默认 attention 后端是 `sdpa`；如需切换 `flash_attention_2`，需按当前环境重新验证稳定性。
 - 涉及 reshape、permute、split、cat、mask、KV cache 写入的改动，优先保证形状语义清晰、易核对。
+- 禁止打补丁式修改，必要时重构相关部分代码。
