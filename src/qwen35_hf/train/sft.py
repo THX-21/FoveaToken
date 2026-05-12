@@ -304,26 +304,12 @@ class ImgSlotMetricsCallback(transformers.TrainerCallback):
     def on_log(self, _args, state, control, model=None, logs=None, **_kwargs):
         if model is None or logs is None or not hasattr(model, "_imgslot_aux"):
             return control
-        aux = getattr(model, "_imgslot_aux", None)
-        if not isinstance(aux, dict):
-            return control
-        for key in (
-            "aux_loss",
-            "gate_logit_mean",
-            "gate_logit_std",
-            "expert_balance",
-            "slot_balance",
-            "dispatch_entropy",
-            "num_blocks",
-        ):
-            value = aux.get(key)
-            if value is None:
-                continue
-            if hasattr(value, "detach"):
-                value = value.detach()
-            if hasattr(value, "item"):
-                value = value.item()
-            logs[f"imgslot/{key}"] = value
+        value = getattr(model, "_imgslot_aux")
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "item"):
+            value = value.item()
+        logs["imgslot/aux_loss"] = value
         return control
 
 

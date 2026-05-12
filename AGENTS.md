@@ -179,7 +179,7 @@ FoveaForConditionalGeneration
 
 `Qwen3_5Model` 负责普通多模态路径：视觉 tower 输出 features，按 placeholder mask 写回 `inputs_embeds`，再构造 MRoPE position ids 并调用 `Qwen3_5TextModel`。如果普通多模态路径收到 `image_grid_thw` / `video_grid_thw`，必须有 `mm_token_type_ids`，否则会报错。
 
-`FoveaForConditionalGeneration` 在 ImgSlot 启用时绕过普通视觉 scatter：先计算 `visual_pools`，再把文本中的 image placeholder spans 改写为 anchor tokens 和压缩后的 visual slots，并构造 ImgSlot 专用连续 MRoPE `position_ids`，随后把 `pixel_values` / `image_grid_thw` / `mm_token_type_ids` 清空并继续走 text decoder。
+`FoveaForConditionalGeneration` 在 ImgSlot 启用时绕过普通视觉 scatter：先计算 `visual_pools`，再把文本中的 image placeholder spans 改写为 anchor tokens 和压缩后的 visual slots，并用全局视觉几何坐标构造 ImgSlot 专用 MRoPE `position_ids`，随后把 `pixel_values` / `image_grid_thw` / `mm_token_type_ids` 清空并继续走 text decoder。
 
 ---
 
@@ -201,10 +201,13 @@ FoveaForConditionalGeneration
 数据侧 placeholder 约定：
 
 - `VisionPacker.pack()` 先对整图应用 `max_image_tokens` 预算，再用 `split_image_into_blocks()` 按 `ceil(width / tile_size)` 和 `ceil(height / tile_size)` 均匀切块。
-- 每个 block 走 normal 本地 patch packing，产生一行 `image_grid_thw`；多 block 图像返回 2D grid。
+- 每个 block 走 normal 本地 patch packing，产生一行 `image_grid_thw`；ImgSlot 路径同时产生一行 `image_block_offsets=[t_global,h_offset,w_offset]`，offset 单位是 spatial-merge 后的 LLM 视觉网格。
 - `encode_chatml_example()` 在含图样本前插入一个长度为 `m` 的 anchor span。
 - 每个 block 的文本侧视觉 span 长度固定为 `k`，不是 `m + k`；整张图的文本侧开销是 `m + num_blocks * k`。
 - `image_token_counts` 的形状语义是 `list[list[int]]`：外层按原图，内层按 block。
+- 同一张原图拆出的所有 block 共享同一个 `t_global`；多图样本按原图顺序递增 `t_global`。
+- block 内视觉 token 的 `h/w` 位置必须加上它在原图中的全局 block offset，不能从每个 block 自己的 `(0,0)` 重新作为最终坐标原点。
+- `span_start` / `span_length` 只用于把 slot embedding 写回输入序列和 KV cache，不再参与 `visual_pos` / `slot_pos` 的几何位置构造。
 
 模型侧 runtime 约定：
 
@@ -213,9 +216,9 @@ FoveaForConditionalGeneration
 - 每个 visual pool 的 token 数不需要再至少等于 `img_slot_k`；Soft-MoE / expert-choice dispatch 会把变长 visual pool 聚合为固定 `k` 个 slot。
 - ImgSlot dispatch 是 token 维 softmax：每个 `(expert, subslot)` 在当前 block 的所有 visual tokens 上归一化并聚合内容，不是每个 token 在 slot 维 softmax 后分配到 slots。
 - `router_input_i = LN(visual_pool_i + token_anchor_context_i)`；不新增 `pos_proj`，位置只通过统一 MRoPE 进入 attention。
-- slot 的连续 `t/h/w` position 由 dispatch 对原始 visual token MRoPE 坐标软聚合得到；anchor position 按当前序列末尾 `t + 1 + j` 确定性递增。
+- slot 的连续 `t/h/w` position 由 dispatch 对原始 visual token 的全局 MRoPE 几何坐标软聚合得到；anchor position 按当前序列末尾 `t + 1 + j` 确定性递增。
 - prefill 期间软压缩路径不 detach `visual_pool` / `text_tokens`，梯度可以回到 vision tower、text embedding 和 LoRA 路径。
-- runtime 中缓存的 `A`、`anchor_pos`、`V`、`visual_pos`、`compressed_slots`、`slot_pos`、`gate_logits`、`dispatch` 是 detach 后的状态，只用于 generation refresh。
+- runtime 中缓存的 `A`、`V`、`visual_pos`、`compressed_slots`、`slot_pos` 是 detach 后的状态，只用于 generation refresh；其中 `visual_pos` / `slot_pos` 必须保持原图级全局视觉坐标。
 - `use_cache=True` generation 首轮通过 `imgslot_first_prefill` 标记强制进入 embedding rewrite；后续 decode 每 `img_slot_delta` 步只刷新 full-attention layers 的 KV cache。
 
 不要重新加入 legacy tuple/list cache 支持、Top-K padding、空文本 fallback 或宽松 `getattr(..., default)` 配置兜底，除非 THX 明确要求。
@@ -241,6 +244,7 @@ FoveaForConditionalGeneration
 - 先冻结全模型；`--unfreeze_vision true` 时解冻 vision tower。
 - LoRA target modules 覆盖 attention、MLP 和 linear-attention 相关投影。
 - ImgSlot 子模块不作为 LoRA target，而是放入 `modules_to_save`，并在 PEFT 包装后显式保持 trainable。
+- 训练日志只从 `_imgslot_aux` 标量发布 `imgslot/aux_loss`；不要重新保留未消费的 router 诊断字段。
 
 LoRA / checkpoint 注意点：
 
@@ -277,7 +281,7 @@ label 策略：
 - assistant role prefix 和空 thinking scaffold mask。
 - answer 内容和 `<|im_end|>` 参与监督。
 
-`DataCollatorForQwen3_5SFT` 会右 padding 文本字段，截断到 `model_max_length`，并把不同样本的 `pixel_values` / `image_grid_thw` 沿视觉 patch / grid 维拼接，不做视觉 padding。
+`DataCollatorForQwen3_5SFT` 会右 padding 文本字段，截断到 `model_max_length`，并把不同样本的 `pixel_values` / `image_grid_thw` / `image_block_offsets` 沿视觉 patch / grid / block 维拼接，不做视觉 padding。
 
 ---
 
@@ -294,6 +298,7 @@ accelerate launch -m lmms_eval --model fovea --tasks xlrs-lite
 - 加载 `FoveaForConditionalGeneration`，可选 `peft=...` 加载 LoRA adapter。
 - `use_cache` 默认允许为 `True`，依赖 ImgSlot 首轮 prefill + 后续 refresh 逻辑。
 - `LocalVisionImageProcessor` 复用训练侧 `VisionPacker`，并记录 `_last_image_block_counts`，用于 processor 把一张原图映射到多个 block spans。
+- ImgSlot 启用时 adapter 会把 `image_block_offsets` 传给模型；训练和评测必须共享同一套全局视觉坐标语义。
 - ImgSlot 启用时 processor 不返回 `mm_token_type_ids`；模型会走 embedding rewrite 路径。
 - 当前 adapter 只支持 image inputs；video 输入会直接报错。
 - `max_image_tokens` 默认 128，但 `eval.sh` 显式传 8196。
@@ -307,7 +312,7 @@ accelerate launch -m lmms_eval --model fovea --tasks xlrs-lite
 - 新模型入口、processor、tokenizer 代码使用 `Fovea*` 命名；仅为兼容保留 `Qwen3_5*` alias。
 - `modeling_qwen3_5.py` 是基础 Qwen3.5 text/vision/backbone 实现；`modeling_fovea.py` 是 Fovea 条件生成和 ImgSlot runtime 实现。不要把 ImgSlot 主逻辑塞回基础 backbone。
 - Qwen3.5/Fovea 专用评测逻辑放在 `lmms_eval/models/simple/fovea.py` 或对应 simple adapter；不要改通用 `qwen3_vl.py` 来服务 Fovea。
-- 训练、评测、processor 的 ImgSlot placeholder 约定必须同步：anchor span、block span、`image_grid_thw` 行数和 `visual_pools` 数量必须一致。
+- 训练、评测、processor 的 ImgSlot placeholder 约定必须同步：anchor span、block span、`image_grid_thw` 行数、`image_block_offsets` 行数和 `visual_pools` 数量必须一致。
 - 遇到不确定的代码设计问题时，必须先询问 THX，不要自行引入兼容层或备用分支。
 - 不能写兼容性代码，除非 THX 明确要求。
 - 代码必须简洁，优先直接清晰的实现。避免“为了稳妥”添加未被当前输入结构使用的防御性路径。
