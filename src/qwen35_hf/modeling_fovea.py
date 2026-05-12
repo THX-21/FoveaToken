@@ -552,11 +552,12 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             visual_mask[block_idx, :visual_len] = True
         return visual_keys_padded, visual_values_padded, visual_mask
 
-    def _build_imgslot_visual_positions(self, visual_grids, visual_spans, device, dtype, visual_lengths=None):
+    def _build_imgslot_visual_positions(self, visual_grids, image_block_offsets, device, dtype, visual_lengths=None):
         spatial_merge_size = int(self.config.vision_config.spatial_merge_size)
         visual_positions = []
-        for grid_idx, (grid, (span_start, _span_length)) in enumerate(zip(visual_grids, visual_spans)):
+        for grid_idx, (grid, block_offset) in enumerate(zip(visual_grids, image_block_offsets)):
             grid = grid.detach().reshape(-1).to(device="cpu", dtype=torch.long)
+            block_offset = block_offset.to(device=device, dtype=torch.long)
             use_linear_fallback = grid.numel() != 3 or torch.any(grid <= 0)
             expected_len = None
             if not use_linear_fallback:
@@ -566,20 +567,20 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 if visual_lengths is None:
                     raise ValueError(f"Invalid ImgSlot visual grid: {grid.tolist()}.")
                 visual_len = int(visual_lengths[grid_idx])
-                linear_pos = torch.arange(int(span_start), int(span_start) + visual_len, device=device)
+                linear_pos = torch.arange(visual_len, device=device, dtype=torch.long)
                 positions = torch.stack(
                     [
-                        torch.full_like(linear_pos, int(span_start)),
-                        torch.full_like(linear_pos, int(span_start)),
+                        torch.zeros_like(linear_pos),
+                        torch.zeros_like(linear_pos),
                         linear_pos,
                     ],
                     dim=1,
                 )
+                positions = positions + block_offset.to(device=device, dtype=positions.dtype)
                 visual_positions.append(positions.to(device=device, dtype=dtype))
                 continue
-            # positions: [3, visual_seq] -> [visual_seq, 3]
             positions = self.model.get_vision_position_ids(
-                int(span_start),
+                0,
                 grid.to(device=device),
                 1,
                 spatial_merge_size,
@@ -617,7 +618,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         visual_spans,
         text_key=None,
         text_value=None,
-        current_last_t: int | float = 0,
     ):
         if len(visual_pools) != len(visual_spans):
             raise ValueError("ImgSlot sample visual block count must match visual span count.")
@@ -634,7 +634,13 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         visual_dtype = visual_pools[0].dtype
         visual_lengths = [visual_pool.shape[0] for visual_pool in visual_pools]
         visual_tokens_global = torch.cat([visual_pool.to(device=visual_device, dtype=visual_dtype) for visual_pool in visual_pools], dim=0).unsqueeze(0)
-        visual_positions = self._build_imgslot_visual_positions(visual_grids, visual_spans, visual_device, torch.float32, visual_lengths)
+        visual_positions = self._build_imgslot_visual_positions(
+            visual_grids,
+            image_block_offsets,
+            visual_device,
+            torch.float32,
+            visual_lengths,
+        )
         visual_positions_global = torch.cat(visual_positions, dim=0).unsqueeze(0)
         visual_key_global, visual_value_global = self._project_imgslot_visual_pool(visual_tokens_global[0])
         visual_mask_global = torch.ones((1, visual_tokens_global.shape[1]), dtype=torch.bool, device=visual_device)
@@ -695,7 +701,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             )
         return visual_replacements, visual_slot_positions, states, self._merge_imgslot_aux_stats(aux_stats, visual_device)
 
-    def _refresh_imgslot_states_for_sample(self, states: list[dict[str, Any]], text_key, text_value, current_last_t: int | float):
+    def _refresh_imgslot_states_for_sample(self, states: list[dict[str, Any]], text_key, text_value):
         if not states:
             return [], None
 
@@ -850,7 +856,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 sample_visual_grids.append(image_grid_thw[pool_index].to(device=inputs_embeds.device))
                 sample_block_offsets.append(image_block_offsets[pool_index].to(device=inputs_embeds.device))
                 pool_index += 1
-            current_last_t = float(position_ids[1:, batch_idx, attention_mask[batch_idx].bool()].max().item())
             visual_replacements, visual_slot_positions, sample_states, sample_aux = self._build_imgslot_states_for_sample(
                 sample_visual_pools,
                 sample_visual_grids,
@@ -859,7 +864,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 visual_spans,
                 text_key=text_key,
                 text_value=text_value,
-                current_last_t=current_last_t,
             )
             for replacement, slot_positions, (span_start, span_length) in zip(visual_replacements, visual_slot_positions, visual_spans):
                 new_inputs_embeds[batch_idx, span_start : span_start + span_length] = replacement.to(inputs_embeds.dtype)
@@ -909,7 +913,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 keys[record["batch_idx"], :, span_start:span_end] = slot_keys[record_idx].to(keys.dtype)
                 values[record["batch_idx"], :, span_start:span_end] = slot_values[record_idx].to(values.dtype)
 
-    def _collect_imgslot_refresh_records(self, runtime, current_last_t: int | float):
+    def _collect_imgslot_refresh_records(self, runtime):
         text_keys_by_batch = runtime["text_keys"]
         text_values_by_batch = runtime["text_values"]
         visual_records = []
@@ -922,7 +926,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 states,
                 text_keys_by_batch[batch_idx],
                 text_values_by_batch[batch_idx],
-                current_last_t,
             )
             for record in sample_visual_records:
                 record["batch_idx"] = batch_idx
@@ -943,8 +946,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             return past_key_values
         layers = self.model.language_model.layers
         layer_types = self.config.text_config.layer_types
-        current_last_t = max(0, past_key_values.get_seq_length() - 1)
-        visual_records = self._collect_imgslot_refresh_records(runtime, current_last_t)
+        visual_records = self._collect_imgslot_refresh_records(runtime)
         if not visual_records:
             return past_key_values
 
