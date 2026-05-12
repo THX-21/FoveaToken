@@ -20,7 +20,7 @@ from qwen35_hf.train.data import VisionPacker
 class LocalVisionImageProcessor(ImageProcessingMixin):
     """Small image processor wrapper around the local Qwen3.5 vision packer."""
 
-    model_input_names = ["pixel_values", "image_grid_thw"]
+    model_input_names = ["pixel_values", "image_grid_thw", "image_block_offsets"]
 
     def __init__(self, vision_packer: VisionPacker) -> None:
         self.vision_packer = vision_packer
@@ -36,9 +36,17 @@ class LocalVisionImageProcessor(ImageProcessingMixin):
 
         pixel_values = []
         image_grid_thw = []
+        image_block_offsets = []
         image_block_counts = []
-        for image in images:
-            packed_pixels, packed_grid = self.vision_packer.pack(image)
+        for image_index, image in enumerate(images):
+            packed = self.vision_packer.pack(image)
+            if self.vision_packer.img_slot_enable:
+                packed_pixels, packed_grid, packed_offsets = packed
+                packed_offsets = packed_offsets.clone()
+                packed_offsets[:, 0] = image_index
+                image_block_offsets.extend(list(packed_offsets))
+            else:
+                packed_pixels, packed_grid = packed
             pixel_values.append(packed_pixels)
             if packed_grid.dim() == 1:
                 image_grid_thw.append(packed_grid)
@@ -49,10 +57,13 @@ class LocalVisionImageProcessor(ImageProcessingMixin):
 
         self._last_image_block_counts = image_block_counts
 
-        return {
+        model_inputs = {
             "pixel_values": torch.cat(pixel_values, dim=0),
             "image_grid_thw": torch.stack(image_grid_thw, dim=0),
         }
+        if image_block_offsets:
+            model_inputs["image_block_offsets"] = torch.stack(image_block_offsets, dim=0)
+        return model_inputs
 
 
 class LocalNoOpVideoProcessor(BaseVideoProcessor):

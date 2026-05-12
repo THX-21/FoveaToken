@@ -44,6 +44,7 @@ class SampleEncoding:
     labels: torch.LongTensor
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.LongTensor | None
+    image_block_offsets: torch.LongTensor | None
     mm_token_type_ids: torch.IntTensor
 
 
@@ -242,8 +243,16 @@ class VisionPacker:
     def _pack_single_block(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
         return pack_single_image(image=image, config=self.local_config, max_image_tokens=self.max_image_tokens)
 
-    def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
-        """Pack one image and return `(pixel_values, image_grid_thw)`."""
+    def _block_offset(self, left: int, top: int) -> torch.LongTensor:
+        merged_patch = self.local_config.patch_size * max(self.local_config.spatial_merge_size, 1)
+        return torch.tensor([0, top // merged_patch, left // merged_patch], dtype=torch.long)
+
+    def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor] | tuple[torch.Tensor, torch.LongTensor, torch.LongTensor]:
+        """Pack one image and return visual tensors.
+
+        ImgSlot additionally returns `image_block_offsets` with one
+        `[t_global, h_offset, w_offset]` row per block in merged-grid units.
+        """
 
         if self.img_slot_enable:
             # Apply the token budget to the whole image first; block count and
@@ -251,11 +260,13 @@ class VisionPacker:
             image = resize_to_token_budget(image, self.local_config, self.max_image_tokens)
             pixel_values_list = []
             image_grid_list = []
+            image_block_offsets = []
             for block in split_image_into_blocks(image, int(self.img_slot_tile_size)):
-                packed_pixels, packed_grid = self._pack_single_block(block)
+                packed_pixels, packed_grid = self._pack_single_block(block.image)
                 pixel_values_list.append(packed_pixels)
                 image_grid_list.append(packed_grid)
-            return torch.cat(pixel_values_list, dim=0), torch.stack(image_grid_list, dim=0)
+                image_block_offsets.append(self._block_offset(block.left, block.top))
+            return torch.cat(pixel_values_list, dim=0), torch.stack(image_grid_list, dim=0), torch.stack(image_block_offsets, dim=0)
 
         return self._pack_single_block(image)
 
@@ -288,7 +299,7 @@ class LazySupervisedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def _load_image(self, image_name: str) -> tuple[torch.Tensor, torch.LongTensor]:
+    def _load_image(self, image_name: str) -> tuple[torch.Tensor, torch.LongTensor] | tuple[torch.Tensor, torch.LongTensor, torch.LongTensor]:
         """Load an image file relative to `image_folder` and pack it."""
 
         image_path = os.path.join(self.image_folder, image_name)
@@ -308,6 +319,7 @@ class LazySupervisedDataset(Dataset):
         image_field = record.get("image")
         pixel_values = None
         image_grid_thw = None
+        image_block_offsets = None
         image_token_counts: list[list[int]] = []
         image_block_counts: list[int] = []
 
@@ -315,8 +327,16 @@ class LazySupervisedDataset(Dataset):
             image_names = image_field if isinstance(image_field, list) else [image_field]
             pixel_values_list = []
             image_grid_list = []
-            for image_name in image_names:
-                packed_pixels, packed_grid = self._load_image(image_name)
+            image_block_offset_list = []
+            for image_index, image_name in enumerate(image_names):
+                packed = self._load_image(image_name)
+                if self.img_slot_enable:
+                    packed_pixels, packed_grid, packed_offsets = packed
+                    packed_offsets = packed_offsets.clone()
+                    packed_offsets[:, 0] = image_index
+                    image_block_offset_list.extend(list(packed_offsets))
+                else:
+                    packed_pixels, packed_grid = packed
                 pixel_values_list.append(packed_pixels)
                 if packed_grid.dim() == 1:
                     grids_for_counts = [packed_grid]
@@ -346,6 +366,8 @@ class LazySupervisedDataset(Dataset):
                 # the patch axis. Keep one grid row per logical image/block.
                 pixel_values = torch.cat(pixel_values_list, dim=0)
                 image_grid_thw = torch.stack(image_grid_list, dim=0)
+                if self.img_slot_enable:
+                    image_block_offsets = torch.stack(image_block_offset_list, dim=0)
 
         input_ids, labels = encode_chatml_example(
             tokenizer=self.tokenizer,
@@ -397,10 +419,13 @@ class DataCollatorForQwen3_5SFT:
 
         pixel_values = [instance["pixel_values"] for instance in instances if instance["pixel_values"] is not None]
         image_grid_thw = [instance["image_grid_thw"] for instance in instances if instance["image_grid_thw"] is not None]
+        image_block_offsets = [instance["image_block_offsets"] for instance in instances if instance.get("image_block_offsets") is not None]
         if pixel_values:
             # Vision patches are already flattened per image, so batching is a
             # simple concatenation rather than padding to a rectangular tensor.
             batch["pixel_values"] = torch.cat(pixel_values, dim=0)
             batch["image_grid_thw"] = torch.cat(image_grid_thw, dim=0)
+            if image_block_offsets:
+                batch["image_block_offsets"] = torch.cat(image_block_offsets, dim=0)
 
         return batch

@@ -21,12 +21,27 @@ class VisionPackerConfig:
     rescale_factor: float = 1.0 / 255.0
 
 
-def split_image_into_blocks(image: Image.Image, tile_size: int) -> list[Image.Image]:
+@dataclass
+class ImageBlock:
+    """One crop plus its location in the budgeted full-image coordinate system."""
+
+    image: Image.Image
+    row: int
+    col: int
+    rows: int
+    cols: int
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+
+def split_image_into_blocks(image: Image.Image, tile_size: int) -> list[ImageBlock]:
     """Split an image into non-overlapping, evenly sized blocks.
 
     The number of blocks along each axis is `ceil(dim / tile_size)`. Boundaries
     are then evenly spaced over the original image, so the last block is not a
-    small leftover strip.
+    small leftover strip. Returned block coordinates are in pixels of `image`.
     """
 
     if tile_size is None or tile_size <= 0:
@@ -35,14 +50,26 @@ def split_image_into_blocks(image: Image.Image, tile_size: int) -> list[Image.Im
     width, height = image.size
     cols = max(1, math.ceil(width / tile_size))
     rows = max(1, math.ceil(height / tile_size))
-    blocks: list[Image.Image] = []
+    blocks: list[ImageBlock] = []
     for row in range(rows):
         top = round(row * height / rows)
         bottom = round((row + 1) * height / rows)
         for col in range(cols):
             left = round(col * width / cols)
             right = round((col + 1) * width / cols)
-            blocks.append(image.crop((left, top, right, bottom)))
+            blocks.append(
+                ImageBlock(
+                    image=image.crop((left, top, right, bottom)),
+                    row=row,
+                    col=col,
+                    rows=rows,
+                    cols=cols,
+                    left=left,
+                    top=top,
+                    right=right,
+                    bottom=bottom,
+                )
+            )
     return blocks
 
 
