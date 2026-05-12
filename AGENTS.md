@@ -68,7 +68,8 @@ lmms-eval/
 - 主训练与评测路径依赖：`PYTHONPATH="$PWD/src:$PWD/lmms-eval"`。
 - 对外主入口优先使用 `FoveaForConditionalGeneration`、`FoveaConfig`、`FoveaProcessor`、`FoveaTokenizer`；`Qwen3_5*` 仅保留兼容别名。
 - `modeling_qwen3_5.py` 是基础实现，`modeling_fovea.py` 是 Fovea / ImgSlot 主实现；不要把 ImgSlot 逻辑塞回基础 backbone。
-- 训练、processor、评测三侧的 ImgSlot placeholder 约定必须同步，尤其是 block span、`image_grid_thw`、`image_block_counts`。
+- 训练、processor、评测三侧的 ImgSlot placeholder 约定必须同步，尤其是 block span、`image_grid_thw`、`image_block_offsets`、`image_block_counts`。
+- ImgSlot 的视觉位置采用原图级全局几何坐标：每个 block 携带 `[t_global, h_offset, w_offset]`，模型用它把 block-local `(t=0,h,w)` 转成同一张原图内共享 `t_global`、连续 `h/w` 的 `visual_pos`；文本 span 只表示 slot embedding 和 KV cache 的写回位置，不参与视觉几何位置构造。
 - 评测 canonical 路径由 `lmms-eval/lmms_eval/models/simple/fovea.py` 负责构造逻辑 image placeholder，并由 `FoveaProcessor` 展开成 block span；`modeling_fovea.py` 不再负责 prompt / placeholder 兼容修复。
 - 修改 LoRA trainable / `modules_to_save` 时，必须同时检查训练保存逻辑和 `lmms-eval/lmms_eval/models/simple/fovea.py` 的评测加载逻辑。
 - 修改脚本环境变量、默认入口或使用方式时，必须同步更新 `AGENTS.md` 和 `README.md`。

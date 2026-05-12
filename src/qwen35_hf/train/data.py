@@ -346,10 +346,8 @@ class LazySupervisedDataset(Dataset):
                     image_grid_list.extend(grids_for_counts)
                 image_block_counts.append(len(grids_for_counts))
                 current_image_token_counts: list[int] = []
-                # Text-side visual span lengths: ImgSlot uses one shared
-                # sentence-level A span of length m plus fixed k-token spans for
-                # each block; the normal path derives counts from `(t, h, w)`
-                # grid metadata after spatial merge.
+                # Text-side visual span lengths: ImgSlot writes one fixed
+                # k-token span per block; geometry comes from image_block_offsets.
                 for grid in grids_for_counts:
                     if self.img_slot_enable:
                         current_image_token_counts.append(self.vision_packer.img_slot_token_count)
@@ -383,6 +381,7 @@ class LazySupervisedDataset(Dataset):
             "mm_token_type_ids": mm_token_type_ids,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
+            "image_block_offsets": image_block_offsets,
             "image_block_counts": torch.tensor(image_block_counts, dtype=torch.long) if image_block_counts else None,
         }
 

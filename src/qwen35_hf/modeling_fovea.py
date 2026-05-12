@@ -1,9 +1,7 @@
 import copy
-import math
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.nn import init
 
@@ -28,14 +26,7 @@ from .train.data import IGNORE_INDEX
 
 
 class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-    """Multimodal causal LM head for text, image, and video generation.
-
-    ImgSlot overview:
-    - Prefill: replace text-side image placeholder spans with one compressed visual span per image block.
-    - Decode: keep a detached runtime state per sample, and every `delta` steps
-      refresh the slot tokens then overwrite their KV cache entries on
-      full-attention layers only.
-    """
+    """Multimodal causal LM head with ImgSlot prefill rewrite and decode-time KV refresh."""
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     accepts_loss_kwargs = False
     config: FoveaConfig
@@ -55,18 +46,11 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         # Shared ImgSlot attention blocks. These do not replace decoder self-attn;
         # they only synthesize/refresh slot tokens before writing them back into
         # decoder KV cache.
-        self.imgslot_text_q_proj = nn.Linear(hidden_size, hidden_size * 2, bias=config.text_config.attention_bias)
-        self.imgslot_text_k_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
-        self.imgslot_text_v_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
-        self.imgslot_text_o_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
-        self.imgslot_text_q_norm = Qwen3_5RMSNorm(self.imgslot_head_dim, eps=config.text_config.rms_norm_eps)
-        self.imgslot_text_k_norm = Qwen3_5RMSNorm(self.imgslot_head_dim, eps=config.text_config.rms_norm_eps)
-        self.imgslot_img_q_proj = nn.Linear(hidden_size, hidden_size * 2, bias=config.text_config.attention_bias)
-        self.imgslot_img_k_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
-        self.imgslot_img_v_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
-        self.imgslot_img_o_proj = nn.Linear(hidden_size, hidden_size, bias=config.text_config.attention_bias)
-        self.imgslot_img_q_norm = Qwen3_5RMSNorm(self.imgslot_head_dim, eps=config.text_config.rms_norm_eps)
-        self.imgslot_img_k_norm = Qwen3_5RMSNorm(self.imgslot_head_dim, eps=config.text_config.rms_norm_eps)
+        for prefix in ("text", "img"):
+            for name, out_dim in (("q", hidden_size * 2), ("k", hidden_size), ("v", hidden_size), ("o", hidden_size)):
+                setattr(self, f"imgslot_{prefix}_{name}_proj", nn.Linear(hidden_size, out_dim, bias=config.text_config.attention_bias))
+            for name in ("q", "k"):
+                setattr(self, f"imgslot_{prefix}_{name}_norm", Qwen3_5RMSNorm(self.imgslot_head_dim, eps=config.text_config.rms_norm_eps))
         self.imgslot_attention_dropout = config.text_config.attention_dropout
         self.imgslot_scaling = self.imgslot_head_dim**-0.5
         self.num_key_value_groups = 1
@@ -86,6 +70,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         self._imgslot_aux = torch.zeros((), device=self.lm_head.weight.device)
         self.post_init()
         self._init_imgslot_modules()
+
+    def _imgslot_init_groups(self):
+        linears = [getattr(self, f"imgslot_{p}_{n}_proj") for p in ("text", "img") for n in ("q", "k", "v", "o")]
+        return linears + [self.imgslot_ffn[0], self.imgslot_ffn[2]], [getattr(self, f"imgslot_{p}_{n}_norm") for p in ("text", "img") for n in ("q", "k")], [self.imgslot_attn_norm, self.imgslot_ffn_norm, self.imgslot_visual_norm]
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
@@ -119,19 +107,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             "max_text_tokens": int(self.config.img_slot_max_text_tokens),
         }
 
-    def _empty_imgslot_aux(self, device: torch.device) -> dict[str, torch.Tensor]:
-        zero = torch.zeros((), device=device)
-        return {
-            "attention_entropy": zero,
-            "num_blocks": zero,
-        }
-
-    def _store_imgslot_aux(self, aux_stats: dict[str, torch.Tensor] | None, device: torch.device) -> None:
-        if aux_stats is None:
-            self._imgslot_aux = self._empty_imgslot_aux(device)
-            return
-        self._imgslot_aux = aux_stats
-
     @torch.no_grad()
     def _init_imgslot_modules(self) -> None:
         """Explicitly initialize newly-added ImgSlot weights.
@@ -143,29 +118,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         """
 
         std = float(getattr(self.config.text_config, "initializer_range", 0.02))
-        linear_modules = (
-            self.imgslot_text_q_proj,
-            self.imgslot_text_k_proj,
-            self.imgslot_text_v_proj,
-            self.imgslot_text_o_proj,
-            self.imgslot_img_q_proj,
-            self.imgslot_img_k_proj,
-            self.imgslot_img_v_proj,
-            self.imgslot_img_o_proj,
-            self.imgslot_ffn[0],
-            self.imgslot_ffn[2],
-        )
-        norm_modules = (
-            self.imgslot_text_q_norm,
-            self.imgslot_text_k_norm,
-            self.imgslot_img_q_norm,
-            self.imgslot_img_k_norm,
-        )
-        layer_norm_modules = (
-            self.imgslot_attn_norm,
-            self.imgslot_ffn_norm,
-            self.imgslot_visual_norm,
-        )
+        linear_modules, norm_modules, layer_norm_modules = self._imgslot_init_groups()
 
         init.normal_(self.imgslot_a_tokens.weight, mean=0.0, std=std)
         for module in linear_modules:
@@ -183,20 +136,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         """Fix ImgSlot missing-key tensors left uninitialized by some loaders."""
 
         std = float(getattr(self.config.text_config, "initializer_range", 0.02))
-        random_weight_modules = (
-            self.imgslot_a_tokens,
-            self.imgslot_text_q_proj,
-            self.imgslot_text_k_proj,
-            self.imgslot_text_v_proj,
-            self.imgslot_text_o_proj,
-            self.imgslot_img_q_proj,
-            self.imgslot_img_k_proj,
-            self.imgslot_img_v_proj,
-            self.imgslot_img_o_proj,
-            self.imgslot_ffn[0],
-            self.imgslot_ffn[2],
-        )
-        for module in random_weight_modules:
+        linear_modules, norm_modules, layer_norm_modules = self._imgslot_init_groups()
+        for module in (self.imgslot_a_tokens, *linear_modules):
             weight = module.weight
             if torch.isfinite(weight).all() and weight.float().std() > 0:
                 continue
@@ -204,21 +145,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             if getattr(module, "bias", None) is not None:
                 init.zeros_(module.bias)
 
-        norm_modules = (
-            self.imgslot_text_q_norm,
-            self.imgslot_text_k_norm,
-            self.imgslot_img_q_norm,
-            self.imgslot_img_k_norm,
-        )
         for module in norm_modules:
             if not torch.isfinite(module.weight).all():
                 init.zeros_(module.weight)
 
-        layer_norm_modules = (
-            self.imgslot_attn_norm,
-            self.imgslot_ffn_norm,
-            self.imgslot_visual_norm,
-        )
         for module in layer_norm_modules:
             if not torch.isfinite(module.weight).all():
                 init.ones_(module.weight)
@@ -256,11 +186,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             items = runtime.get(key)
             if not items:
                 continue
-            expanded = []
-            for item in items:
-                for _ in range(expand_size):
-                    expanded.append(self._clone_imgslot_runtime_item(item, deep=(key == "states")))
-            runtime[key] = expanded
+            runtime[key] = [self._clone_imgslot_runtime_item(item, deep=(key == "states")) for item in items for _ in range(expand_size)]
 
     def _image_block_counts_tensor(self, image_block_counts, device) -> torch.Tensor | None:
         if image_block_counts is None:
@@ -277,9 +203,23 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             image_block_counts = image_block_counts.unsqueeze(0)
         return image_block_counts
 
-    def _expand_imgslot_packed_images(self, pixel_values, image_grid_thw, image_block_counts, expand_size: int):
-        if pixel_values is None or image_grid_thw is None or image_block_counts is None or expand_size == 1:
-            return pixel_values, image_grid_thw, image_block_counts
+    def _split_imgslot_patches(self, pixel_values, image_grid_thw, sample_block_counts):
+        merge_size = int(getattr(self.model.visual, "spatial_merge_size", 1))
+        if merge_size <= 0:
+            raise ValueError(f"Invalid visual spatial_merge_size: {merge_size}.")
+        patch_sizes = (image_grid_thw.prod(-1) // (merge_size**2)).to(device=pixel_values.device, dtype=torch.long).tolist()
+        block_patches = list(torch.split(pixel_values, patch_sizes, dim=0))
+        sample_patches, start = [], 0
+        for count in sample_block_counts:
+            sample_patches.append(torch.cat(block_patches[start : start + count], dim=0))
+            start += count
+        if start != len(block_patches):
+            raise ValueError("Packed ImgSlot patch splits contain extra blocks after sample grouping.")
+        return sample_patches
+
+    def _expand_imgslot_packed_images(self, pixel_values, image_grid_thw, image_block_offsets, image_block_counts, expand_size: int):
+        if pixel_values is None or image_grid_thw is None or image_block_offsets is None or image_block_counts is None or expand_size == 1:
+            return pixel_values, image_grid_thw, image_block_offsets, image_block_counts
 
         image_block_counts = self._image_block_counts_tensor(image_block_counts, device=image_grid_thw.device)
         sample_block_counts = image_block_counts.sum(dim=1).tolist()
@@ -287,38 +227,22 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             raise ValueError(
                 f"Expanded ImgSlot image metadata mismatch: summed block counts {sum(sample_block_counts)} != grid rows {image_grid_thw.shape[0]}."
             )
+        if image_block_offsets.shape[0] != image_grid_thw.shape[0]:
+            raise ValueError("Expanded ImgSlot image_block_offsets row count must match image_grid_thw rows.")
 
         grid_splits = torch.split(image_grid_thw, sample_block_counts, dim=0)
-        merge_size = int(getattr(self.model.visual, "spatial_merge_size", 1))
-        if merge_size <= 0:
-            raise ValueError(f"Invalid visual spatial_merge_size: {merge_size}.")
-        packed_patch_sizes = (image_grid_thw.prod(-1) // (merge_size**2)).to(device=pixel_values.device, dtype=torch.long).tolist()
-        block_patch_splits = torch.split(pixel_values, packed_patch_sizes, dim=0)
-        patch_splits = []
-        block_offset = 0
-        for block_count in sample_block_counts:
-            sample_blocks = block_patch_splits[block_offset : block_offset + block_count]
-            if len(sample_blocks) != block_count:
-                raise ValueError("Packed ImgSlot patch splits do not align with per-sample block counts.")
-            patch_splits.append(torch.cat(sample_blocks, dim=0))
-            block_offset += block_count
-        if block_offset != len(block_patch_splits):
-            raise ValueError("Packed ImgSlot patch splits contain extra blocks after sample grouping.")
-        if len(grid_splits) != len(sample_block_counts) or len(patch_splits) != len(sample_block_counts):
+        offset_splits = torch.split(image_block_offsets, sample_block_counts, dim=0)
+        patch_splits = self._split_imgslot_patches(pixel_values, image_grid_thw, sample_block_counts)
+        if len(grid_splits) != len(sample_block_counts) or len(offset_splits) != len(sample_block_counts) or len(patch_splits) != len(sample_block_counts):
             raise ValueError("Packed ImgSlot image splits do not align with per-sample block counts.")
 
-        expanded_grids = []
-        expanded_patches = []
-        expanded_counts = []
-        for sample_idx, block_count in enumerate(sample_block_counts):
-            sample_grids = grid_splits[sample_idx]
-            sample_patches = patch_splits[sample_idx]
-            sample_counts = image_block_counts[sample_idx : sample_idx + 1]
-            for _ in range(expand_size):
-                expanded_grids.append(sample_grids.clone())
-                expanded_patches.append(sample_patches.clone())
-                expanded_counts.append(sample_counts.clone())
-        return torch.cat(expanded_patches, dim=0), torch.cat(expanded_grids, dim=0), torch.cat(expanded_counts, dim=0)
+        expanded_patches, expanded_grids, expanded_offsets, expanded_counts = [], [], [], []
+        for patches, grids, offsets, counts in zip(patch_splits, grid_splits, offset_splits, image_block_counts):
+            expanded_patches.extend(patches.clone() for _ in range(expand_size))
+            expanded_grids.extend(grids.clone() for _ in range(expand_size))
+            expanded_offsets.extend(offsets.clone() for _ in range(expand_size))
+            expanded_counts.extend(counts.unsqueeze(0).clone() for _ in range(expand_size))
+        return torch.cat(expanded_patches, dim=0), torch.cat(expanded_grids, dim=0), torch.cat(expanded_offsets, dim=0), torch.cat(expanded_counts, dim=0)
 
     def _project_imgslot_kv(self, tokens, k_proj, v_proj, k_norm):
         # tokens: [seq, hidden]
@@ -451,134 +375,81 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             mask=text_mask,
         )[0]
 
-    def _run_imgslot_visual_blocks(
-        self,
-        anchor_tokens,
-        visual_key,
-        visual_value,
-        visual_tokens,
-        visual_lengths,
-        visual_mask=None,
-        anchor_positions=None,
-        visual_positions=None,
-    ):
-        updated_anchor_tokens, attention_weights = self._run_imgslot_attention(
-            anchor_tokens,
-            visual_key,
-            visual_value,
+    def _run_imgslot_global_visual(self, shared_a_tokens, visual_pools, visual_positions, device, dtype):
+        visual_tokens = torch.cat([pool.to(device=device, dtype=dtype) for pool in visual_pools], dim=0).unsqueeze(0)
+        visual_pos = torch.cat(visual_positions, dim=0).unsqueeze(0)
+        visual_key, visual_value = self._project_imgslot_visual_pool(visual_tokens[0])
+        return self._run_imgslot_attention(
+            shared_a_tokens,
+            visual_key.to(device=device, dtype=dtype),
+            visual_value.to(device=device, dtype=dtype),
             self.imgslot_img_q_proj,
             self.imgslot_img_q_norm,
             self.imgslot_img_o_proj,
-            mask=visual_mask,
-            query_positions=anchor_positions,
-            key_positions=visual_positions,
-        )
-        # attention_weights: [1, num_heads, m, total_visual_seq]
-        # token_anchor_weight: [1, total_visual_seq, m]
-        anchor_attn = attention_weights.float().mean(dim=1)
-        token_anchor_weight = torch.softmax(anchor_attn.transpose(1, 2), dim=-1).to(updated_anchor_tokens.dtype)
-        token_anchor_context = torch.matmul(token_anchor_weight, updated_anchor_tokens)
-        visual_context_global = self.imgslot_visual_norm(visual_tokens + token_anchor_context)
-        visual_contexts = list(visual_context_global.split(visual_lengths, dim=1))
-        token_scores = anchor_attn.mean(dim=1).to(updated_anchor_tokens.dtype)
-        visual_token_scores = list(token_scores.split(visual_lengths, dim=1))
-        return updated_anchor_tokens, visual_contexts, visual_token_scores, attention_weights
+            mask=torch.ones((1, visual_tokens.shape[1]), dtype=torch.bool, device=device),
+            key_positions=visual_pos.permute(2, 0, 1),
+        )[0][0]
 
-    def _compress_imgslot_visual_tokens(self, shared_a_tokens, visual_pool, visual_pos, visual_mask=None):
-        # shared_a_tokens: [block_count, k, hidden]
-        # visual_pool: [block_count, visual_seq, hidden]
-        # visual_pos: [block_count, visual_seq, 3]
-        # visual_mask: [block_count, visual_seq]
-        block_keys = []
-        block_values = []
-        for block_idx in range(visual_pool.shape[0]):
-            key, value = self._project_imgslot_visual_pool(visual_pool[block_idx])
-            block_keys.append(key)
-            block_values.append(value)
-        key_states = torch.cat(block_keys, dim=0)
-        value_states = torch.cat(block_values, dim=0)
+    def _build_shared_imgslot_a(self, visual_pools, visual_positions, text_key, text_value, device, dtype, prev_a=None):
+        base_a = (prev_a if prev_a is not None else self.imgslot_a_tokens.weight[: int(self._imgslot_config()["k"])]).to(device=device, dtype=dtype).unsqueeze(0)
+        if text_key is not None and text_value is not None and text_key.shape[-2] > 0:
+            text_a = self._run_imgslot_text_blocks(base_a, text_key.to(device=device, dtype=dtype), text_value.to(device=device, dtype=dtype))
+            if prev_a is not None:
+                beta = float(self._imgslot_config()["beta"])
+                text_a = (1.0 - beta) * base_a + beta * text_a
+            base_a = text_a
+        return self._run_imgslot_global_visual(base_a, visual_pools, visual_positions, device, dtype)
+
+    def _compress_imgslot_visual_tokens(self, shared_a_tokens, visual_pool, visual_pos):
+        # shared_a_tokens: [k, hidden], visual_pool: [visual_seq, hidden],
+        # visual_pos: [visual_seq, 3] in global image coordinates.
+        key_states, value_states = self._project_imgslot_visual_pool(visual_pool)
         updated_a_tokens, attention_weights = self._run_imgslot_attention(
-            shared_a_tokens,
+            shared_a_tokens.unsqueeze(0),
             key_states,
             value_states,
             self.imgslot_img_q_proj,
             self.imgslot_img_q_norm,
             self.imgslot_img_o_proj,
-            mask=visual_mask,
-            key_positions=visual_pos.permute(2, 0, 1),
+            key_positions=visual_pos.unsqueeze(0).permute(2, 0, 1),
         )
-        attention_scores = attention_weights.float().mean(dim=1)
-        slot_tokens = updated_a_tokens
+        attention_scores = attention_weights.float().mean(dim=1)[0]
+        slot_tokens = updated_a_tokens[0]
         slot_pos = torch.matmul(attention_scores, visual_pos.float()).to(visual_pos.dtype)
         attention_prob = attention_scores.clamp_min(1e-6)
         attention_entropy = -(attention_prob * attention_prob.log()).sum(dim=-1).mean()
         aux_stats = {
             "attention_entropy": attention_entropy.to(slot_tokens.dtype),
-            "num_blocks": torch.tensor(float(visual_pool.shape[0]), device=visual_pool.device),
+            "num_blocks": torch.ones((), device=visual_pool.device),
         }
         return slot_tokens, slot_pos, aux_stats
 
+    def _compress_imgslot_blocks(self, shared_a_tokens, visual_pools, visual_positions):
+        replacements, slot_positions, aux_stats = [], [], []
+        for visual_pool, visual_pos in zip(visual_pools, visual_positions):
+            compressed_slots, slot_pos, block_aux = self._compress_imgslot_visual_tokens(shared_a_tokens, visual_pool, visual_pos)
+            replacements.append(compressed_slots)
+            slot_positions.append(slot_pos)
+            aux_stats.append(block_aux)
+        return replacements, slot_positions, aux_stats
+
     def _merge_imgslot_aux_stats(self, aux_stats: list[dict[str, torch.Tensor]], device: torch.device) -> dict[str, torch.Tensor]:
         if not aux_stats:
-            return self._empty_imgslot_aux(device)
-        merged = {
+            zero = torch.zeros((), device=device)
+            return {"attention_entropy": zero, "num_blocks": zero}
+        return {
             "attention_entropy": torch.stack([item["attention_entropy"] for item in aux_stats]).mean(),
+            "num_blocks": torch.stack([item["num_blocks"].to(device) for item in aux_stats]).sum(),
         }
-        block_counts = [item.get("num_blocks") for item in aux_stats]
-        if all(count is not None for count in block_counts):
-            merged["num_blocks"] = torch.stack([count.to(device) for count in block_counts]).sum()
-        else:
-            merged["num_blocks"] = torch.tensor(float(len(aux_stats)), device=device)
-        return merged
 
-    def _pad_imgslot_visual_kv(self, visual_kv, device, dtype):
-        # visual_kv: list[(key, value)] where each key/value is
-        #   [1, num_attention_heads, visual_seq_i, head_dim]
-        # After padding:
-        #   visual_keys_padded/visual_values_padded: [block_count, num_attention_heads, max_visual_tokens, head_dim]
-        #   visual_mask: [block_count, max_visual_tokens]
-        block_count = len(visual_kv)
-        visual_lengths = [visual_key.shape[-2] for visual_key, _visual_value in visual_kv]
-        max_visual_tokens = max(visual_lengths)
-        num_heads = self.imgslot_num_heads
-        head_dim = visual_kv[0][0].shape[-1]
-        visual_keys_padded = visual_kv[0][0].new_zeros((block_count, num_heads, max_visual_tokens, head_dim), device=device, dtype=dtype)
-        visual_values_padded = visual_kv[0][1].new_zeros((block_count, num_heads, max_visual_tokens, head_dim), device=device, dtype=dtype)
-        visual_mask = torch.zeros((block_count, max_visual_tokens), dtype=torch.bool, device=device)
-        for block_idx, (visual_key, visual_value) in enumerate(visual_kv):
-            visual_len = visual_key.shape[-2]
-            visual_keys_padded[block_idx, :, :visual_len, :] = visual_key[0].to(device=device, dtype=dtype)
-            visual_values_padded[block_idx, :, :visual_len, :] = visual_value[0].to(device=device, dtype=dtype)
-            visual_mask[block_idx, :visual_len] = True
-        return visual_keys_padded, visual_values_padded, visual_mask
-
-    def _build_imgslot_visual_positions(self, visual_grids, image_block_offsets, device, dtype, visual_lengths=None):
+    def _build_imgslot_visual_positions(self, visual_grids, image_block_offsets, device, dtype):
         spatial_merge_size = int(self.config.vision_config.spatial_merge_size)
         visual_positions = []
-        for grid_idx, (grid, block_offset) in enumerate(zip(visual_grids, image_block_offsets)):
+        for grid, block_offset in zip(visual_grids, image_block_offsets):
             grid = grid.detach().reshape(-1).to(device="cpu", dtype=torch.long)
+            if grid.numel() != 3 or torch.any(grid <= 0):
+                raise ValueError(f"Invalid ImgSlot visual grid: {grid.tolist()}.")
             block_offset = block_offset.to(device=device, dtype=torch.long)
-            use_linear_fallback = grid.numel() != 3 or torch.any(grid <= 0)
-            expected_len = None
-            if not use_linear_fallback:
-                expected_len = int(grid.prod().item() // (spatial_merge_size**2))
-                use_linear_fallback = expected_len <= 0 or expected_len > 1_000_000
-            if use_linear_fallback:
-                if visual_lengths is None:
-                    raise ValueError(f"Invalid ImgSlot visual grid: {grid.tolist()}.")
-                visual_len = int(visual_lengths[grid_idx])
-                linear_pos = torch.arange(visual_len, device=device, dtype=torch.long)
-                positions = torch.stack(
-                    [
-                        torch.zeros_like(linear_pos),
-                        torch.zeros_like(linear_pos),
-                        linear_pos,
-                    ],
-                    dim=1,
-                )
-                positions = positions + block_offset.to(device=device, dtype=positions.dtype)
-                visual_positions.append(positions.to(device=device, dtype=dtype))
-                continue
             positions = self.model.get_vision_position_ids(
                 0,
                 grid.to(device=device),
@@ -600,15 +471,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             text_pos = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1)
         return text_pos.unsqueeze(0).expand(4, -1, -1).clone()
 
-    def _split_imgslot_sample_spans(self, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        topk_target = int(self._imgslot_config()["k"])
-        if not spans:
-            raise ValueError("ImgSlot sample must contain at least one visual span.")
-        for _, span_length in spans:
-            if span_length != topk_target:
-                raise ValueError(f"ImgSlot visual span length {span_length} must equal k ({topk_target}).")
-        return spans
-
     def _build_imgslot_states_for_sample(
         self,
         visual_pools,
@@ -628,67 +490,27 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if not visual_pools:
             raise ValueError("ImgSlot sample must contain at least one visual pool.")
 
-        imgslot_config = self._imgslot_config()
-        slot_target = int(imgslot_config["k"])
         visual_device = visual_pools[0].device
         visual_dtype = visual_pools[0].dtype
-        visual_lengths = [visual_pool.shape[0] for visual_pool in visual_pools]
-        visual_tokens_global = torch.cat([visual_pool.to(device=visual_device, dtype=visual_dtype) for visual_pool in visual_pools], dim=0).unsqueeze(0)
         visual_positions = self._build_imgslot_visual_positions(
             visual_grids,
             image_block_offsets,
             visual_device,
             torch.float32,
-            visual_lengths,
         )
-        visual_positions_global = torch.cat(visual_positions, dim=0).unsqueeze(0)
-        visual_key_global, visual_value_global = self._project_imgslot_visual_pool(visual_tokens_global[0])
-        visual_mask_global = torch.ones((1, visual_tokens_global.shape[1]), dtype=torch.bool, device=visual_device)
+        if text_tokens.numel() > 0 and (text_key is None or text_value is None):
+            text_key, text_value = self._project_imgslot_text_tokens(text_tokens.to(visual_dtype))
+        shared_a_tokens_single = self._build_shared_imgslot_a(visual_pools, visual_positions, text_key, text_value, visual_device, visual_dtype)
 
-        shared_a_seed = self.imgslot_a_tokens.weight[:slot_target].to(device=visual_device, dtype=visual_dtype)
-        if text_tokens.numel() == 0:
-            shared_a_text = shared_a_seed.unsqueeze(0)
-        else:
-            if text_key is None or text_value is None:
-                text_key, text_value = self._project_imgslot_text_tokens(text_tokens.to(visual_dtype))
-            text_key = text_key.to(device=visual_device, dtype=visual_dtype)
-            text_value = text_value.to(device=visual_device, dtype=visual_dtype)
-            shared_a_text = self._run_imgslot_text_blocks(shared_a_seed.unsqueeze(0), text_key, text_value)
-        shared_a_tokens, _visual_contexts, _visual_scores, _anchor_attn = self._run_imgslot_visual_blocks(
-            shared_a_text,
-            visual_key_global.to(device=visual_device, dtype=visual_dtype),
-            visual_value_global.to(device=visual_device, dtype=visual_dtype),
-            visual_tokens_global,
-            visual_lengths,
-            visual_mask=visual_mask_global,
-            visual_positions=visual_positions_global.permute(2, 0, 1),
-        )
-        shared_a_tokens_single = shared_a_tokens[0]
-
-        visual_replacements, visual_slot_positions, aux_stats = self._compress_imgslot_blocks(
+        states = []
+        visual_replacements, visual_slot_positions, aux_stats = self._compress_imgslot_blocks(shared_a_tokens_single, visual_pools, visual_positions)
+        for (span_start, span_length), visual_pool, visual_pos, compressed_slots, slot_pos in zip(
+            visual_spans,
             visual_pools,
             visual_positions,
-            visual_contexts,
-            visual_gate_scores,
-            visual_device,
-        )
-        states = []
-        aux_stats = []
-        for (span_start, span_length), visual_pool, visual_pos in zip(visual_spans, visual_pools, visual_positions):
-            if span_length != slot_target:
-                raise ValueError(f"ImgSlot visual span length {span_length} must equal k ({slot_target}).")
-            block_mask = torch.ones((1, visual_pool.shape[0]), dtype=torch.bool, device=visual_device)
-            compressed_slots, slot_pos, block_aux = self._compress_imgslot_visual_tokens(
-                shared_a_tokens_single.unsqueeze(0),
-                visual_pool.unsqueeze(0),
-                visual_pos.unsqueeze(0),
-                block_mask,
-            )
-            compressed_slots = compressed_slots[0]
-            slot_pos = slot_pos[0]
-            visual_replacements.append(compressed_slots)
-            visual_slot_positions.append(slot_pos)
-            aux_stats.append(block_aux)
+            visual_replacements,
+            visual_slot_positions,
+        ):
             states.append(
                 {
                     "span": (int(span_start), int(span_length)),
@@ -705,56 +527,24 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if not states:
             return [], None
 
-        imgslot_config = self._imgslot_config()
         visual_dtype = states[0]["V"].dtype
         visual_device = states[0]["V"].device
+        imgslot_config = self._imgslot_config()
         slot_target = int(imgslot_config["k"])
 
-        shared_a_prev = states[0]["A"].to(device=visual_device, dtype=visual_dtype).unsqueeze(0)
-        if text_key is None or text_value is None or text_key.shape[-2] == 0:
-            shared_a_text = shared_a_prev
-        else:
-            text_key = text_key.to(device=visual_device, dtype=visual_dtype)
-            text_value = text_value.to(device=visual_device, dtype=visual_dtype)
-            shared_a_text = self._run_imgslot_text_blocks(shared_a_prev, text_key, text_value)
-            shared_a_text = (1.0 - imgslot_config["beta"]) * shared_a_prev + imgslot_config["beta"] * shared_a_text
-
+        shared_a_prev = states[0]["A"].to(device=visual_device, dtype=visual_dtype)
         visual_pools = [state["V"].to(device=visual_device, dtype=visual_dtype) for state in states]
         visual_positions = [state["visual_pos"].to(device=visual_device, dtype=torch.float32) for state in states]
-        visual_positions_global = torch.cat(visual_positions, dim=0).unsqueeze(0)
-        visual_key_global, visual_value_global = self._project_imgslot_visual_pool(visual_tokens_global[0])
-        visual_mask_global = torch.ones((1, visual_tokens_global.shape[1]), dtype=torch.bool, device=visual_device)
-        shared_a_new, _visual_contexts, _visual_scores, _anchor_attn = self._run_imgslot_visual_blocks(
-            shared_a_text,
-            visual_key_global.to(device=visual_device, dtype=visual_dtype),
-            visual_value_global.to(device=visual_device, dtype=visual_dtype),
-            visual_tokens_global,
-            visual_lengths,
-            visual_mask=visual_mask_global,
-            visual_positions=visual_positions_global.permute(2, 0, 1),
-        )
-        shared_a_tokens = shared_a_new[0]
+        shared_a_tokens = self._build_shared_imgslot_a(visual_pools, visual_positions, text_key, text_value, visual_device, visual_dtype, shared_a_prev)
 
         visual_records = []
-        aux_stats = []
-        for state_idx, state in enumerate(states):
-            visual_pool = visual_pools[state_idx]
-            visual_pos = visual_positions[state_idx]
-            block_mask = torch.ones((1, visual_pool.shape[0]), dtype=torch.bool, device=visual_device)
-            compressed_slots, slot_pos, block_aux = self._compress_imgslot_visual_tokens(
-                shared_a_tokens.unsqueeze(0),
-                visual_pool.unsqueeze(0),
-                visual_pos.unsqueeze(0),
-                block_mask,
-            )
-            compressed_slots = compressed_slots[0]
-            slot_pos = slot_pos[0]
+        compressed_blocks, slot_positions, aux_stats = self._compress_imgslot_blocks(shared_a_tokens, visual_pools, visual_positions)
+        for state, compressed_slots, slot_pos in zip(states, compressed_blocks, slot_positions):
             prev_slots = state["compressed_slots"].to(device=visual_device, dtype=visual_dtype)
             compressed_slots = imgslot_config["lam"] * prev_slots + (1.0 - imgslot_config["lam"]) * compressed_slots
             state["A"] = shared_a_tokens.detach()
             state["compressed_slots"] = compressed_slots.detach()
             state["slot_pos"] = slot_pos.detach()
-            states[state_idx] = state
             span_start, span_length = state["span"]
             if span_length != slot_target:
                 raise ValueError(f"ImgSlot visual span length {span_length} must equal k ({slot_target}).")
@@ -766,7 +556,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                     "slot_positions": state["slot_pos"][:span_length],
                 }
             )
-            aux_stats.append(block_aux)
         return visual_records, self._merge_imgslot_aux_stats(aux_stats, visual_device)
 
     def _image_placeholder_spans(self, input_ids: torch.Tensor) -> list[list[tuple[int, int]]]:
@@ -786,13 +575,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             all_spans.append(sample_spans)
         return all_spans
 
-    def _build_imgslot_visual_pools(self, pixel_values, image_grid_thw):
-        if pixel_values is None or image_grid_thw is None:
-            return None
-        image_outputs = self.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, return_dict=True)
-        return list(image_outputs.pooler_output)
-
-    def _prebuild_imgslot_inputs(self, input_ids, attention_mask, inputs_embeds, visual_pools, image_grid_thw, labels=None):
+    def _prebuild_imgslot_inputs(self, input_ids, attention_mask, inputs_embeds, visual_pools, image_grid_thw, image_block_offsets, labels=None):
         embed_device = inputs_embeds.device
         # With device_map="auto", token tensors can stay on cuda:0 while the
         # embedding shard that produced inputs_embeds lives on another GPU.
@@ -827,6 +610,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             torch.float32,
         )
         imgslot_config = self._imgslot_config()
+        slot_target = int(imgslot_config["k"])
         max_text_tokens = int(imgslot_config["max_text_tokens"])
         runtime_text_keys: list[torch.Tensor] = []
         runtime_text_values: list[torch.Tensor] = []
@@ -836,7 +620,9 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 runtime_text_keys.append(inputs_embeds.new_zeros((1, self.imgslot_num_heads, 0, self.imgslot_head_dim)).detach())
                 runtime_text_values.append(inputs_embeds.new_zeros((1, self.imgslot_num_heads, 0, self.imgslot_head_dim)).detach())
                 continue
-            visual_spans = self._split_imgslot_sample_spans(spans)
+            if any(span_length != slot_target for _, span_length in spans):
+                raise ValueError(f"ImgSlot visual span length must equal k ({slot_target}).")
+            visual_spans = spans
             # valid_text_mask: [seq]
             # text_tokens: [text_seq, hidden], with image placeholders removed and
             # supervision targets excluded so ImgSlot does not condition on future
@@ -847,7 +633,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             text_tokens = inputs_embeds[batch_idx][valid_text_mask][-max_text_tokens:]
             text_key = text_value = None
             if text_tokens.numel() > 0:
-                text_key, text_value = self._project_imgslot_kv(text_tokens, self.imgslot_text_k_proj, self.imgslot_text_v_proj)
+                text_key, text_value = self._project_imgslot_text_tokens(text_tokens)
             sample_visual_pools = []
             sample_visual_grids = []
             sample_block_offsets = []
@@ -934,7 +720,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             if sample_aux is not None:
                 aux_stats.append(sample_aux)
         if aux_device is not None:
-            self._store_imgslot_aux(self._merge_imgslot_aux_stats(aux_stats, aux_device), aux_device)
+            self._imgslot_aux = self._merge_imgslot_aux_stats(aux_stats, aux_device)
         return visual_records
 
     def _maybe_refresh_imgslot_cache(self, past_key_values):
@@ -973,7 +759,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         max_text_tokens = int(self._imgslot_config()["max_text_tokens"])
         for batch_idx in range(last_hidden.shape[0]):
             # last_hidden[batch_idx]: [1, hidden] -> new_key/new_value: [1, num_attention_heads, 1, head_dim]
-            new_key, new_value = self._project_imgslot_kv(last_hidden[batch_idx], self.imgslot_text_k_proj, self.imgslot_text_v_proj)
+            new_key, new_value = self._project_imgslot_text_tokens(last_hidden[batch_idx])
             # Append one new text token into the per-sample runtime KV memory, then
             # keep only the latest max_text_tokens entries along seq dim (-2).
             text_keys[batch_idx] = torch.cat([text_keys[batch_idx].to(new_key.device, new_key.dtype), new_key], dim=-2)[:, :, -max_text_tokens:, :].detach()
@@ -981,22 +767,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
     @auto_docstring
     def get_video_features(self, pixel_values_videos: torch.FloatTensor, video_grid_thw: torch.LongTensor | None = None, **kwargs: Unpack[TransformersKwargs]):
-        r"""
-        pixel_values_videos (`torch.FloatTensor` of shape `(sum(raw_video_patches), patch_volume)`):
-            Packed flattened raw video patches across the whole batch.
-        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-            The per-video `(T, H, W)` grid in LLM token space.
-        """
         return self.model.get_video_features(pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thw, **kwargs)
 
     @auto_docstring
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None, **kwargs: Unpack[TransformersKwargs]):
-        r"""
-        pixel_values (`torch.FloatTensor` of shape `(sum(raw_image_patches), patch_volume)`):
-            Packed flattened raw image patches across the whole batch.
-        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
-            The per-image `(T, H, W)` grid in LLM token space.
-        """
         return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
     @can_return_tuple
@@ -1024,7 +798,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if self._imgslot_is_enabled() and not has_imgslot_prefill and past_key_values is None:
             self._reset_imgslot_runtime()
         # Decode path: refresh cached slot tokens before entering the decoder so the
-        # next token attends to the latest anchor/Top-K visual state.
+        # next token attends to the latest ImgSlot visual state.
         if self._imgslot_is_enabled() and past_key_values is not None:
             past_key_values = self._maybe_refresh_imgslot_cache(past_key_values)
 
@@ -1047,6 +821,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 inputs_embeds=inputs_embeds,
                 visual_pools=visual_pools,
                 image_grid_thw=image_grid_thw,
+                image_block_offsets=image_block_offsets,
                 labels=labels,
             )
             input_ids = None
@@ -1131,6 +906,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             model_inputs["attention_mask"] = attention_mask
             model_inputs["pixel_values"] = pixel_values
             model_inputs["image_grid_thw"] = image_grid_thw
+            model_inputs["image_block_offsets"] = image_block_offsets
             model_inputs["image_block_counts"] = image_block_counts
             model_inputs["mm_token_type_ids"] = mm_token_type_ids
             model_inputs["imgslot_first_prefill"] = True
@@ -1171,9 +947,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         position_ids = torch.cat([text_positions, vision_positions], dim=0)
         return position_ids
 
-    def _get_image_nums_and_video_nums(self, input_ids: torch.LongTensor | None, inputs_embeds: torch.Tensor | None = None):
-        return super()._get_image_nums_and_video_nums(input_ids=input_ids, inputs_embeds=inputs_embeds)
-
     def _reorder_cache(self, past_key_values, beam_idx):
         if not hasattr(past_key_values, "reorder_cache"):
             raise TypeError("past_key_values does not support reorder_cache required for beam search.")
@@ -1193,6 +966,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     def _expand_inputs_for_generation(self, expand_size: int = 1, is_encoder_decoder: bool = False, input_ids: torch.LongTensor | None = None, **model_kwargs):
         pixel_values = model_kwargs.pop("pixel_values", None)
         image_grid_thw = model_kwargs.pop("image_grid_thw", None)
+        image_block_offsets = model_kwargs.pop("image_block_offsets", None)
         image_block_counts = model_kwargs.pop("image_block_counts", None)
         input_ids, model_kwargs = super()._expand_inputs_for_generation(
             expand_size=expand_size,
@@ -1200,9 +974,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             **model_kwargs,
         )
-        pixel_values, image_grid_thw, image_block_counts = self._expand_imgslot_packed_images(
+        pixel_values, image_grid_thw, image_block_offsets, image_block_counts = self._expand_imgslot_packed_images(
             pixel_values,
             image_grid_thw,
+            image_block_offsets,
             image_block_counts,
             expand_size,
         )
@@ -1210,6 +985,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             model_kwargs["pixel_values"] = pixel_values
         if image_grid_thw is not None:
             model_kwargs["image_grid_thw"] = image_grid_thw
+        if image_block_offsets is not None:
+            model_kwargs["image_block_offsets"] = image_block_offsets
         if image_block_counts is not None:
             model_kwargs["image_block_counts"] = image_block_counts
         self._expand_imgslot_runtime(expand_size)
