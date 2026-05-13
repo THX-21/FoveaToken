@@ -6,7 +6,6 @@ from torch import nn
 from torch.nn import init
 
 from .modeling_qwen3_5 import (
-    ALL_ATTENTION_FUNCTIONS,
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5Model,
     Qwen3_5PreTrainedModel,
@@ -61,7 +60,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             nn.Linear(hidden_size * 4, hidden_size),
         )
         self.imgslot_ffn_norm = nn.LayerNorm(hidden_size)
-        self.imgslot_visual_norm = nn.LayerNorm(hidden_size)
         # Runtime state used only during generation refresh.
         # states: list[batch] -> list[visual_block_state]
         # text_keys/text_values: per-sample cached text KV, each shaped
@@ -73,7 +71,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
     def _imgslot_init_groups(self):
         linears = [getattr(self, f"imgslot_{p}_{n}_proj") for p in ("text", "img") for n in ("q", "k", "v", "o")]
-        return linears + [self.imgslot_ffn[0], self.imgslot_ffn[2]], [getattr(self, f"imgslot_{p}_{n}_norm") for p in ("text", "img") for n in ("q", "k")], [self.imgslot_attn_norm, self.imgslot_ffn_norm, self.imgslot_visual_norm]
+        return linears + [self.imgslot_ffn[0], self.imgslot_ffn[2]], [getattr(self, f"imgslot_{p}_{n}_norm") for p in ("text", "img") for n in ("q", "k")], [self.imgslot_attn_norm, self.imgslot_ffn_norm]
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
@@ -330,12 +328,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             )
             attention_mask = attention_mask.masked_fill(mask[:, None, None, :], 0)
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config.text_config._attn_implementation,
-            eager_attention_forward,
-        )
-        use_eager_attention = attention_interface is eager_attention_forward
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = eager_attention_forward(
             self,
             query_states,
             key_states,
@@ -345,19 +338,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             scaling=self.imgslot_scaling,
             is_causal=False,
         )
-        if attn_weights is None:
-            attn_output, attn_weights = eager_attention_forward(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                dropout=0.0 if not self.training else self.imgslot_attention_dropout,
-                scaling=self.imgslot_scaling,
-                is_causal=False,
-            )
-        elif not use_eager_attention:
-            attn_output = attn_output.to(query_states.dtype)
         context = attn_output.reshape(block_count, slot_seq, hidden_dim).contiguous()
         context = (context * torch.sigmoid(gate)).to(anchor_tokens.dtype)
         updated_anchor_tokens = self.imgslot_attn_norm(anchor_tokens + o_proj(context))
