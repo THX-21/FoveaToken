@@ -96,7 +96,6 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         "imgslot_attn_norm",
         "imgslot_ffn",
         "imgslot_ffn_norm",
-        "imgslot_visual_norm",
     ]
     target_modules = [
         "q_proj",
