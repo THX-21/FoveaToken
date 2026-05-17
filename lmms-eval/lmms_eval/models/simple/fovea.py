@@ -18,6 +18,14 @@ from fovea_token.train.data import VisionPacker
 from fovea_token.tokenizers.tokenization_visual_query import add_visual_query_tokens, sync_visual_query_token_ids
 
 
+MODEL_WEIGHT_FILENAMES = {
+    "pytorch_model.bin",
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+}
+
+
 class LocalVisionImageProcessor(ImageProcessingMixin):
     """Small image processor wrapper around the local Qwen3.5 vision packer."""
 
@@ -64,6 +72,37 @@ class Fovea(Qwen3_VL):
             return "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
         return "float32"
 
+    @staticmethod
+    def _as_local_path(path: Optional[str]) -> Optional[Path]:
+        if not path:
+            return None
+        candidate = Path(path).expanduser()
+        return candidate if candidate.exists() else None
+
+    @classmethod
+    def _is_peft_adapter_dir(cls, path: Optional[str]) -> bool:
+        candidate = cls._as_local_path(path)
+        return bool(candidate and (candidate / "adapter_config.json").exists())
+
+    @classmethod
+    def _is_full_checkpoint_dir(cls, path: Optional[str]) -> bool:
+        candidate = cls._as_local_path(path)
+        if not candidate or not candidate.is_dir() or not (candidate / "config.json").exists():
+            return False
+        return any((candidate / filename).exists() for filename in MODEL_WEIGHT_FILENAMES)
+
+    @classmethod
+    def _resolve_checkpoint_sources(cls, pretrained: str, peft: Optional[str]) -> tuple[str, Optional[str], str]:
+        if peft is not None:
+            return pretrained, peft, "peft"
+        if cls._is_peft_adapter_dir(pretrained):
+            raise ValueError(
+                "`pretrained` points to a PEFT adapter directory. Pass the base model as `pretrained` and the adapter path as `peft`."
+            )
+        if cls._is_full_checkpoint_dir(pretrained):
+            return pretrained, None, "full"
+        return pretrained, None, "base"
+
     def __init__(
         self,
         pretrained: str = "Qwen/Qwen3.5-4B",
@@ -98,19 +137,22 @@ class Fovea(Qwen3_VL):
             self._device = torch.device(resolved_device)
             self.device_map = device_map if device_map else resolved_device
 
+        load_pretrained, load_peft, checkpoint_mode = self._resolve_checkpoint_sources(pretrained, peft)
+        eval_logger.info(f"Resolved Fovea checkpoint mode: {checkpoint_mode}")
         model_kwargs = {
             "torch_dtype": self._pick_torch_dtype(),
             "device_map": self.device_map,
         }
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
-        self._model = FoveaForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
-        if peft is not None:
+        self._model = FoveaForConditionalGeneration.from_pretrained(load_pretrained, **model_kwargs)
+        if load_peft is not None:
             from peft import PeftModel
 
-            self._load_deepspeed_trainables(peft)
-            self._model = PeftModel.from_pretrained(self._model, peft)
-        self._tokenizer = FoveaTokenizer.from_pretrained(pretrained)
+            self._load_deepspeed_trainables(load_peft)
+            self._model = PeftModel.from_pretrained(self._model, load_peft)
+        tokenizer_source = load_pretrained
+        self._tokenizer = FoveaTokenizer.from_pretrained(tokenizer_source)
         add_visual_query_tokens(self._tokenizer)
         if len(self._tokenizer) != self._model.get_input_embeddings().weight.shape[0]:
             self._model.resize_token_embeddings(len(self._tokenizer))

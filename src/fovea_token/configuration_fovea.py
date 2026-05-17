@@ -114,9 +114,6 @@ class FoveaConfig(PretrainedConfig):
     vision_end_token_id: int = 248054
     tie_word_embeddings: bool = False
     visual_codebook_size: int = 16384
-    visual_query_max_codes: int = 64
-    visual_query_max_queries: int = 4
-    visual_query_max_replay_tokens: int = 256
     visual_query_retrieve_tokens: int = 4096
     visual_query_lambda_align: float = 0.5
     visual_query_align_eps: float = 1e-6

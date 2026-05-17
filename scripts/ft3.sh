@@ -18,7 +18,7 @@ fi
 export WORLD_SIZE=$((NNODES * NUM_GPUS))
 export RANK=0
 
-NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-3}"
+NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
 RUN_NAME="${FT3_RUN_NAME:-fovea-visual-query-replay}"
 DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr/data}"
 IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/vgr/llava_next_raw_format}"
@@ -90,7 +90,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --ibq_checkpoint "${IBQ_CHECKPOINT}" \
     --ibq_config "${IBQ_CONFIG}" \
     --visual_code_cache_dir "${FT3_VISUAL_CODE_CACHE_DIR:-${PROJECT_ROOT}/data/vgr/.visual_code_cache}" \
-    --lora_enable true \
+    --lora_enable false \
     --lora_r 64 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
@@ -107,9 +107,10 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --save_strategy steps \
     --save_steps "${SAVE_STEPS}" \
     --save_total_limit 2 \
-    --learning_rate 5e-6 \
+    --learning_rate 2e-5 \
+    --vision_tower_lr 2e-6 \
     --weight_decay 0.0 \
-    --warmup_ratio 0.1 \
+    --warmup_ratio 0.03 \
     --attn_implementation "${ATTN_IMPLEMENTATION}" \
     --lr_scheduler_type cosine \
     --logging_steps 1 \

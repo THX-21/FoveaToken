@@ -5,6 +5,8 @@ from typing import Optional
 import torch
 import transformers
 from transformers import HfArgumentParser, Trainer
+from transformers.trainer_pt_utils import get_parameter_names
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
 from fovea_token import FoveaForConditionalGeneration, FoveaTokenizer
 from fovea_token.tokenizers.tokenization_ibq import (
@@ -48,9 +50,13 @@ class TrainingArguments(transformers.TrainingArguments):
     model_max_length: int = field(default=32768)
     report_to: str | None = field(default="tensorboard")
     attn_implementation: str = field(default="sdpa")
+    vision_tower_lr: Optional[float] = field(default=None)
 
 
-def freeze_for_vision_plus_lora(model: FoveaForConditionalGeneration, unfreeze_vision: bool) -> None:
+def freeze_for_vision_plus_lora(model: FoveaForConditionalGeneration, unfreeze_vision: bool, lora_enable: bool) -> None:
+    if not lora_enable:
+        model.requires_grad_(True)
+        return
     model.requires_grad_(False)
     if unfreeze_vision:
         get_visual_module(model).requires_grad_(True)
@@ -173,63 +179,33 @@ def print_loading_summary(model, loading_info: dict) -> None:
 
 
 def print_parameter_summary(model) -> None:
-    """Print all parameters and split them by trainability / LoRA ownership."""
-
-    all_params = []
-    trainable_params = []
-    frozen_params = []
-    lora_params = []
-
     total_numel = 0
     trainable_numel = 0
     frozen_numel = 0
     lora_numel = 0
+    trainable_names: list[str] = []
 
     for name, param in model.named_parameters():
         numel = param.numel()
-        shape = tuple(param.shape)
-        dtype = str(param.dtype)
-        device = str(param.device)
-        requires_grad = bool(param.requires_grad)
-        line = (
-            f"{name} | shape={shape} | numel={numel} | dtype={dtype} | "
-            f"device={device} | trainable={requires_grad}"
-        )
-        all_params.append(line)
         total_numel += numel
-
-        if requires_grad:
-            trainable_params.append(line)
+        if param.requires_grad:
             trainable_numel += numel
+            trainable_names.append(name)
         else:
-            frozen_params.append(line)
             frozen_numel += numel
-
         if "lora_" in name.lower():
-            lora_params.append(line)
             lora_numel += numel
 
+    trainable_ratio = (trainable_numel / total_numel) if total_numel else 0.0
     print("=== Parameter Summary ===")
     print(f"total_parameters: {total_numel}")
     print(f"trainable_parameters: {trainable_numel}")
     print(f"frozen_parameters: {frozen_numel}")
+    print(f"trainable_ratio: {trainable_ratio:.6f}")
     print(f"lora_parameters: {lora_numel}")
-
-    print("=== All Parameters ===")
-    for line in all_params:
-        print(line)
-
-    print("=== Trainable Parameters ===")
-    for line in trainable_params:
-        print(line)
-
-    print("=== Frozen Parameters ===")
-    for line in frozen_params:
-        print(line)
-
-    print("=== LoRA Parameters ===")
-    for line in lora_params:
-        print(line)
+    print("=== Trainable Parameter Names ===")
+    for name in trainable_names:
+        print(name)
 
 
 def sync_tokenizer_special_tokens_with_model(tokenizer: FoveaTokenizer, model: FoveaForConditionalGeneration) -> None:
@@ -260,6 +236,47 @@ def sync_tokenizer_special_tokens_with_model(tokenizer: FoveaTokenizer, model: F
         model.generation_config.bos_token_id = getattr(model.config, "bos_token_id", None)
         model.generation_config.eos_token_id = getattr(model.config, "eos_token_id", None)
         model.generation_config.pad_token_id = getattr(model.config, "pad_token_id", None)
+
+
+class FT3Trainer(Trainer):
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+
+        vision_tower_lr = self.args.vision_tower_lr
+        if vision_tower_lr is None:
+            return super().create_optimizer()
+
+        decay_parameter_names = set(get_parameter_names(self.model, ALL_LAYERNORM_LAYERS))
+        decay_parameter_names = {name for name in decay_parameter_names if not name.endswith("bias")}
+        vision_module = get_visual_module(self.model)
+        vision_param_ids = {id(param) for param in vision_module.parameters() if param.requires_grad}
+
+        optimizer_grouped_parameters = [
+            {"params": [], "weight_decay": self.args.weight_decay, "lr": self.args.learning_rate},
+            {"params": [], "weight_decay": 0.0, "lr": self.args.learning_rate},
+            {"params": [], "weight_decay": self.args.weight_decay, "lr": vision_tower_lr},
+            {"params": [], "weight_decay": 0.0, "lr": vision_tower_lr},
+        ]
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_vision = id(param) in vision_param_ids
+            uses_decay = name in decay_parameter_names
+            if is_vision and uses_decay:
+                optimizer_grouped_parameters[2]["params"].append(param)
+            elif is_vision:
+                optimizer_grouped_parameters[3]["params"].append(param)
+            elif uses_decay:
+                optimizer_grouped_parameters[0]["params"].append(param)
+            else:
+                optimizer_grouped_parameters[1]["params"].append(param)
+
+        optimizer_grouped_parameters = [group for group in optimizer_grouped_parameters if group["params"]]
+        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args, self.model)
+        self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+        return self.optimizer
 
 
 class StopAtStepCallback(transformers.TrainerCallback):
@@ -337,13 +354,13 @@ def main() -> None:
     if training_args.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 
-    freeze_for_vision_plus_lora(model, unfreeze_vision=model_args.unfreeze_vision)
+    freeze_for_vision_plus_lora(model, unfreeze_vision=model_args.unfreeze_vision, lora_enable=model_args.lora_enable)
     model = maybe_enable_lora(model, model_args)
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     if model_args.unfreeze_vision:
         get_visual_module(model).requires_grad_(True)
     unfreeze_visual_query_parameters(model)
-    # print_parameter_summary(model)
+    print_parameter_summary(model)
 
     vision_packer = VisionPacker(
         vision_config=model.config.vision_config,
@@ -371,7 +388,7 @@ def main() -> None:
         model_max_length=training_args.model_max_length,
     )
 
-    trainer = Trainer(
+    trainer = FT3Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
