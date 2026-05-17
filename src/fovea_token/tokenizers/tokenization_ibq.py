@@ -8,6 +8,7 @@ project-local SEED-Voken checkout under `src/fovea_token/models/Open-MAGVIT2`.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -147,6 +148,9 @@ class IBQCodec:
         config = OmegaConf.load(self.config_path)
         init_args = OmegaConf.to_container(config.model.init_args, resolve=True)
         init_args["lossconfig"] = {"target": "torch.nn.Identity"}
+        valid_params = set(inspect.signature(IBQ.__init__).parameters)
+        valid_params.discard("self")
+        init_args = {key: value for key, value in init_args.items() if key in valid_params}
         model = IBQ(**init_args)
         state = torch.load(self.checkpoint, map_location="cpu")
         state_dict = state["state_dict"] if isinstance(state, dict) and "state_dict" in state else state

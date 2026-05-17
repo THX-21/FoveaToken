@@ -111,9 +111,9 @@ def replace_vgr_regions_with_visual_queries(
         box = parse_vgr_box(match.group(1))
         codes = visual_codec.encode_crop(image_path, box)
         code_tokens = " ".join(vis_token(code) for code in codes)
-        replay = " ".join(REPLAY_TOKEN for _ in codes)
+        replay = "".join(REPLAY_TOKEN for _ in codes)
         queries.append({"box": box, "codes": codes})
-        return f"{VQ_START_TOKEN} {code_tokens} {VQ_END_TOKEN} {replay}"
+        return f"{VQ_START_TOKEN} {code_tokens} {VQ_END_TOKEN}{replay}"
 
     return SOT_EOT_IMAGE_RE.sub(replace, text), queries
 

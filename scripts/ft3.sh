@@ -20,8 +20,8 @@ export RANK=0
 
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-3}"
 RUN_NAME="${FT3_RUN_NAME:-fovea-visual-query-replay}"
-DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr}"
-IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/llava_next_raw_format}"
+DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr/data}"
+IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/vgr/llava_next_raw_format}"
 CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
 IBQ_REPO="${FT3_IBQ_REPO:-${PROJECT_ROOT}/src/fovea_token/models/Open-MAGVIT2}"
 IBQ_CHECKPOINT="${FT3_IBQ_CHECKPOINT:-${PROJECT_ROOT}/src/fovea_token/models/Open-MAGVIT2/IBQ_pretrain_16384.ckpt}"
@@ -101,8 +101,8 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
     --max_steps "${MAX_STEPS}" \
-    --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 4 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 8 \
     --eval_strategy no \
     --save_strategy steps \
     --save_steps "${SAVE_STEPS}" \
@@ -115,7 +115,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --logging_steps 1 \
     --model_max_length 32768 \
     --gradient_checkpointing true \
-    --dataloader_num_workers 4 \
+    --dataloader_num_workers "${FT3_DATALOADER_NUM_WORKERS:-0}" \
     --report_to tensorboard \
     --remove_unused_columns false \
     --logging_nan_inf_filter false \

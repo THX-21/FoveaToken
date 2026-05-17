@@ -26,8 +26,8 @@ FoveaToken 基于 Qwen3.5 多模态实现，新增逻辑集中在：
 训练数据只使用 VGR parquet：
 
 ```text
-data/vgr/vgr_shortcot.parquet
-data/vgr/vgr_longcot.parquet
+data/vgr/data/vgr_shortcot.parquet
+data/vgr/data/vgr_longcot.parquet
 ```
 
 VGR 中的：
@@ -52,7 +52,7 @@ VGR 中的：
 src/fovea_token/models/Open-MAGVIT2
 src/fovea_token/models/Open-MAGVIT2/configs/IBQ/gpu/pretrain_ibqgan_16384.yaml
 src/fovea_token/models/Open-MAGVIT2/IBQ_pretrain_16384.ckpt
-data/llava_next_raw_format
+data/vgr/llava_next_raw_format
 ```
 
 需要换路径时，通过训练参数 `--ibq_repo`、`--ibq_config`、`--ibq_checkpoint`、`--image_folder` 显式传入。IBQ 必须是真实本地 16384 checkpoint，不使用伪码。
@@ -89,4 +89,5 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 - 不要恢复旧视觉 slot 路径。
 - 不要添加 JSON SFT 兼容读取。
 - 不要在 `modeling_qwen3_5.py` 里加入 Fovea retrieval 逻辑。
+- `FoveaForConditionalGeneration` 的 `visual_query_*` 是 base checkpoint 中不存在的新参数；`__init__()` 里的显式初始化不够，`from_pretrained()` 返回前还需要再次检查这些新增 projection 权重是否变成全 0 或非 finite，并只修复异常权重。
 - 修改 token、训练脚本、保存模块或数据字段时，同步更新 `README.md` 和本文件。

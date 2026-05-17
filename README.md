@@ -26,7 +26,7 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 src/fovea_token/models/Open-MAGVIT2
 src/fovea_token/models/Open-MAGVIT2/configs/IBQ/gpu/pretrain_ibqgan_16384.yaml
 src/fovea_token/models/Open-MAGVIT2/IBQ_pretrain_16384.ckpt
-data/llava_next_raw_format
+data/vgr/llava_next_raw_format
 ```
 
 也可以在训练命令中显式传入：
@@ -46,11 +46,11 @@ data/llava_next_raw_format
 bash scripts/ft3.sh
 ```
 
-默认数据路径是 `data/vgr`，会合并：
+默认数据路径是 `data/vgr/data`，会合并：
 
 ```text
-data/vgr/vgr_shortcot.parquet
-data/vgr/vgr_longcot.parquet
+data/vgr/data/vgr_shortcot.parquet
+data/vgr/data/vgr_longcot.parquet
 ```
 
 常用环境变量：
@@ -67,6 +67,9 @@ data/vgr/vgr_longcot.parquet
 - `FT3_GENERATED_REPLAY_PROB`
 - `FT3_RETRIEVE_MAX_IMAGE_TOKENS`
 - `FT3_VISUAL_CODE_CACHE_DIR`
+- `FT3_DATALOADER_NUM_WORKERS`
+
+注意：当前 VGR 训练会在取样阶段调用本地 IBQ codec 编码 crop。默认使用 `FT3_DATALOADER_NUM_WORKERS=0`，避免 DataLoader worker 中初始化 CUDA 导致失败。
 
 ## 数据转换
 

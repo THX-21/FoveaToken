@@ -8,6 +8,7 @@ second decoder pass.
 
 import torch
 from torch import nn
+from torch.nn import init
 
 from .configuration_fovea import FoveaConfig
 from .modeling_qwen3_5 import (
@@ -51,12 +52,56 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         self.visual_query_k_norm = Qwen3_5RMSNorm(self.visual_query_head_dim, eps=config.text_config.rms_norm_eps)
         self._visual_query_aux: dict[str, torch.Tensor] = {}
         self.post_init()
+        self._init_visual_query_modules()
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        output_loading_info = bool(kwargs.get("output_loading_info", False))
+        loaded = super().from_pretrained(*args, **kwargs)
+        if output_loading_info:
+            model, loading_info = loaded
+            model._repair_visual_query_init()
+            return model, loading_info
+        loaded._repair_visual_query_init()
+        return loaded
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
         self.model.set_input_embeddings(value)
+
+    @torch.no_grad()
+    def _init_visual_query_modules(self) -> None:
+        std = float(getattr(self.config.text_config, "initializer_range", 0.02))
+        for module in (
+            self.visual_query_q_proj,
+            self.visual_query_k_proj,
+            self.visual_query_v_proj,
+            self.visual_query_o_proj,
+        ):
+            init.normal_(module.weight, mean=0.0, std=std)
+        init.zeros_(self.visual_query_q_norm.weight)
+        init.zeros_(self.visual_query_k_norm.weight)
+
+    @torch.no_grad()
+    def _repair_visual_query_init(self) -> None:
+        """Repair missing visual-query params after checkpoint loading."""
+
+        std = float(getattr(self.config.text_config, "initializer_range", 0.02))
+        for module in (
+            self.visual_query_q_proj,
+            self.visual_query_k_proj,
+            self.visual_query_v_proj,
+            self.visual_query_o_proj,
+        ):
+            weight = module.weight
+            if torch.isfinite(weight).all() and weight.float().std() > 0:
+                continue
+            init.normal_(weight, mean=0.0, std=std)
+        for module in (self.visual_query_q_norm, self.visual_query_k_norm):
+            if not torch.isfinite(module.weight).all():
+                init.zeros_(module.weight)
 
     @auto_docstring
     def get_video_features(self, pixel_values_videos: torch.FloatTensor, video_grid_thw: torch.LongTensor | None = None, **kwargs: Unpack[TransformersKwargs]):
@@ -259,7 +304,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             & mask_for_code
         )
         align_loss = -((attn_mean * inside.to(attn_mean.dtype)).sum(dim=-1).clamp_min(float(self.config.visual_query_align_eps)).log()).mean()
-        soft_xy = torch.matmul(attn_mean.float(), centers.float())
+        soft_xy = (attn_mean.float().unsqueeze(-1) * centers.float()).sum(dim=1)
         scale = max(memory.shape[1] ** 0.5, 1.0)
         replay_offsets = torch.stack([soft_xy[:, 1] * scale, soft_xy[:, 0] * scale], dim=-1)
         return {
@@ -297,16 +342,18 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                     pos[:, batch_idx, first_token + 1 :] -= extra_tokens
 
         replay_offsets = retrieval["offsets"].round().to(device=pos.device, dtype=pos.dtype)
-        base_pos = pos[:, batch_ids, token_ids].transpose(0, 1)
+        base_t = pos[0, batch_ids, token_ids]
+        base_h = pos[1, batch_ids, token_ids]
+        base_w = pos[2, batch_ids, token_ids]
         replay_visual_pos = torch.stack(
             [
-                base_pos[:, 0],
-                base_pos[:, 1] + replay_offsets[:, 0],
-                base_pos[:, 2] + replay_offsets[:, 1],
+                base_t,
+                base_h + replay_offsets[:, 0],
+                base_w + replay_offsets[:, 1],
             ],
-            dim=1,
+            dim=0,
         )
-        pos[:, batch_ids, token_ids] = replay_visual_pos.transpose(0, 1)
+        pos[:, batch_ids, token_ids] = replay_visual_pos
         return out, pos
 
     def _visual_query_forward(
