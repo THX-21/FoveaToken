@@ -4,14 +4,14 @@
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-RUN_NAME="${FT3_RUN_NAME:-fovea-ft3-imgslot}"
+RUN_NAME="${FT3_RUN_NAME:-fovea-visual-query-replay}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 STEP_INTERVAL="${TRAIN_EVAL_STEP_INTERVAL:-200}"
 SAVE_INTERVAL="${FT3_SAVE_STEPS:-200}"
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-3}"
 LOG_PREFIX="${TRAIN_EVAL_LOG_PREFIX:-fovea_xlrs_lite}"
-JSON_PATH="${FT3_JSON_PATH:-${PROJECT_ROOT}/data/ft3_whole_shuffle.json}"
-IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/jpg_images}"
+DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr}"
+IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/llava_next_raw_format}"
 CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
 BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen3.5-9B}"
 TASKS="${EVAL_TASKS:-xlrs-lite}"
@@ -56,7 +56,7 @@ while true; do
     echo "Training until global step ${target_step} or epoch ${NUM_TRAIN_EPOCHS} end..."
     FT3_RUN_NAME="${RUN_NAME}" \
     FT3_OUTPUT_DIR="${OUTPUT_DIR}" \
-    FT3_JSON_PATH="${JSON_PATH}" \
+    FT3_DATA_PATH="${DATA_PATH}" \
     FT3_IMAGE_FOLDER="${IMAGE_FOLDER}" \
     FT3_CKPT_PATH="${CKPT_PATH}" \
     FT3_SAVE_STEPS="${SAVE_INTERVAL}" \

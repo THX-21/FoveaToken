@@ -15,18 +15,17 @@ from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
 
 from qwen35_hf import FoveaForConditionalGeneration, FoveaTokenizer, FoveaProcessor
 from qwen35_hf.train.data import VisionPacker
+from qwen35_hf.visual_tokens import add_visual_query_tokens, sync_visual_query_token_ids
 
 
 class LocalVisionImageProcessor(ImageProcessingMixin):
     """Small image processor wrapper around the local Qwen3.5 vision packer."""
 
-    model_input_names = ["pixel_values", "image_grid_thw", "image_block_offsets"]
+    model_input_names = ["pixel_values", "image_grid_thw"]
 
     def __init__(self, vision_packer: VisionPacker) -> None:
         self.vision_packer = vision_packer
         self.merge_size = vision_packer.local_config.spatial_merge_size
-        self.img_slot_token_count = vision_packer.img_slot_token_count if vision_packer.img_slot_enable else None
-        self._last_image_block_counts = []
 
     def __call__(self, images=None, **kwargs):
         if images is None:
@@ -36,34 +35,14 @@ class LocalVisionImageProcessor(ImageProcessingMixin):
 
         pixel_values = []
         image_grid_thw = []
-        image_block_offsets = []
-        image_block_counts = []
-        for image_index, image in enumerate(images):
-            packed = self.vision_packer.pack(image)
-            if self.vision_packer.img_slot_enable:
-                packed_pixels, packed_grid, packed_offsets = packed
-                packed_offsets = packed_offsets.clone()
-                packed_offsets[:, 0] = image_index
-                image_block_offsets.extend(list(packed_offsets))
-            else:
-                packed_pixels, packed_grid = packed
+        for image in images:
+            packed_pixels, packed_grid = self.vision_packer.pack(image)
             pixel_values.append(packed_pixels)
-            if packed_grid.dim() == 1:
-                image_grid_thw.append(packed_grid)
-                image_block_counts.append(1)
-            else:
-                image_grid_thw.extend(list(packed_grid))
-                image_block_counts.append(int(packed_grid.shape[0]))
-
-        self._last_image_block_counts = image_block_counts
-
-        model_inputs = {
+            image_grid_thw.append(packed_grid)
+        return {
             "pixel_values": torch.cat(pixel_values, dim=0),
             "image_grid_thw": torch.stack(image_grid_thw, dim=0),
         }
-        if image_block_offsets:
-            model_inputs["image_block_offsets"] = torch.stack(image_block_offsets, dim=0)
-        return model_inputs
 
 
 class LocalNoOpVideoProcessor(BaseVideoProcessor):
@@ -99,12 +78,6 @@ class Fovea(Qwen3_VL):
         enable_thinking: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
         max_image_tokens: int | None = 128,
-        img_slot_enable: bool = True,
-        img_slot_k: int | None = None,
-        img_slot_delta: int | None = None,
-        img_slot_beta: float | None = None,
-        img_slot_lambda: float | None = None,
-        img_slot_tile_size: int | None = 1024,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -113,20 +86,6 @@ class Fovea(Qwen3_VL):
         valid_attn_implementations = [None, "flash_attention_2", "sdpa", "eager"]
         if attn_implementation not in valid_attn_implementations:
             raise ValueError(f"attn_implementation must be one of {valid_attn_implementations}, got {attn_implementation}")
-        if isinstance(img_slot_enable, str):
-            img_slot_enable = img_slot_enable.lower() in {"1", "true", "yes"}
-        if img_slot_k is not None:
-            img_slot_k = int(img_slot_k)
-        if img_slot_delta is not None:
-            img_slot_delta = int(img_slot_delta)
-        if img_slot_beta is not None:
-            img_slot_beta = float(img_slot_beta)
-        if img_slot_lambda is not None:
-            img_slot_lambda = float(img_slot_lambda)
-        if img_slot_enable and img_slot_tile_size is None:
-            raise ValueError("img_slot_tile_size is required when img_slot_enable=true.")
-        self.img_slot_enable = bool(img_slot_enable)
-
         accelerator = Accelerator()
         self.accelerator = accelerator
         if accelerator.num_processes > 1:
@@ -145,38 +104,21 @@ class Fovea(Qwen3_VL):
         }
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
-        if self.img_slot_enable:
-            model_kwargs["img_slot_enable"] = True
-        if img_slot_k is not None:
-            model_kwargs["img_slot_k"] = img_slot_k
-        if img_slot_delta is not None:
-            model_kwargs["img_slot_delta"] = img_slot_delta
-        if img_slot_beta is not None:
-            model_kwargs["img_slot_beta"] = img_slot_beta
-        if img_slot_lambda is not None:
-            model_kwargs["img_slot_lambda"] = img_slot_lambda
-        if img_slot_tile_size is not None:
-            model_kwargs["img_slot_tile_size"] = int(img_slot_tile_size)
-
         self._model = FoveaForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
-        self._model.config.img_slot_enable = self.img_slot_enable
-        if img_slot_tile_size is not None:
-            self._model.config.img_slot_tile_size = int(img_slot_tile_size)
-        config_img_slot_k = int(self._model.config.img_slot_k)
         if peft is not None:
             from peft import PeftModel
 
             self._load_deepspeed_trainables(peft)
             self._model = PeftModel.from_pretrained(self._model, peft)
-        self._model = self._model.eval()
-
         self._tokenizer = FoveaTokenizer.from_pretrained(pretrained)
+        add_visual_query_tokens(self._tokenizer)
+        if len(self._tokenizer) != self._model.get_input_embeddings().weight.shape[0]:
+            self._model.resize_token_embeddings(len(self._tokenizer))
+        sync_visual_query_token_ids(self._model.config, self._tokenizer)
+        self._model = self._model.eval()
         vision_packer = VisionPacker(
             vision_config=self._model.config.vision_config,
             max_image_tokens=max_image_tokens,
-            img_slot_enable=self.img_slot_enable,
-            img_slot_k=config_img_slot_k,
-            img_slot_tile_size=None if img_slot_tile_size is None else int(img_slot_tile_size),
         )
         self.processor = FoveaProcessor(
             image_processor=LocalVisionImageProcessor(vision_packer),
@@ -219,7 +161,7 @@ class Fovea(Qwen3_VL):
     def _load_deepspeed_trainables(self, checkpoint_path: str) -> None:
         """Load non-LoRA trainables saved in the Deepspeed checkpoint.
 
-        PEFT's adapter file contains LoRA and ImgSlot modules_to_save tensors.
+        PEFT's adapter file contains LoRA and visual-query modules_to_save tensors.
         The vision tower is still stored in Deepspeed's model state file under
         ``global_step*/mp_rank_00_model_states.pt``.
         """
@@ -284,7 +226,6 @@ class Fovea(Qwen3_VL):
         batched_messages = []
         image_inputs = []
         image_counts_per_sample = []
-        logical_image_placeholder = self.processor.build_visual_placeholder(1)
         for i, context in enumerate(contexts):
             if "<image>" in context:
                 context = context.replace("<image>", "")
@@ -304,36 +245,7 @@ class Fovea(Qwen3_VL):
                     if isinstance(visual, Image.Image):
                         processed_visuals.append({"type": "image", "image": visual})
 
-            if self.img_slot_enable:
-                sample_text = context
-                sample_image_count = len(processed_visuals)
-                if self.interleave_visuals:
-                    image_placeholders = re.findall(r"<image \d+>", context)
-                    text_parts = re.split(r"<image \d+>", context)
-                    sample_text = text_parts[0] if text_parts else ""
-                    ordered_images = []
-                    for placeholder_idx, placeholder in enumerate(image_placeholders):
-                        img_idx = int(re.search(r"<image (\d+)>", placeholder).group(1)) - 1
-                        image_idx = min(img_idx, len(processed_visuals) - 1) if processed_visuals else 0
-                        if processed_visuals and image_idx < len(processed_visuals):
-                            ordered_images.append(processed_visuals[image_idx]["image"])
-                            sample_text += logical_image_placeholder
-                        if placeholder_idx + 1 < len(text_parts):
-                            sample_text += text_parts[placeholder_idx + 1]
-                    image_inputs.extend(ordered_images)
-                    sample_image_count = len(ordered_images)
-                else:
-                    sample_text = logical_image_placeholder * sample_image_count + context
-                    image_inputs.extend(part["image"] for part in processed_visuals)
-
-                message.append(
-                    {
-                        "role": "user",
-                        "content": sample_text,
-                    }
-                )
-                image_counts_per_sample.append(sample_image_count)
-            elif self.interleave_visuals is False:
+            if self.interleave_visuals is False:
                 message.append(
                     {
                         "role": "user",
@@ -375,14 +287,11 @@ class Fovea(Qwen3_VL):
             "text": texts,
             "images": image_inputs or None,
             "image_counts_per_sample": image_counts_per_sample,
-            "return_mm_token_type_ids": not self.img_slot_enable,
+            "return_mm_token_type_ids": True,
             "return_tensors": "pt",
         }
         if self.batch_size > 1:
             processor_kwargs.update({"padding": True, "padding_side": "left"})
         inputs = self.processor(**processor_kwargs)
-        if self.img_slot_enable:
-            inputs.pop("mm_token_type_ids", None)
-            gen_kwargs = dict(gen_kwargs)
 
         return inputs, contexts, gen_kwargs, until

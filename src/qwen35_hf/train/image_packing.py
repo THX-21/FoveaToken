@@ -22,55 +22,12 @@ class VisionPackerConfig:
 
 
 @dataclass
-class ImageBlock:
-    """One crop plus its location in the budgeted full-image coordinate system."""
+class PackedImage:
+    """Packed Qwen vision inputs plus original-coordinate token boxes."""
 
-    image: Image.Image
-    row: int
-    col: int
-    rows: int
-    cols: int
-    left: int
-    top: int
-    right: int
-    bottom: int
-
-
-def split_image_into_blocks(image: Image.Image, tile_size: int) -> list[ImageBlock]:
-    """Split an image into non-overlapping, evenly sized blocks.
-
-    The number of blocks along each axis is `ceil(dim / tile_size)`. Boundaries
-    are then evenly spaced over the original image, so the last block is not a
-    small leftover strip. Returned block coordinates are in pixels of `image`.
-    """
-
-    if tile_size is None or tile_size <= 0:
-        raise ValueError("img_slot_tile_size must be a positive integer when ImgSlot is enabled.")
-
-    width, height = image.size
-    cols = max(1, math.ceil(width / tile_size))
-    rows = max(1, math.ceil(height / tile_size))
-    blocks: list[ImageBlock] = []
-    for row in range(rows):
-        top = round(row * height / rows)
-        bottom = round((row + 1) * height / rows)
-        for col in range(cols):
-            left = round(col * width / cols)
-            right = round((col + 1) * width / cols)
-            blocks.append(
-                ImageBlock(
-                    image=image.crop((left, top, right, bottom)),
-                    row=row,
-                    col=col,
-                    rows=rows,
-                    cols=cols,
-                    left=left,
-                    top=top,
-                    right=right,
-                    bottom=bottom,
-                )
-            )
-    return blocks
+    pixel_values: torch.Tensor
+    image_grid_thw: torch.LongTensor
+    patch_boxes: torch.Tensor
 
 
 def align_resolution(value: int, multiple: int) -> int:
@@ -190,6 +147,44 @@ def pack_single_image(
     )
     grid_thw = torch.tensor([1, grid_h, grid_w], dtype=torch.long)
     return patches, grid_thw
+
+
+def build_merged_patch_boxes(
+    image_width: int,
+    image_height: int,
+    grid_thw: torch.LongTensor,
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    """Return normalized boxes for merged visual tokens in image coordinates."""
+
+    _t, grid_h, grid_w = [int(v) for v in grid_thw.tolist()]
+    merge = max(int(spatial_merge_size), 1)
+    boxes: list[list[float]] = []
+    for h in range(0, grid_h, merge):
+        for w in range(0, grid_w, merge):
+            boxes.append(
+                [
+                    w / max(grid_w, 1),
+                    h / max(grid_h, 1),
+                    min(w + merge, grid_w) / max(grid_w, 1),
+                    min(h + merge, grid_h) / max(grid_h, 1),
+                ]
+            )
+    return torch.tensor(boxes, dtype=torch.float32)
+
+
+def pack_single_image_with_boxes(
+    image: Image.Image,
+    config: VisionPackerConfig,
+    max_image_tokens: int | None = None,
+) -> PackedImage:
+    """Pack one image and track each merged token's normalized box."""
+
+    image = resize_to_token_budget(image, config, max_image_tokens)
+    width, height = image.size
+    patches, grid_thw = pack_single_image(image, config, max_image_tokens=None)
+    patch_boxes = build_merged_patch_boxes(width, height, grid_thw, config.spatial_merge_size)
+    return PackedImage(pixel_values=patches, image_grid_thw=grid_thw, patch_boxes=patch_boxes)
 
 
 def default_processor_stats() -> tuple[tuple[float, float, float], tuple[float, float, float], float]:

@@ -7,6 +7,13 @@ import transformers
 from transformers import HfArgumentParser, Trainer
 
 from qwen35_hf import FoveaForConditionalGeneration, FoveaTokenizer
+from qwen35_hf.visual_codec import (
+    DEFAULT_MAGVIT2_CHECKPOINT,
+    DEFAULT_MAGVIT2_CONFIG,
+    DEFAULT_MAGVIT2_REPO,
+    OpenMAGVIT2Codec,
+)
+from qwen35_hf.query_tokens import add_visual_query_tokens, sync_visual_query_token_ids
 
 from .data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
 
@@ -19,7 +26,7 @@ class ModelArguments:
     lora_alpha: int = field(default=16)
     lora_dropout: float = field(default=0.05)
     unfreeze_vision: bool = field(default=True)
-    img_slot_enable: bool = field(default=True)
+    visual_query_generated_replay_prob: float = field(default=0.5)
 
 
 @dataclass
@@ -27,6 +34,11 @@ class DataArguments:
     data_path: str = field(default=None)
     image_folder: str = field(default=None)
     max_image_tokens: Optional[int] = field(default=None)
+    retrieve_max_image_tokens: Optional[int] = field(default=4096)
+    magvit2_repo: str = field(default=DEFAULT_MAGVIT2_REPO)
+    magvit2_checkpoint: str = field(default=DEFAULT_MAGVIT2_CHECKPOINT)
+    magvit2_config: str = field(default=DEFAULT_MAGVIT2_CONFIG)
+    visual_code_cache_dir: Optional[str] = field(default=None)
     system_message: str = field(default="You are a helpful assistant.")
 
 
@@ -44,11 +56,11 @@ def freeze_for_vision_plus_lora(model: FoveaForConditionalGeneration, unfreeze_v
         get_visual_module(model).requires_grad_(True)
 
 
-def unfreeze_imgslot_parameters(model) -> None:
-    """Keep ImgSlot trainable after the base model freeze."""
+def unfreeze_visual_query_parameters(model) -> None:
+    """Keep retrieval modules and new token embeddings trainable."""
 
     for name, param in model.named_parameters():
-        if "imgslot_" in name:
+        if "visual_query_" in name or "embed_tokens" in name or "lm_head" in name:
             param.requires_grad_(True)
 
 
@@ -79,23 +91,15 @@ def maybe_enable_lora(model, model_args: ModelArguments):
 
     from peft import LoraConfig, get_peft_model
 
-    imgslot_modules = [
-        "imgslot_a_tokens",
-        "imgslot_text_q_proj",
-        "imgslot_text_k_proj",
-        "imgslot_text_v_proj",
-        "imgslot_text_o_proj",
-        "imgslot_text_q_norm",
-        "imgslot_text_k_norm",
-        "imgslot_img_q_proj",
-        "imgslot_img_k_proj",
-        "imgslot_img_v_proj",
-        "imgslot_img_o_proj",
-        "imgslot_img_q_norm",
-        "imgslot_img_k_norm",
-        "imgslot_attn_norm",
-        "imgslot_ffn",
-        "imgslot_ffn_norm",
+    visual_query_modules = [
+        "visual_query_q_proj",
+        "visual_query_k_proj",
+        "visual_query_v_proj",
+        "visual_query_o_proj",
+        "visual_query_q_norm",
+        "visual_query_k_norm",
+        "embed_tokens",
+        "lm_head",
     ]
     target_modules = [
         "q_proj",
@@ -118,8 +122,8 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=target_modules,
-        exclude_modules=imgslot_modules if model_args.img_slot_enable else None,
-        modules_to_save=imgslot_modules if model_args.img_slot_enable else None,
+        exclude_modules=visual_query_modules,
+        modules_to_save=visual_query_modules,
     )
     model = get_peft_model(model, lora_config)
     return model
@@ -278,19 +282,16 @@ class StopAtStepCallback(transformers.TrainerCallback):
         return control
 
 
-class ImgSlotMetricsCallback(transformers.TrainerCallback):
-    """Publish ImgSlot auxiliary metrics into Trainer logs when available."""
+class VisualQueryMetricsCallback(transformers.TrainerCallback):
+    """Publish visual-query auxiliary metrics into Trainer logs."""
 
     def on_log(self, _args, state, control, model=None, logs=None, **_kwargs):
-        if model is None or logs is None or not hasattr(model, "_imgslot_aux"):
+        if model is None or logs is None or not hasattr(model, "_visual_query_aux"):
             return control
-        aux = getattr(model, "_imgslot_aux", None)
+        aux = getattr(model, "_visual_query_aux", None)
         if not isinstance(aux, dict):
             return control
-        for key in (
-            "attention_entropy",
-            "num_blocks",
-        ):
+        for key in ("lm_loss", "align_loss", "generated_replay", "num_queries"):
             value = aux.get(key)
             if value is None:
                 continue
@@ -300,7 +301,7 @@ class ImgSlotMetricsCallback(transformers.TrainerCallback):
                 continue
             if hasattr(value, "item"):
                 value = value.item()
-            logs[f"imgslot/{key}"] = value
+            logs[f"visual_query/{key}"] = value
         return control
 
 
@@ -314,12 +315,17 @@ def main() -> None:
         model_max_length=training_args.model_max_length,
         padding_side="right",
     )
+    add_visual_query_tokens(tokenizer)
     model, loading_info = FoveaForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
         torch_dtype="auto",
         attn_implementation=training_args.attn_implementation,
         output_loading_info=True,
     )
+    if len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
+        model.resize_token_embeddings(len(tokenizer))
+    model.config.visual_query_generated_replay_prob = float(model_args.visual_query_generated_replay_prob)
+    sync_visual_query_token_ids(model.config, tokenizer)
     print_loading_summary(model, loading_info)
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     if tokenizer.pad_token is None:
@@ -327,8 +333,6 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or 0
 
-    if model_args.img_slot_enable and model.config.img_slot_tile_size is None:
-        raise ValueError("ImgSlot config requires img_slot_tile_size when enabled.")
     model.config.use_cache = False
     if training_args.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
@@ -338,16 +342,18 @@ def main() -> None:
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     if model_args.unfreeze_vision:
         get_visual_module(model).requires_grad_(True)
-    if model_args.img_slot_enable:
-        unfreeze_imgslot_parameters(model)
+    unfreeze_visual_query_parameters(model)
     # print_parameter_summary(model)
 
     vision_packer = VisionPacker(
         vision_config=model.config.vision_config,
         max_image_tokens=data_args.max_image_tokens,
-        img_slot_enable=model_args.img_slot_enable,
-        img_slot_k=model.config.img_slot_k,
-        img_slot_tile_size=model.config.img_slot_tile_size,
+    )
+    visual_codec = OpenMAGVIT2Codec.from_paths(
+        repo=data_args.magvit2_repo,
+        checkpoint=data_args.magvit2_checkpoint,
+        config=data_args.magvit2_config,
+        cache_dir=data_args.visual_code_cache_dir,
     )
 
     train_dataset = LazySupervisedDataset(
@@ -357,7 +363,8 @@ def main() -> None:
         vision_packer=vision_packer,
         image_token_id=model.config.image_token_id,
         system_message=data_args.system_message,
-        img_slot_enable=model_args.img_slot_enable,
+        visual_codec=visual_codec,
+        retrieve_max_image_tokens=data_args.retrieve_max_image_tokens,
     )
     data_collator = DataCollatorForQwen3_5SFT(
         tokenizer=tokenizer,
@@ -370,7 +377,7 @@ def main() -> None:
         train_dataset=train_dataset,
         data_collator=data_collator,
         processing_class=tokenizer,
-        callbacks=[StopAtStepCallback, ImgSlotMetricsCallback],
+        callbacks=[StopAtStepCallback, VisualQueryMetricsCallback],
     )
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_state()

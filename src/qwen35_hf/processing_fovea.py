@@ -1,7 +1,4 @@
-from typing import Any
-
 import numpy as np
-import torch
 
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessorMixin
@@ -72,13 +69,7 @@ class FoveaProcessor(ProcessorMixin):
             grids = [image_grid_thw]
         else:
             grids = list(image_grid_thw)
-        img_slot_token_count = getattr(self.image_processor, "img_slot_token_count", None)
-        if img_slot_token_count is not None:
-            return [int(img_slot_token_count) for _ in grids]
         return [image_token_count_from_grid(grid, self.image_processor.merge_size) for grid in grids]
-
-    def uses_imgslot_placeholders(self) -> bool:
-        return getattr(self.image_processor, "img_slot_token_count", None) is not None
 
     def build_visual_placeholder(self, num_image_tokens: int) -> str:
         return build_visual_placeholder(
@@ -88,56 +79,31 @@ class FoveaProcessor(ProcessorMixin):
             vision_end_token=self.vision_end_token,
         )
 
-    def expand_image_pad_tokens(self, text: list[str], image_grid_thw, image_block_counts=None) -> list[str]:
+    def expand_image_pad_tokens(self, text: list[str], image_grid_thw) -> list[str]:
         image_token_counts = self.image_token_counts_from_grids(image_grid_thw)
         index = 0
-        image_index = 0
         output = text.copy()
 
-        def take_block_counts() -> list[int]:
-            nonlocal index, image_index
+        def take_count() -> int:
+            nonlocal index
             if index >= len(image_token_counts):
                 raise ValueError("Text contains more image placeholders than image_grid_thw entries.")
-            block_count = 1
-            if image_block_counts is not None:
-                if image_index >= len(image_block_counts):
-                    raise ValueError("Text contains more image placeholders than image block metadata entries.")
-                block_count = int(image_block_counts[image_index])
-            block_counts = image_token_counts[index : index + block_count]
-            if len(block_counts) != block_count:
-                raise ValueError("image_grid_thw contains fewer blocks than expected for image placeholder.")
-            index += block_count
-            image_index += 1
-            return block_counts
+            count = image_token_counts[index]
+            index += 1
+            return count
 
         for i in range(len(output)):
             full_placeholder = f"{self.vision_start_token}{self.image_token}{self.vision_end_token}"
             while full_placeholder in output[i]:
-                block_counts = take_block_counts()
-                replacement = "".join(
-                    build_visual_placeholder(
-                        count,
-                        image_token="<|placeholder|>",
-                        vision_start_token=self.vision_start_token,
-                        vision_end_token=self.vision_end_token,
-                    )
-                    for count in block_counts
+                replacement = build_visual_placeholder(
+                    take_count(),
+                    image_token="<|placeholder|>",
+                    vision_start_token=self.vision_start_token,
+                    vision_end_token=self.vision_end_token,
                 )
                 output[i] = output[i].replace(full_placeholder, replacement, 1)
             while self.image_token in output[i]:
-                block_counts = take_block_counts()
-                if len(block_counts) == 1:
-                    replacement = "<|placeholder|>" * block_counts[0]
-                else:
-                    replacement = "".join(
-                        build_visual_placeholder(
-                            count,
-                            image_token="<|placeholder|>",
-                            vision_start_token=self.vision_start_token,
-                            vision_end_token=self.vision_end_token,
-                        )
-                        for count in block_counts
-                    )
+                replacement = "<|placeholder|>" * take_count()
                 output[i] = output[i].replace(self.image_token, replacement, 1)
             output[i] = output[i].replace("<|placeholder|>", self.image_token)
         if index != len(image_token_counts):
@@ -146,38 +112,6 @@ class FoveaProcessor(ProcessorMixin):
 
     def build_mm_token_type_ids(self, input_ids):
         return build_mm_token_type_ids(input_ids, self.image_token_id, self.video_token_id)
-
-    def _normalize_image_counts_per_sample(self, images, image_counts_per_sample):
-        if image_counts_per_sample is not None:
-            return image_counts_per_sample
-        if not isinstance(images, list):
-            images = [images]
-        return [len(sample_images) if isinstance(sample_images, (list, tuple)) else 1 for sample_images in images]
-
-    def _group_image_block_counts(self, flat_image_block_counts, image_counts_per_sample):
-        if flat_image_block_counts is None:
-            return None
-        grouped_image_block_counts = []
-        flat_index = 0
-        for num_images in image_counts_per_sample:
-            sample_counts = flat_image_block_counts[flat_index : flat_index + num_images]
-            if len(sample_counts) != num_images:
-                raise ValueError("Image block metadata does not align with per-sample image grouping.")
-            grouped_image_block_counts.append(sample_counts)
-            flat_index += num_images
-        if flat_index != len(flat_image_block_counts):
-            raise ValueError("Image block metadata contains extra entries after per-sample grouping.")
-        return grouped_image_block_counts
-
-    def _tensorize_grouped_image_block_counts(self, grouped_image_block_counts):
-        if grouped_image_block_counts is None:
-            return None
-        max_images = max((len(sample_counts) for sample_counts in grouped_image_block_counts), default=0)
-        padded_counts = [
-            list(sample_counts) + [0] * (max_images - len(sample_counts))
-            for sample_counts in grouped_image_block_counts
-        ]
-        return torch.tensor(padded_counts, dtype=torch.long)
 
     def __call__(
         self,
@@ -188,7 +122,7 @@ class FoveaProcessor(ProcessorMixin):
         return_tensors=None,
         **kwargs,
     ) -> BatchFeature:
-        image_counts_per_sample = kwargs.pop("image_counts_per_sample", None)
+        kwargs.pop("image_counts_per_sample", None)
         if text is None:
             text = []
         if not isinstance(text, list):
@@ -197,42 +131,30 @@ class FoveaProcessor(ProcessorMixin):
 
         image_inputs = {}
         image_grid_thw = None
-        flat_image_block_counts = getattr(self.image_processor, "_last_image_block_counts", None)
-        grouped_image_block_counts = None
         if images is not None:
             image_inputs = self.image_processor(images=images, **kwargs)
             image_grid_thw = image_inputs["image_grid_thw"]
-            flat_image_block_counts = getattr(self.image_processor, "_last_image_block_counts", flat_image_block_counts)
-            image_counts_per_sample = self._normalize_image_counts_per_sample(images, image_counts_per_sample)
-            grouped_image_block_counts = self._group_image_block_counts(flat_image_block_counts, image_counts_per_sample)
 
         videos_inputs = {}
         if videos is not None and self.video_processor is not None:
             videos_inputs = self.video_processor(videos=videos, **kwargs)
 
         if image_grid_thw is not None:
-            text = self.expand_image_pad_tokens(text, image_grid_thw, flat_image_block_counts)
+            text = self.expand_image_pad_tokens(text, image_grid_thw)
 
         text_inputs = self.tokenizer(text, return_tensors=return_tensors, **kwargs)
 
-        if self.uses_imgslot_placeholders():
-            return_mm_token_type_ids = False
-        elif return_mm_token_type_ids is None:
+        if return_mm_token_type_ids is None:
             return_mm_token_type_ids = True
 
         if return_mm_token_type_ids:
             mm_token_type_ids = self.build_mm_token_type_ids(text_inputs["input_ids"])
             text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
 
-        image_block_counts = grouped_image_block_counts
-        if image_block_counts is not None and return_tensors is not None:
-            image_block_counts = self._tensorize_grouped_image_block_counts(image_block_counts)
-
         return BatchFeature(
             data={
                 **text_inputs,
                 **image_inputs,
-                **({"image_block_counts": image_block_counts} if image_block_counts is not None else {}),
                 **videos_inputs,
             },
             tensor_type=return_tensors,

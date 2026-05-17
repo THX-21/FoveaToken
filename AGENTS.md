@@ -1,78 +1,92 @@
-# AGENTS.md
+# FoveaToken 当前约定
 
-本文件面向 Claude Code 及其他 AI 编程助手。**修改代码后如果影响项目结构、脚本入口或使用约定，需同步更新本文档。**
+本仓库只保留 visual-query replay 机制，不保留历史机制、旧 JSON SFT 或旧 block span 兼容路径。
 
----
+## 机制
 
-## 项目结构
+FoveaToken 基于 Qwen3.5 多模态实现，新增逻辑集中在：
+
+- `src/qwen35_hf/modeling_fovea.py`
+- `src/qwen35_hf/train/data.py`
+- `src/qwen35_hf/visual_codec.py`
+- `src/qwen35_hf/query_tokens.py`
+
+核心数据流：
 
 ```text
-src/qwen35_hf/
-  __init__.py             # Fovea 公共 API 与 Qwen3_5 兼容别名
-  configuration_fovea.py  # Fovea / ImgSlot 配置
-  modeling_qwen3_5.py     # Qwen3.5 text / vision / backbone 基础实现
-  modeling_fovea.py       # FoveaForConditionalGeneration 与 ImgSlot 主逻辑
-  processing_fovea.py     # FoveaProcessor 与视觉 placeholder 展开
-  tokenization_fovea.py   # FoveaTokenizer
-  train/
-    sft.py                # 训练入口、LoRA、冻结策略、callback
-    data.py               # SFT 数据集、ChatML 编码、collator
-    image_packing.py      # 图像 resize / patch packing / block split
-
-scripts/
-  ft3.sh                  # LoRA + ImgSlot 训练脚本
-  eval.sh                 # Fovea LoRA 评测脚本
-  eval_qwen35.sh          # Qwen3.5 baseline 评测脚本
-  train_eval_loop.sh      # 分段训练并评测最新 checkpoint
-  zero2_tp2_gpu.json      # 当前训练默认使用的 DeepSpeed 配置
-
-lmms-eval/
-  lmms_eval/models/simple/fovea.py    # Fovea 自定义 lmms-eval adapter
-  lmms_eval/tasks/xlrs/XLRS-lite.yaml # 当前默认评测任务
+<vq> <vis_i> ... </vq>
+-> code hidden states
+-> packed multi-head retrieval over high-resolution visual memory
+-> replay vectors scattered into <|replay_pad|> positions
+-> observation / reasoning / final answer
 ```
 
----
+## 数据
 
-## 关键脚本摘要
+训练数据只使用 VGR parquet：
 
-### `scripts/ft3.sh`
-- 训练主入口：`torchrun -m qwen35_hf.train.sft`
-- 默认单机单卡，固定使用 `scripts/zero2_tp2_gpu.json`
-- 自动从输出目录查找最新 `checkpoint-*` 续训
-- 结构参数优先从 checkpoint / config 读取，脚本只透传训练期 loss 权重等调参项
-- 常用环境变量：`FT3_JSON_PATH`、`FT3_IMAGE_FOLDER`、`FT3_CKPT_PATH`、`FT3_OUTPUT_DIR`、`FT3_MAX_STEPS`、`FT3_NUM_TRAIN_EPOCHS`
+```text
+data/vgr/vgr_shortcot.parquet
+data/vgr/vgr_longcot.parquet
+```
 
-### `scripts/eval.sh`
-- Fovea LoRA 评测入口，走本地 `lmms-eval` 的 `fovea` adapter
-- 默认任务：`xlrs-lite`
-- 默认离线模式：`HF_HUB_OFFLINE=1`
-- 默认 `device_map=cuda:0`、`batch_size=1`
-- 单进程下默认把 `device` 和 `device_map` 绑定到同一张卡
-- 当前 `xlrs-lite` 任务按数据集全量样本评测，不再在 task 侧按 category 截断
-- 常用环境变量：`EVAL_BASE_MODEL`、`EVAL_LORA_CHECKPOINT`、`EVAL_TASKS`、`EVAL_OUTPUT_PATH`、`EVAL_DEVICE`、`EVAL_DEVICE_MAP`、`EVAL_BATCH_SIZE`
+VGR 中的：
 
-### `scripts/eval_qwen35.sh`
-- Qwen3.5 baseline 评测入口
-- 不加载 Fovea LoRA，用于和 Fovea 路径对比
+```text
+<SOT>[x1, y1, x2, y2]<EOT><image>
+```
 
-### `scripts/train_eval_loop.sh`
-- 按 checkpoint step 分段训练
-- 每段训练后自动评测最新 checkpoint
-- 任一步失败即按原始退出码退出
+会转换为：
 
----
+```text
+<vq> <vis_i> ... </vq> <|replay_pad|> ...
+```
 
-## 必要注意事项
+每个 `<vq>` 必须绑定一个原图归一化 box，用于 `L_align`。图像路径相对 `image_folder`。
 
-- 仓库根目录不是标准可编辑包；不要假设 `pip install -e .` 可用。
-- 主训练与评测路径依赖：`PYTHONPATH="$PWD/src:$PWD/lmms-eval"`。
-- 对外主入口优先使用 `FoveaForConditionalGeneration`、`FoveaConfig`、`FoveaProcessor`、`FoveaTokenizer`；`Qwen3_5*` 仅保留兼容别名。
-- `modeling_qwen3_5.py` 是基础实现，`modeling_fovea.py` 是 Fovea / ImgSlot 主实现；不要把 ImgSlot 逻辑塞回基础 backbone。
-- 训练、processor、评测三侧的 ImgSlot placeholder 约定必须同步，尤其是 block span、`image_grid_thw`、`image_block_offsets`、`image_block_counts`。
-- ImgSlot 的视觉位置采用原图级全局几何坐标：每个 block 携带 `[t_global, h_offset, w_offset]`，模型用它把 block-local `(t=0,h,w)` 转成同一张原图内共享 `t_global`、连续 `h/w` 的 `visual_pos`；文本 span 只表示 slot embedding 和 KV cache 的写回位置，不参与视觉几何位置构造。
-- 评测 canonical 路径由 `lmms-eval/lmms_eval/models/simple/fovea.py` 负责构造逻辑 image placeholder，并由 `FoveaProcessor` 展开成 block span；`modeling_fovea.py` 不再负责 prompt / placeholder 兼容修复。
-- 修改 LoRA trainable / `modules_to_save` 时，必须同时检查训练保存逻辑和 `lmms-eval/lmms_eval/models/simple/fovea.py` 的评测加载逻辑。
-- 修改脚本环境变量、默认入口或使用方式时，必须同步更新 `AGENTS.md` 和 `README.md`。
-- 当前默认 attention 后端是 `sdpa`；如需切换 `flash_attention_2`，需按当前环境重新验证稳定性。
-- 涉及 reshape、permute、split、cat、mask、KV cache 写入的改动，优先保证形状语义清晰、易核对。
-- 禁止打补丁式修改，必要时重构相关部分代码。
+## 本地权重
+
+不要自动下载模型或图像。训练默认读取项目内本地路径：
+
+```bash
+models/Open-MAGVIT2
+models/Open-MAGVIT2/configs/Open-MAGVIT2/gpu/pretrain_lfqgan_256_16384.yaml
+models/Open-MAGVIT2/tokenizer_16384.pt
+data/llava_next_raw_format
+```
+
+需要换路径时，通过训练参数 `--magvit2_repo`、`--magvit2_config`、`--magvit2_checkpoint`、`--image_folder` 显式传入。Open-MAGVIT2 必须是真实本地 tokenizer 16384 checkpoint，不使用伪码。
+
+## 训练入口
+
+默认入口：
+
+```bash
+bash scripts/ft3.sh
+```
+
+常用环境变量：
+
+- `FT3_DATA_PATH`
+- `FT3_IMAGE_FOLDER`
+- `FT3_CKPT_PATH`
+- `FT3_OUTPUT_DIR`
+- `FT3_MAGVIT2_REPO`
+- `FT3_MAGVIT2_CONFIG`
+- `FT3_MAGVIT2_CHECKPOINT`
+- `FT3_GENERATED_REPLAY_PROB`
+- `FT3_RETRIEVE_MAX_IMAGE_TOKENS`
+- `FT3_VISUAL_CODE_CACHE_DIR`
+
+运行时需要：
+
+```bash
+export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
+```
+
+## 修改规则
+
+- 不要恢复旧视觉 slot 路径。
+- 不要添加 JSON SFT 兼容读取。
+- 不要在 `modeling_qwen3_5.py` 里加入 Fovea retrieval 逻辑。
+- 修改 token、训练脚本、保存模块或数据字段时，同步更新 `README.md` 和本文件。

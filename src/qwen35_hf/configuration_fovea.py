@@ -1,15 +1,10 @@
-# Re-export and rename configuration classes to Fovea naming while keeping
-# Qwen3.5 compatibility aliases for the underlying architecture-specific types.
-from huggingface_hub.dataclasses import strict
+# Fovea configuration for the visual-query replay model.
+from typing import Any
 
-from transformers.configuration_utils import PreTrainedConfig
-from transformers.modeling_rope_utils import RopeParameters
-from transformers.utils import auto_docstring
+from transformers.configuration_utils import PretrainedConfig
 
 
-@auto_docstring(checkpoint="Qwen/Qwen3.5-27B")
-@strict
-class FoveaTextConfig(PreTrainedConfig):
+class FoveaTextConfig(PretrainedConfig):
     r"""
     linear_conv_kernel_dim (`int`, *optional*, defaults to 4):
         Kernel size of the convolution used in linear attention layers.
@@ -54,7 +49,7 @@ class FoveaTextConfig(PreTrainedConfig):
     rms_norm_eps: float = 1e-6
     use_cache: bool = True
     tie_word_embeddings: bool = False
-    rope_parameters: RopeParameters | dict | None = None
+    rope_parameters: Any | dict | None = None
     attention_bias: bool = False
     attention_dropout: float | int = 0.0
     head_dim: int = 256
@@ -81,9 +76,7 @@ class FoveaTextConfig(PreTrainedConfig):
         super().__post_init__(**kwargs)
 
 
-@auto_docstring(checkpoint="Qwen/Qwen3.5-27B")
-@strict
-class FoveaVisionConfig(PreTrainedConfig):
+class FoveaVisionConfig(PretrainedConfig):
     r"""
     out_hidden_size (`int`, *optional*, defaults to 3584):
         The output hidden size of the vision model.
@@ -107,45 +100,33 @@ class FoveaVisionConfig(PreTrainedConfig):
     initializer_range: float = 0.02
 
 
-@auto_docstring(checkpoint="Qwen/Qwen3.5-27B")
-@strict
-class FoveaConfig(PreTrainedConfig):
-    r"""
-    img_slot_enable (`bool`, *optional*, defaults to `True`):
-        Whether to enable block-based ImgSlot routing.
-    img_slot_k (`int`, *optional*, defaults to 128):
-        Number of shared internal A/query tokens and compressed visual slots written back per image block span.
-    img_slot_delta (`int`, *optional*, defaults to 128):
-        Decode-step interval for refreshing ImgSlot KV entries.
-    img_slot_beta (`float`, *optional*, defaults to 0.3):
-        Update strength for the dynamic anchor tokens.
-    img_slot_lambda (`float`, *optional*, defaults to 0.9):
-        EMA coefficient for decode-time router state smoothing.
-    img_slot_max_text_tokens (`int`, *optional*, defaults to 512):
-        Maximum number of text hidden states kept for ImgSlot decode refresh.
-    img_slot_tile_size (`int`, *optional*):
-        Required when ImgSlot is enabled. Original images are evenly split into
-        blocks using `ceil(width / img_slot_tile_size)` and `ceil(height / img_slot_tile_size)`.
-    """
+class FoveaConfig(PretrainedConfig):
     model_type = "fovea"
     sub_configs = {"vision_config": FoveaVisionConfig, "text_config": FoveaTextConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    text_config: dict | PreTrainedConfig | None = None
-    vision_config: dict | PreTrainedConfig | None = None
+    text_config: dict | PretrainedConfig | None = None
+    vision_config: dict | PretrainedConfig | None = None
 
     image_token_id: int = 248056
     video_token_id: int = 248057
     vision_start_token_id: int = 248053
     vision_end_token_id: int = 248054
     tie_word_embeddings: bool = False
-    img_slot_enable: bool = True
-    img_slot_k: int = 128
-    img_slot_delta: int = 128
-    img_slot_beta: float = 0.3
-    img_slot_lambda: float = 0.9
-    img_slot_max_text_tokens: int = 512
-    img_slot_tile_size: int | None = 1280
+    visual_codebook_size: int = 16384
+    visual_query_max_codes: int = 64
+    visual_query_max_queries: int = 4
+    visual_query_max_replay_tokens: int = 256
+    visual_query_retrieve_tokens: int = 4096
+    visual_query_lambda_align: float = 0.5
+    visual_query_align_eps: float = 1e-6
+    visual_query_generated_replay_prob: float = 0.5
+    vq_start_token_id: int | None = None
+    vq_end_token_id: int | None = None
+    mask_vis_token_id: int | None = None
+    replay_token_id: int | None = None
+    vis_token_start_id: int | None = None
+    vis_token_end_id: int | None = None
 
     def __post_init__(self, **kwargs):
         if isinstance(self.vision_config, dict):

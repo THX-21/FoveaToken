@@ -17,6 +17,7 @@ from .modeling_qwen3_5 import (
 from .modeling_fovea import FoveaForConditionalGeneration
 from .processing_fovea import FoveaProcessor
 from .tokenization_fovea import FoveaTokenizer
+from .query_tokens import add_visual_query_tokens, sync_visual_query_token_ids
 
 Qwen3_5ForConditionalGeneration = FoveaForConditionalGeneration
 Qwen3VLProcessor = FoveaProcessor
@@ -38,4 +39,6 @@ __all__ = [
     "Qwen3VLProcessor",
     "FoveaTokenizer",
     "Qwen3_5Tokenizer",
+    "add_visual_query_tokens",
+    "sync_visual_query_token_ids",
 ]

@@ -3,6 +3,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Sequence
 
 import torch
@@ -11,7 +12,6 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
 from ..processing_fovea import (
-    DEFAULT_IMAGE_PAD,
     build_mm_token_type_ids,
     build_visual_placeholder,
     image_token_count_from_grid,
@@ -19,9 +19,15 @@ from ..processing_fovea import (
 from .image_packing import (
     VisionPackerConfig,
     default_processor_stats,
+    pack_single_image_with_boxes,
     pack_single_image,
-    resize_to_token_budget,
-    split_image_into_blocks,
+)
+from ..visual_codec import OpenMAGVIT2Codec
+from ..query_tokens import (
+    REPLAY_TOKEN,
+    VQ_END_TOKEN,
+    VQ_START_TOKEN,
+    vis_token,
 )
 
 Image.MAX_IMAGE_PIXELS = None
@@ -30,22 +36,7 @@ Image.MAX_IMAGE_PIXELS = None
 IGNORE_INDEX = -100
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
-
-
-@dataclass
-class SampleEncoding:
-    """Typed view of one encoded sample.
-
-    The current dataset returns raw dicts because that is what `Trainer` and the
-    collator consume directly, but this structure documents the intended fields.
-    """
-
-    input_ids: torch.LongTensor
-    labels: torch.LongTensor
-    pixel_values: torch.Tensor | None
-    image_grid_thw: torch.LongTensor | None
-    image_block_offsets: torch.LongTensor | None
-    mm_token_type_ids: torch.IntTensor
+SOT_EOT_IMAGE_RE = re.compile(r"<SOT>\s*(\[[^\]]+\])\s*<EOT>\s*<image>")
 
 
 def preprocess_multimodal_conversations(conversations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -68,19 +59,63 @@ def preprocess_multimodal_conversations(conversations: list[dict[str, Any]]) -> 
     return conversations
 
 
-def load_json_records(data_path: str) -> list[dict[str, Any]]:
-    """Load the SFT dataset file.
+def load_training_records(data_path: str) -> list[dict[str, Any]]:
+    """Load VGR parquet records from a file or `data/vgr` directory."""
 
-    Expected schema:
-    - top level: a JSON list
-    - each item: at least `conversations`, optionally `image`
-    """
+    path = Path(data_path)
+    if path.is_dir():
+        paths = [path / "vgr_shortcot.parquet", path / "vgr_longcot.parquet"]
+        paths = [item for item in paths if item.exists()]
+        if not paths:
+            raise FileNotFoundError(f"No VGR parquet files found under {path}.")
+    else:
+        paths = [path]
 
-    with open(data_path, "r", encoding="utf-8") as handle:
-        records = json.load(handle)
-    if not isinstance(records, list):
-        raise ValueError(f"{data_path} must contain a JSON list.")
+    records: list[dict[str, Any]] = []
+    for item in paths:
+        if item.suffix == ".parquet":
+            try:
+                import pandas as pd
+            except ImportError as exc:
+                raise ImportError("Reading VGR parquet requires pandas and pyarrow.") from exc
+            frame = pd.read_parquet(item)
+            records.extend(frame.to_dict("records"))
+        else:
+            raise ValueError(f"Only VGR parquet training files are supported: {item}")
     return records
+
+
+def parse_vgr_box(box_text: str) -> tuple[float, float, float, float]:
+    values = json.loads(box_text)
+    if not isinstance(values, list) or len(values) != 4:
+        raise ValueError(f"Invalid VGR box: {box_text}")
+    x1, y1, x2, y2 = [float(v) for v in values]
+    x1, y1 = max(0.0, min(1.0, x1)), max(0.0, min(1.0, y1))
+    x2, y2 = max(0.0, min(1.0, x2)), max(0.0, min(1.0, y2))
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"Invalid non-positive VGR box: {box_text}")
+    return x1, y1, x2, y2
+
+
+def replace_vgr_regions_with_visual_queries(
+    text: str,
+    *,
+    image_path: str,
+    visual_codec: OpenMAGVIT2Codec,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Convert VGR `<SOT>box<EOT><image>` tags to `<vq> codes </vq> replay pads."""
+
+    queries: list[dict[str, Any]] = []
+
+    def replace(match: re.Match) -> str:
+        box = parse_vgr_box(match.group(1))
+        codes = visual_codec.encode_crop(image_path, box)
+        code_tokens = " ".join(vis_token(code) for code in codes)
+        replay = " ".join(REPLAY_TOKEN for _ in codes)
+        queries.append({"box": box, "codes": codes})
+        return f"{VQ_START_TOKEN} {code_tokens} {VQ_END_TOKEN} {replay}"
+
+    return SOT_EOT_IMAGE_RE.sub(replace, text), queries
 
 
 def replace_image_tokens_in_conversations(
@@ -144,8 +179,8 @@ def encode_chatml_example(
     Labeling policy:
     - system turns: ignored
     - user turns: ignored
-    - assistant turns: supervise only the answer content and turn end marker,
-      not the role prefix or empty thinking scaffold
+    - assistant turns: supervise the sample-provided assistant content and turn
+      end marker, not the role prefix
 
     This is the standard SFT setup where the model learns to continue the prompt
     as the assistant.
@@ -188,18 +223,85 @@ def encode_chatml_example(
             full_segment = f"{prefix}{sentence['value']}<|im_end|>\n"
             prefix_len = len(tokenize_text(tokenizer, prefix))
         else:
-            # Align with the official Qwen3.5 chat template: assistant turns
-            # include an explicit thinking block even when reasoning content is
-            # absent. The scaffold is prompt context only; supervise the answer.
-            answer_prefix = f"{prefix}<think>\n\n</think>\n\n"
-            full_segment = f"{answer_prefix}{sentence['value']}<|im_end|>\n"
-            prefix_len = len(tokenize_text(tokenizer, answer_prefix))
+            full_segment = f"{prefix}{sentence['value']}<|im_end|>\n"
+            prefix_len = len(tokenize_text(tokenizer, prefix))
         if role in {"human", "user"}:
             append_segment(full_segment, supervised_prefix_len=None)
         else:
             append_segment(full_segment, supervised_prefix_len=prefix_len)
 
     return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+
+
+def build_visual_query_metadata(
+    input_ids: torch.LongTensor,
+    labels: torch.LongTensor,
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    query_boxes: Sequence[Sequence[float]],
+) -> dict[str, torch.Tensor]:
+    """Locate `<vq> ... </vq> replay` spans after tokenization."""
+
+    vq_start_id = tokenizer.convert_tokens_to_ids(VQ_START_TOKEN)
+    if not query_boxes and vq_start_id not in input_ids.tolist():
+        return {
+            "vq_code_positions": torch.empty((0,), dtype=torch.long),
+            "vq_replay_positions": torch.empty((0,), dtype=torch.long),
+            "vq_code_query_indices": torch.empty((0,), dtype=torch.long),
+            "vq_boxes": torch.empty((0, 4), dtype=torch.float32),
+            "vq_code_label_mask": torch.zeros_like(labels, dtype=torch.bool),
+        }
+    vq_end_id = tokenizer.convert_tokens_to_ids(VQ_END_TOKEN)
+    replay_id = tokenizer.convert_tokens_to_ids(REPLAY_TOKEN)
+    vis_start_id = tokenizer.convert_tokens_to_ids("<vis_0>")
+    vis_end_id = tokenizer.convert_tokens_to_ids("<vis_16383>")
+    if min(vq_start_id, vq_end_id, replay_id, vis_start_id, vis_end_id) < 0:
+        raise ValueError("Visual query special tokens must be added to the tokenizer before encoding VGR.")
+
+    ids = input_ids.tolist()
+    code_positions: list[int] = []
+    code_query_indices: list[int] = []
+    replay_positions: list[int] = []
+    code_label_mask = torch.zeros_like(labels, dtype=torch.bool)
+    query_index = 0
+    pos = 0
+    while pos < len(ids):
+        if ids[pos] != vq_start_id:
+            pos += 1
+            continue
+        end = pos + 1
+        while end < len(ids) and ids[end] != vq_end_id:
+            end += 1
+        if end >= len(ids):
+            raise ValueError("Found <vq> without matching </vq>.")
+        codes = [idx for idx in range(pos + 1, end) if vis_start_id <= ids[idx] <= vis_end_id]
+        if not codes:
+            raise ValueError("Found empty visual query.")
+        replay_start = end + 1
+        replay_end = replay_start
+        while replay_end < len(ids) and ids[replay_end] == replay_id:
+            replay_end += 1
+        if replay_end - replay_start != len(codes):
+            raise ValueError("Replay pad count must equal visual code count.")
+        if query_index >= len(query_boxes):
+            raise ValueError("More tokenized visual queries than parsed VGR boxes.")
+        code_positions.extend(codes)
+        replay_positions.extend(range(replay_start, replay_end))
+        code_query_indices.extend([query_index] * len(codes))
+        code_label_mask[pos : end + 1] = labels[pos : end + 1].ne(IGNORE_INDEX)
+        query_index += 1
+        pos = replay_end
+
+    if query_index != len(query_boxes):
+        raise ValueError("Parsed VGR boxes do not match tokenized visual queries.")
+
+    return {
+        "vq_code_positions": torch.tensor(code_positions, dtype=torch.long),
+        "vq_replay_positions": torch.tensor(replay_positions, dtype=torch.long),
+        "vq_code_query_indices": torch.tensor(code_query_indices, dtype=torch.long),
+        "vq_boxes": torch.tensor(query_boxes, dtype=torch.float32),
+        "vq_code_label_mask": code_label_mask,
+    }
 
 
 class VisionPacker:
@@ -209,21 +311,8 @@ class VisionPacker:
         self,
         vision_config,
         max_image_tokens: int | None = None,
-        img_slot_enable: bool = False,
-        img_slot_k: int = 64,
-        img_slot_tile_size: int | None = None,
     ) -> None:
         self.max_image_tokens = max_image_tokens
-        self.img_slot_enable = img_slot_enable
-        self.img_slot_token_count = int(img_slot_k)
-        self.img_slot_tile_size = img_slot_tile_size
-        if self.img_slot_enable:
-            if self.img_slot_tile_size is None:
-                raise ValueError("img_slot_tile_size is required when img_slot_enable=true.")
-            if self.img_slot_token_count <= 0:
-                raise ValueError("img_slot_k must be positive when ImgSlot is enabled.")
-
-        # Some configs expose scalar patch sizes while others expose tuples.
         patch_size = vision_config.patch_size if isinstance(vision_config.patch_size, int) else int(vision_config.patch_size[0])
         temporal_patch_size = (
             vision_config.temporal_patch_size
@@ -243,38 +332,18 @@ class VisionPacker:
     def _pack_single_block(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
         return pack_single_image(image=image, config=self.local_config, max_image_tokens=self.max_image_tokens)
 
-    def _block_offset(self, left: int, top: int) -> torch.LongTensor:
-        merged_patch = self.local_config.patch_size * max(self.local_config.spatial_merge_size, 1)
-        return torch.tensor([0, top // merged_patch, left // merged_patch], dtype=torch.long)
+    def pack_retrieve(self, image: Image.Image, max_image_tokens: int | None) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
+        packed = pack_single_image_with_boxes(image=image, config=self.local_config, max_image_tokens=max_image_tokens)
+        return packed.pixel_values, packed.image_grid_thw, packed.patch_boxes
 
-    def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor] | tuple[torch.Tensor, torch.LongTensor, torch.LongTensor]:
-        """Pack one image and return visual tensors.
-
-        ImgSlot additionally returns `image_block_offsets` with one
-        `[t_global, h_offset, w_offset]` row per block in merged-grid units.
-        """
-
-        if self.img_slot_enable:
-            # Apply the token budget to the whole image first; block count and
-            # boundaries are based on the budgeted normal-resolution image.
-            image = resize_to_token_budget(image, self.local_config, self.max_image_tokens)
-            pixel_values_list = []
-            image_grid_list = []
-            image_block_offsets = []
-            for block in split_image_into_blocks(image, int(self.img_slot_tile_size)):
-                packed_pixels, packed_grid = self._pack_single_block(block.image)
-                pixel_values_list.append(packed_pixels)
-                image_grid_list.append(packed_grid)
-                image_block_offsets.append(self._block_offset(block.left, block.top))
-            return torch.cat(pixel_values_list, dim=0), torch.stack(image_grid_list, dim=0), torch.stack(image_block_offsets, dim=0)
-
+    def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
         return self._pack_single_block(image)
 
 
 class LazySupervisedDataset(Dataset):
     """Lazily load images and encode samples on access.
 
-    JSON metadata is kept in memory, but image decoding and tokenization happen
+    VGR metadata is kept in memory, but image decoding and tokenization happen
     inside `__getitem__`, which avoids a large up-front preprocessing step.
     """
 
@@ -286,25 +355,32 @@ class LazySupervisedDataset(Dataset):
         vision_packer: VisionPacker,
         image_token_id: int,
         system_message: str = DEFAULT_SYSTEM_MESSAGE,
-        img_slot_enable: bool = False,
+        visual_codec: OpenMAGVIT2Codec | None = None,
+        retrieve_max_image_tokens: int | None = 4096,
     ) -> None:
-        self.records = load_json_records(data_path)
+        self.records = load_training_records(data_path)
         self.image_folder = image_folder
         self.tokenizer = tokenizer
         self.vision_packer = vision_packer
         self.image_token_id = image_token_id
         self.system_message = system_message
-        self.img_slot_enable = img_slot_enable
+        self.visual_codec = visual_codec
+        self.retrieve_max_image_tokens = retrieve_max_image_tokens
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def _load_image(self, image_name: str) -> tuple[torch.Tensor, torch.LongTensor] | tuple[torch.Tensor, torch.LongTensor, torch.LongTensor]:
+    def _load_image(self, image_name: str) -> tuple[torch.Tensor, torch.LongTensor]:
         """Load an image file relative to `image_folder` and pack it."""
 
         image_path = os.path.join(self.image_folder, image_name)
         image = Image.open(image_path).convert("RGB")
         return self.vision_packer.pack(image)
+
+    def _load_retrieve_image(self, image_name: str) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
+        image_path = os.path.join(self.image_folder, image_name)
+        image = Image.open(image_path).convert("RGB")
+        return self.vision_packer.pack_retrieve(image, self.retrieve_max_image_tokens)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Build one training instance.
@@ -319,61 +395,71 @@ class LazySupervisedDataset(Dataset):
         image_field = record.get("image")
         pixel_values = None
         image_grid_thw = None
-        image_block_offsets = None
+        retrieve_pixel_values = None
+        retrieve_grid_thw = None
+        retrieve_patch_boxes = None
         image_token_counts: list[list[int]] = []
-        image_block_counts: list[int] = []
+        query_boxes: list[tuple[float, float, float, float]] = []
 
         if image_field is not None:
             image_names = image_field if isinstance(image_field, list) else [image_field]
             pixel_values_list = []
             image_grid_list = []
-            image_block_offset_list = []
-            for image_index, image_name in enumerate(image_names):
-                packed = self._load_image(image_name)
-                if self.img_slot_enable:
-                    packed_pixels, packed_grid, packed_offsets = packed
-                    packed_offsets = packed_offsets.clone()
-                    packed_offsets[:, 0] = image_index
-                    image_block_offset_list.extend(list(packed_offsets))
-                else:
-                    packed_pixels, packed_grid = packed
+            retrieve_pixels_list = []
+            retrieve_grid_list = []
+            retrieve_box_list = []
+            for image_name in image_names:
+                packed_pixels, packed_grid = self._load_image(image_name)
+                retrieve_pixels, retrieve_grid, retrieve_boxes = self._load_retrieve_image(image_name)
+                retrieve_pixels_list.append(retrieve_pixels)
+                retrieve_grid_list.append(retrieve_grid)
+                retrieve_box_list.append(retrieve_boxes)
                 pixel_values_list.append(packed_pixels)
-                if packed_grid.dim() == 1:
-                    grids_for_counts = [packed_grid]
-                    image_grid_list.append(packed_grid)
-                else:
-                    grids_for_counts = list(packed_grid)
-                    image_grid_list.extend(grids_for_counts)
-                image_block_counts.append(len(grids_for_counts))
-                current_image_token_counts: list[int] = []
-                # Text-side visual span lengths: ImgSlot writes one fixed
-                # k-token span per block; geometry comes from image_block_offsets.
-                for grid in grids_for_counts:
-                    if self.img_slot_enable:
-                        current_image_token_counts.append(self.vision_packer.img_slot_token_count)
-                    else:
-                        current_image_token_counts.append(
-                            image_token_count_from_grid(
-                                grid,
-                                self.vision_packer.local_config.spatial_merge_size,
-                            )
-                        )
-                image_token_counts.append(current_image_token_counts)
+                image_grid_list.append(packed_grid)
+                image_token_counts.append([
+                    image_token_count_from_grid(
+                        packed_grid,
+                        self.vision_packer.local_config.spatial_merge_size,
+                    )
+                ])
             if pixel_values_list:
-                # Multiple images or blocks in one sample are concatenated along
-                # the patch axis. Keep one grid row per logical image/block.
                 pixel_values = torch.cat(pixel_values_list, dim=0)
                 image_grid_thw = torch.stack(image_grid_list, dim=0)
-                if self.img_slot_enable:
-                    image_block_offsets = torch.stack(image_block_offset_list, dim=0)
+                retrieve_pixel_values = torch.cat(retrieve_pixels_list, dim=0)
+                retrieve_grid_thw = torch.stack(retrieve_grid_list, dim=0)
+                retrieve_patch_boxes = torch.cat(retrieve_box_list, dim=0)
+
+        conversations = copy.deepcopy(record["conversations"])
+        if self.visual_codec is None or image_field is None:
+            raise ValueError("VGR visual-query training requires an image and a local Open-MAGVIT2 codec.")
+        image_names = image_field if isinstance(image_field, list) else [image_field]
+        if len(image_names) != 1:
+            raise ValueError("VGR visual-query training expects one image per sample.")
+        image_path = os.path.join(self.image_folder, image_names[0])
+        for sentence in conversations:
+            if sentence.get("from") not in {"gpt", "assistant"}:
+                continue
+            value, parsed_queries = replace_vgr_regions_with_visual_queries(
+                sentence["value"],
+                image_path=image_path,
+                visual_codec=self.visual_codec,
+            )
+            sentence["value"] = value
+            query_boxes.extend(query["box"] for query in parsed_queries)
 
         input_ids, labels = encode_chatml_example(
             tokenizer=self.tokenizer,
-            conversations=record["conversations"],
+            conversations=conversations,
             image_token_counts=image_token_counts,
             system_message=self.system_message,
         )
         mm_token_type_ids = build_mm_token_type_ids(input_ids=input_ids, image_token_id=self.image_token_id)
+        vq_metadata = build_visual_query_metadata(
+            input_ids,
+            labels,
+            tokenizer=self.tokenizer,
+            query_boxes=query_boxes,
+        )
 
         return {
             "input_ids": input_ids,
@@ -381,8 +467,10 @@ class LazySupervisedDataset(Dataset):
             "mm_token_type_ids": mm_token_type_ids,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
-            "image_block_offsets": image_block_offsets,
-            "image_block_counts": torch.tensor(image_block_counts, dtype=torch.long) if image_block_counts else None,
+            "retrieve_pixel_values": retrieve_pixel_values,
+            "retrieve_grid_thw": retrieve_grid_thw,
+            "retrieve_patch_boxes": retrieve_patch_boxes,
+            **vq_metadata,
         }
 
 
@@ -408,23 +496,53 @@ class DataCollatorForQwen3_5SFT:
         input_ids = self._pad([instance["input_ids"] for instance in instances], padding_value=self.tokenizer.pad_token_id)
         labels = self._pad([instance["labels"] for instance in instances], padding_value=IGNORE_INDEX)
         mm_token_type_ids = self._pad([instance["mm_token_type_ids"] for instance in instances], padding_value=0).int()
+        vq_code_label_mask = self._pad([instance["vq_code_label_mask"] for instance in instances], padding_value=0).bool()
 
         batch = {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
             "mm_token_type_ids": mm_token_type_ids,
+            "vq_code_label_mask": vq_code_label_mask,
         }
 
         pixel_values = [instance["pixel_values"] for instance in instances if instance["pixel_values"] is not None]
         image_grid_thw = [instance["image_grid_thw"] for instance in instances if instance["image_grid_thw"] is not None]
-        image_block_offsets = [instance["image_block_offsets"] for instance in instances if instance.get("image_block_offsets") is not None]
         if pixel_values:
-            # Vision patches are already flattened per image, so batching is a
-            # simple concatenation rather than padding to a rectangular tensor.
             batch["pixel_values"] = torch.cat(pixel_values, dim=0)
             batch["image_grid_thw"] = torch.cat(image_grid_thw, dim=0)
-            if image_block_offsets:
-                batch["image_block_offsets"] = torch.cat(image_block_offsets, dim=0)
+
+        retrieve_pixel_values = [instance["retrieve_pixel_values"] for instance in instances if instance.get("retrieve_pixel_values") is not None]
+        retrieve_grid_thw = [instance["retrieve_grid_thw"] for instance in instances if instance.get("retrieve_grid_thw") is not None]
+        retrieve_patch_boxes = [instance["retrieve_patch_boxes"] for instance in instances if instance.get("retrieve_patch_boxes") is not None]
+        if retrieve_pixel_values:
+            batch["retrieve_pixel_values"] = torch.cat(retrieve_pixel_values, dim=0)
+            batch["retrieve_grid_thw"] = torch.cat(retrieve_grid_thw, dim=0)
+            batch["retrieve_patch_boxes"] = torch.cat(retrieve_patch_boxes, dim=0)
+            batch["retrieve_image_counts"] = torch.tensor(
+                [int(instance["retrieve_grid_thw"].shape[0]) if instance.get("retrieve_grid_thw") is not None else 0 for instance in instances],
+                dtype=torch.long,
+            )
+
+        code_positions = []
+        replay_positions = []
+        code_query_indices = []
+        boxes = []
+        query_offset = 0
+        for batch_idx, instance in enumerate(instances):
+            num_queries = int(instance["vq_boxes"].shape[0])
+            if num_queries:
+                boxes.append(instance["vq_boxes"])
+            codes = instance["vq_code_positions"]
+            if codes.numel() > 0:
+                code_positions.append(torch.stack([torch.full_like(codes, batch_idx), codes], dim=1))
+                replay = instance["vq_replay_positions"]
+                replay_positions.append(torch.stack([torch.full_like(replay, batch_idx), replay], dim=1))
+                code_query_indices.append(instance["vq_code_query_indices"] + query_offset)
+            query_offset += num_queries
+        batch["vq_code_positions"] = torch.cat(code_positions, dim=0) if code_positions else torch.empty((0, 2), dtype=torch.long)
+        batch["vq_replay_positions"] = torch.cat(replay_positions, dim=0) if replay_positions else torch.empty((0, 2), dtype=torch.long)
+        batch["vq_code_query_indices"] = torch.cat(code_query_indices, dim=0) if code_query_indices else torch.empty((0,), dtype=torch.long)
+        batch["vq_boxes"] = torch.cat(boxes, dim=0) if boxes else torch.empty((0, 4), dtype=torch.float32)
 
         return batch

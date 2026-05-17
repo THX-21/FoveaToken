@@ -19,11 +19,13 @@ export WORLD_SIZE=$((NNODES * NUM_GPUS))
 export RANK=0
 
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-3}"
-RUN_NAME="${FT3_RUN_NAME:-fovea-ft3-imgslot}"
-JSON_PATH="${FT3_JSON_PATH:-${PROJECT_ROOT}/data/ft3_whole_shuffle.json}"
-# JSON_PATH="${FT3_JSON_PATH:-${PROJECT_ROOT}/data/debug/ft3_step144_nearby.json}"
-IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/jpg_images}"
+RUN_NAME="${FT3_RUN_NAME:-fovea-visual-query-replay}"
+DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr}"
+IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/llava_next_raw_format}"
 CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
+MAGVIT2_REPO="${FT3_MAGVIT2_REPO:-${PROJECT_ROOT}/models/Open-MAGVIT2}"
+MAGVIT2_CHECKPOINT="${FT3_MAGVIT2_CHECKPOINT:-${PROJECT_ROOT}/models/Open-MAGVIT2/tokenizer_16384.pt}"
+MAGVIT2_CONFIG="${FT3_MAGVIT2_CONFIG:-${PROJECT_ROOT}/models/Open-MAGVIT2/configs/Open-MAGVIT2/gpu/pretrain_lfqgan_256_16384.yaml}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-200}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
@@ -31,14 +33,17 @@ ATTN_IMPLEMENTATION="${FT3_ATTN_IMPLEMENTATION:-sdpa}"
 
 echo "[ft3] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
 echo "[ft3] RUN_NAME=${RUN_NAME}"
-echo "[ft3] JSON_PATH=${JSON_PATH}"
+echo "[ft3] DATA_PATH=${DATA_PATH}"
 echo "[ft3] IMAGE_FOLDER=${IMAGE_FOLDER}"
 echo "[ft3] CKPT_PATH=${CKPT_PATH}"
+echo "[ft3] MAGVIT2_REPO=${MAGVIT2_REPO}"
+echo "[ft3] MAGVIT2_CHECKPOINT=${MAGVIT2_CHECKPOINT}"
+echo "[ft3] MAGVIT2_CONFIG=${MAGVIT2_CONFIG}"
 echo "[ft3] OUTPUT_DIR=${OUTPUT_DIR}"
 echo "[ft3] SAVE_STEPS=${SAVE_STEPS}"
 echo "[ft3] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
 
-export PYTHONPATH="${PROJECT_ROOT}/src"
+export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 
 if python - <<'PY'
 import torch
@@ -77,14 +82,20 @@ fi
 ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --deepspeed "${PROJECT_ROOT}/scripts/zero2_tp2.json" \
     --model_name_or_path "${CKPT_PATH}" \
-    --data_path "${JSON_PATH}" \
+    --data_path "${DATA_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
-    --max_image_tokens 8196 \
+    --max_image_tokens 512 \
+    --retrieve_max_image_tokens "${FT3_RETRIEVE_MAX_IMAGE_TOKENS:-4096}" \
+    --magvit2_repo "${MAGVIT2_REPO}" \
+    --magvit2_checkpoint "${MAGVIT2_CHECKPOINT}" \
+    --magvit2_config "${MAGVIT2_CONFIG}" \
+    --visual_code_cache_dir "${FT3_VISUAL_CODE_CACHE_DIR:-${PROJECT_ROOT}/data/vgr/.visual_code_cache}" \
     --lora_enable true \
     --lora_r 64 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
     --unfreeze_vision true \
+    --visual_query_generated_replay_prob "${FT3_GENERATED_REPLAY_PROB:-0.5}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
     --output_dir "${OUTPUT_DIR}" \

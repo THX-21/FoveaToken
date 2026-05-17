@@ -6,7 +6,7 @@ export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 export HF_HUB_OFFLINE=1
 
 BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen3.5-9B}"
-LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-ft3-imgslot/checkpoint-15600}"
+LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-visual-query-replay/checkpoint-200}"
 TASKS="${EVAL_TASKS:-xlrs-lite}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 ATTN_IMPLEMENTATION="${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
@@ -42,7 +42,7 @@ echo "[eval] ACCELERATE_BIN=${ACCELERATE_BIN}"
   --main_process_port 12345 \
   -m lmms_eval \
   --model fovea \
-  --model_args "pretrained=${BASE_MODEL},peft=${LORA_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=False,max_image_tokens=8196" \
+  --model_args "pretrained=${BASE_MODEL},peft=${LORA_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=False,max_image_tokens=512" \
   --tasks "${TASKS}" \
   --batch_size "${BATCH_SIZE}" \
   --log_samples \
