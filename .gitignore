@@ -3,6 +3,7 @@
 *.vscode
 *.pyc
 *.whl
+*.ckpt
 *.claude
 __pycache__/
 logs/

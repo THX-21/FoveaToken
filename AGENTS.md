@@ -6,10 +6,10 @@
 
 FoveaToken 基于 Qwen3.5 多模态实现，新增逻辑集中在：
 
-- `src/qwen35_hf/modeling_fovea.py`
-- `src/qwen35_hf/train/data.py`
-- `src/qwen35_hf/visual_codec.py`
-- `src/qwen35_hf/query_tokens.py`
+- `src/fovea_token/modeling_fovea.py`
+- `src/fovea_token/train/data.py`
+- `src/fovea_token/tokenizers/tokenization_ibq.py`
+- `src/fovea_token/tokenizers/tokenization_visual_query.py`
 
 核心数据流：
 
@@ -49,13 +49,13 @@ VGR 中的：
 不要自动下载模型或图像。训练默认读取项目内本地路径：
 
 ```bash
-models/Open-MAGVIT2
-models/Open-MAGVIT2/configs/Open-MAGVIT2/gpu/pretrain_lfqgan_256_16384.yaml
-models/Open-MAGVIT2/tokenizer_16384.pt
+src/fovea_token/models/Open-MAGVIT2
+src/fovea_token/models/Open-MAGVIT2/configs/IBQ/gpu/pretrain_ibqgan_16384.yaml
+src/fovea_token/models/Open-MAGVIT2/IBQ_pretrain_16384.ckpt
 data/llava_next_raw_format
 ```
 
-需要换路径时，通过训练参数 `--magvit2_repo`、`--magvit2_config`、`--magvit2_checkpoint`、`--image_folder` 显式传入。Open-MAGVIT2 必须是真实本地 tokenizer 16384 checkpoint，不使用伪码。
+需要换路径时，通过训练参数 `--ibq_repo`、`--ibq_config`、`--ibq_checkpoint`、`--image_folder` 显式传入。IBQ 必须是真实本地 16384 checkpoint，不使用伪码。
 
 ## 训练入口
 
@@ -71,9 +71,9 @@ bash scripts/ft3.sh
 - `FT3_IMAGE_FOLDER`
 - `FT3_CKPT_PATH`
 - `FT3_OUTPUT_DIR`
-- `FT3_MAGVIT2_REPO`
-- `FT3_MAGVIT2_CONFIG`
-- `FT3_MAGVIT2_CHECKPOINT`
+- `FT3_IBQ_REPO`
+- `FT3_IBQ_CONFIG`
+- `FT3_IBQ_CHECKPOINT`
 - `FT3_GENERATED_REPLAY_PROB`
 - `FT3_RETRIEVE_MAX_IMAGE_TOKENS`
 - `FT3_VISUAL_CODE_CACHE_DIR`

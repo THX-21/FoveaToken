@@ -23,9 +23,9 @@ RUN_NAME="${FT3_RUN_NAME:-fovea-visual-query-replay}"
 DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr}"
 IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/llava_next_raw_format}"
 CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
-MAGVIT2_REPO="${FT3_MAGVIT2_REPO:-${PROJECT_ROOT}/models/Open-MAGVIT2}"
-MAGVIT2_CHECKPOINT="${FT3_MAGVIT2_CHECKPOINT:-${PROJECT_ROOT}/models/Open-MAGVIT2/tokenizer_16384.pt}"
-MAGVIT2_CONFIG="${FT3_MAGVIT2_CONFIG:-${PROJECT_ROOT}/models/Open-MAGVIT2/configs/Open-MAGVIT2/gpu/pretrain_lfqgan_256_16384.yaml}"
+IBQ_REPO="${FT3_IBQ_REPO:-${PROJECT_ROOT}/src/fovea_token/models/Open-MAGVIT2}"
+IBQ_CHECKPOINT="${FT3_IBQ_CHECKPOINT:-${PROJECT_ROOT}/src/fovea_token/models/Open-MAGVIT2/IBQ_pretrain_16384.ckpt}"
+IBQ_CONFIG="${FT3_IBQ_CONFIG:-${PROJECT_ROOT}/src/fovea_token/models/Open-MAGVIT2/configs/IBQ/gpu/pretrain_ibqgan_16384.yaml}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-200}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
@@ -36,9 +36,9 @@ echo "[ft3] RUN_NAME=${RUN_NAME}"
 echo "[ft3] DATA_PATH=${DATA_PATH}"
 echo "[ft3] IMAGE_FOLDER=${IMAGE_FOLDER}"
 echo "[ft3] CKPT_PATH=${CKPT_PATH}"
-echo "[ft3] MAGVIT2_REPO=${MAGVIT2_REPO}"
-echo "[ft3] MAGVIT2_CHECKPOINT=${MAGVIT2_CHECKPOINT}"
-echo "[ft3] MAGVIT2_CONFIG=${MAGVIT2_CONFIG}"
+echo "[ft3] IBQ_REPO=${IBQ_REPO}"
+echo "[ft3] IBQ_CHECKPOINT=${IBQ_CHECKPOINT}"
+echo "[ft3] IBQ_CONFIG=${IBQ_CONFIG}"
 echo "[ft3] OUTPUT_DIR=${OUTPUT_DIR}"
 echo "[ft3] SAVE_STEPS=${SAVE_STEPS}"
 echo "[ft3] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
@@ -69,7 +69,7 @@ LAUNCHER=(
     --node_rank="${RANK}"
     --master_addr="${MASTER_ADDR}"
     --master_port="${MASTER_PORT}"
-    -m qwen35_hf.train.sft
+    -m fovea_token.train.sft
 )
 
 RESUME_ARGS=()
@@ -86,9 +86,9 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --image_folder "${IMAGE_FOLDER}" \
     --max_image_tokens 512 \
     --retrieve_max_image_tokens "${FT3_RETRIEVE_MAX_IMAGE_TOKENS:-4096}" \
-    --magvit2_repo "${MAGVIT2_REPO}" \
-    --magvit2_checkpoint "${MAGVIT2_CHECKPOINT}" \
-    --magvit2_config "${MAGVIT2_CONFIG}" \
+    --ibq_repo "${IBQ_REPO}" \
+    --ibq_checkpoint "${IBQ_CHECKPOINT}" \
+    --ibq_config "${IBQ_CONFIG}" \
     --visual_code_cache_dir "${FT3_VISUAL_CODE_CACHE_DIR:-${PROJECT_ROOT}/data/vgr/.visual_code_cache}" \
     --lora_enable true \
     --lora_r 64 \

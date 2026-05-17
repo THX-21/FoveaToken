@@ -13,9 +13,9 @@ from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
 
-from qwen35_hf import FoveaForConditionalGeneration, FoveaTokenizer, FoveaProcessor
-from qwen35_hf.train.data import VisionPacker
-from qwen35_hf.visual_tokens import add_visual_query_tokens, sync_visual_query_token_ids
+from fovea_token import FoveaForConditionalGeneration, FoveaTokenizer, FoveaProcessor
+from fovea_token.train.data import VisionPacker
+from fovea_token.tokenizers.tokenization_visual_query import add_visual_query_tokens, sync_visual_query_token_ids
 
 
 class LocalVisionImageProcessor(ImageProcessingMixin):

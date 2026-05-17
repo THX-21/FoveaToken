@@ -10,35 +10,35 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 
 ## 代码结构
 
-- `src/qwen35_hf/modeling_fovea.py`：`FoveaForConditionalGeneration` 和 packed visual-query retrieval/replay。
-- `src/qwen35_hf/train/data.py`：VGR parquet 读取、ChatML 编码、Open-MAGVIT2 code 替换、collator。
-- `src/qwen35_hf/train/image_packing.py`：Qwen vision patch packing 与 retrieval token box 生成。
-- `src/qwen35_hf/visual_codec.py`：本地 Open-MAGVIT2 visual codec 与 cache。
-- `src/qwen35_hf/query_tokens.py`：`<vq>`、`</vq>`、`<vis_i>`、`<|replay_pad|>` token helpers。
+- `src/fovea_token/modeling_fovea.py`：`FoveaForConditionalGeneration` 和 packed visual-query retrieval/replay。
+- `src/fovea_token/train/data.py`：VGR parquet 读取、ChatML 编码、IBQ code 替换、collator。
+- `src/fovea_token/train/image_packing.py`：Qwen vision patch packing 与 retrieval token box 生成。
+- `src/fovea_token/tokenizers/tokenization_ibq.py`：本地 IBQ 视觉码 tokenizer 与 cache。
+- `src/fovea_token/tokenizers/tokenization_visual_query.py`：`<vq>`、`</vq>`、`<vis_i>`、`<|replay_pad|>` token helpers。
 - `scripts/ft3.sh`：VGR 训练入口。
 - `lmms-eval/lmms_eval/models/simple/fovea.py`：本地 lmms-eval adapter。
 
 ## 本地依赖
 
-训练不会下载图像、Qwen 权重或 Open-MAGVIT2 权重。默认从项目内本地路径读取：
+训练不会下载图像、Qwen 权重或 IBQ 权重。默认从项目内本地路径读取：
 
 ```bash
-models/Open-MAGVIT2
-models/Open-MAGVIT2/configs/Open-MAGVIT2/gpu/pretrain_lfqgan_256_16384.yaml
-models/Open-MAGVIT2/tokenizer_16384.pt
+src/fovea_token/models/Open-MAGVIT2
+src/fovea_token/models/Open-MAGVIT2/configs/IBQ/gpu/pretrain_ibqgan_16384.yaml
+src/fovea_token/models/Open-MAGVIT2/IBQ_pretrain_16384.ckpt
 data/llava_next_raw_format
 ```
 
 也可以在训练命令中显式传入：
 
 ```bash
---magvit2_repo /path/to/local/Open-MAGVIT2 \
---magvit2_config /path/to/local/pretrain_lfqgan_256_16384.yaml \
---magvit2_checkpoint /path/to/local/tokenizer_16384.pt \
+--ibq_repo /path/to/local/SEED-Voken \
+--ibq_config /path/to/local/pretrain_ibqgan_16384.yaml \
+--ibq_checkpoint /path/to/local/IBQ_pretrain_16384.ckpt \
 --image_folder /path/to/llava_next_raw_format
 ```
 
-`image_folder` 必须包含 VGR `image` 字段对应的相对路径，例如 `ai2d/abc_images/311.png`。
+图像数据不会自动下载。`image_folder` 必须包含 VGR `image` 字段对应的相对路径，例如 `ai2d/abc_images/311.png`。
 
 ## 训练
 
@@ -61,9 +61,9 @@ data/vgr/vgr_longcot.parquet
 - `FT3_OUTPUT_DIR`
 - `FT3_NUM_TRAIN_EPOCHS`
 - `FT3_MAX_STEPS`
-- `FT3_MAGVIT2_REPO`
-- `FT3_MAGVIT2_CONFIG`
-- `FT3_MAGVIT2_CHECKPOINT`
+- `FT3_IBQ_REPO`
+- `FT3_IBQ_CONFIG`
+- `FT3_IBQ_CHECKPOINT`
 - `FT3_GENERATED_REPLAY_PROB`
 - `FT3_RETRIEVE_MAX_IMAGE_TOKENS`
 - `FT3_VISUAL_CODE_CACHE_DIR`
@@ -82,7 +82,7 @@ VGR assistant 文本中的区域标注：
 <vq> <vis_i> ... </vq> <|replay_pad|> ...
 ```
 
-每个 `<vq>` 绑定对应的归一化原图 box，用于 `L_align`。视觉码由本地 Open-MAGVIT2 codec 真实生成，并缓存到 `FT3_VISUAL_CODE_CACHE_DIR`。
+每个 `<vq>` 绑定对应的归一化原图 box，用于 `L_align`。视觉码由本地 IBQ codec 真实生成，并缓存到 `FT3_VISUAL_CODE_CACHE_DIR`。
 
 ## 训练目标
 
