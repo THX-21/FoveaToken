@@ -15,24 +15,27 @@ ATTN_IMPLEMENTATION="${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
 DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:0}"
 DEVICE="${EVAL_DEVICE:-${DEVICE_MAP}}"
 BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
-if [[ "${CHECKPOINT_MODE}" == "full" ]]; then
-  RESOLVED_CHECKPOINT="${FULL_CHECKPOINT}"
-  LOG_SUFFIX_DEFAULT="$(basename "${FULL_CHECKPOINT}")"
-  MODEL_ARGS="pretrained=${FULL_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=False,max_image_tokens=512"
-else
-  RESOLVED_CHECKPOINT="${LORA_CHECKPOINT}"
-  LOG_SUFFIX_DEFAULT="$(basename "${LORA_CHECKPOINT}")"
-  MODEL_ARGS="pretrained=${BASE_MODEL},peft=${LORA_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=False,max_image_tokens=512"
-fi
+
+COMMON_MODEL_ARGS="device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=False"
+case "${CHECKPOINT_MODE}" in
+  full)
+    RESOLVED_CHECKPOINT="${FULL_CHECKPOINT}"
+    MODEL_ARGS="pretrained=${FULL_CHECKPOINT},${COMMON_MODEL_ARGS}"
+    ;;
+  lora)
+    RESOLVED_CHECKPOINT="${LORA_CHECKPOINT}"
+    MODEL_ARGS="pretrained=${BASE_MODEL},peft=${LORA_CHECKPOINT},${COMMON_MODEL_ARGS}"
+    ;;
+  *)
+    echo "[eval] EVAL_CHECKPOINT_MODE must be full or lora, got ${CHECKPOINT_MODE}" >&2
+    exit 2
+    ;;
+esac
+LOG_SUFFIX_DEFAULT="$(basename "${RESOLVED_CHECKPOINT}")"
 LOG_SUFFIX="${EVAL_LOG_SUFFIX:-${LOG_SUFFIX_DEFAULT}}"
-if command -v accelerate >/dev/null 2>&1; then
-  ACCELERATE_BIN="accelerate"
-elif [[ -x "${PROJECT_ROOT}/.venv/bin/accelerate" ]]; then
-  ACCELERATE_BIN="${PROJECT_ROOT}/.venv/bin/accelerate"
-else
-  echo "[eval] accelerate not found in PATH or ${PROJECT_ROOT}/.venv/bin" >&2
-  exit 127
-fi
+ACCELERATE_BIN="$(command -v accelerate || true)"
+ACCELERATE_BIN="${ACCELERATE_BIN:-${PROJECT_ROOT}/.venv/bin/accelerate}"
+[[ -x "${ACCELERATE_BIN}" ]] || { echo "[eval] accelerate not found: ${ACCELERATE_BIN}" >&2; exit 127; }
 
 echo "[eval] BASE_MODEL=${BASE_MODEL}"
 echo "[eval] CHECKPOINT_MODE=${CHECKPOINT_MODE}"

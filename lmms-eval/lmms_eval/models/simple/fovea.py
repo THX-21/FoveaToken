@@ -120,7 +120,7 @@ class Fovea(Qwen3_VL):
         interleave_visuals: Optional[bool] = False,
         enable_thinking: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
-        max_image_tokens: int | None = 128,
+        max_image_tokens: int | None = 512,
         retrieve_max_image_tokens: int | None = 4096,
         **kwargs,
     ) -> None:

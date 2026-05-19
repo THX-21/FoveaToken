@@ -108,3 +108,11 @@ bash scripts/eval.sh
 ```
 
 默认使用 `--model fovea`、`max_image_tokens=512`、任务 `xlrs-lite`。
+
+评测其他基线模型使用：
+
+```bash
+bash scripts/eval_others.sh
+```
+
+默认使用 `--model qwen3_5`、任务 `xlrs-lite`。可通过 `EVAL_MODEL`、`EVAL_BASE_MODEL`、`EVAL_LIMIT`、`EVAL_FORCE_SIMPLE` 等环境变量覆盖。
