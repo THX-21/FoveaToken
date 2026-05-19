@@ -42,7 +42,7 @@ VGR 中的：
 <vq> <vis_i> ... </vq> <|replay_pad|> ...
 ```
 
-每个 `<vq>` 必须绑定一个原图归一化 box，用于 `L_align`。图像路径相对 `image_folder`。
+每个 `<vq>` 必须绑定一个原图归一化 box，用于 `L_align`。图像路径相对 `image_folder`。assistant 文本里不属于合法 region tag 的残留 `<image>`、孤立 `<SOT>`、孤立 `<EOT>` 会在懒加载阶段直接清掉，不再参与 placeholder 展开。
 
 ## 本地权重
 

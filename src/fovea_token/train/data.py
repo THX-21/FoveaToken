@@ -37,26 +37,7 @@ IGNORE_INDEX = -100
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
 SOT_EOT_IMAGE_RE = re.compile(r"<SOT>\s*(\[[^\]]+\])\s*<EOT>\s*<image>")
-
-
-def preprocess_multimodal_conversations(conversations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize conversation text before tokenization.
-
-    When a turn contains exactly one `<image>` token mixed into text, move it to
-    the beginning of the message on its own line. This matches the prompt style
-    expected by many multimodal instruction datasets and keeps template handling
-    predictable.
-    """
-
-    conversations = copy.deepcopy(conversations)
-    for sentence in conversations:
-        value = sentence["value"]
-        num_images = len(re.findall(DEFAULT_IMAGE_TOKEN, value))
-        if num_images == 1 and DEFAULT_IMAGE_TOKEN in value and not value.startswith(DEFAULT_IMAGE_TOKEN):
-            value = value.replace(DEFAULT_IMAGE_TOKEN, "").strip()
-            value = f"{DEFAULT_IMAGE_TOKEN}\n{value}".strip()
-        sentence["value"] = value
-    return conversations
+ORPHAN_VGR_TAG_RE = re.compile(r"<SOT>|<EOT>")
 
 
 def load_training_records(data_path: str) -> list[dict[str, Any]]:
@@ -103,9 +84,16 @@ def replace_vgr_regions_with_visual_queries(
     image_path: str,
     visual_codec: IBQCodec,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Convert VGR `<SOT>box<EOT><image>` tags to `<vq> codes </vq> replay pads."""
+    """Convert VGR `<SOT>box<EOT><image>` tags to `<vq> codes </vq> replay pads`.
+
+    Assistant-side VGR data may also contain orphan `<SOT>/<EOT>` tags or stray
+    plain `<image>` markers that do not correspond to a real extra image. Drop
+    those leftovers here so downstream placeholder expansion only sees the
+    sample-level user image placeholder.
+    """
 
     queries: list[dict[str, Any]] = []
+    saw_vgr_markup = bool(SOT_EOT_IMAGE_RE.search(text) or ORPHAN_VGR_TAG_RE.search(text))
 
     def replace(match: re.Match) -> str:
         box = parse_vgr_box(match.group(1))
@@ -115,7 +103,10 @@ def replace_vgr_regions_with_visual_queries(
         queries.append({"box": box, "codes": codes})
         return f"{VQ_START_TOKEN} {code_tokens} {VQ_END_TOKEN}{replay}"
 
-    return SOT_EOT_IMAGE_RE.sub(replace, text), queries
+    cleaned_text = ORPHAN_VGR_TAG_RE.sub("", SOT_EOT_IMAGE_RE.sub(replace, text))
+    if saw_vgr_markup:
+        cleaned_text = cleaned_text.replace(DEFAULT_IMAGE_TOKEN, "")
+    return cleaned_text, queries
 
 
 def replace_image_tokens_in_conversations(
@@ -186,8 +177,7 @@ def encode_chatml_example(
     as the assistant.
     """
 
-    prompt_conversations = preprocess_multimodal_conversations(list(conversations))
-    prompt_conversations = replace_image_tokens_in_conversations(prompt_conversations, image_token_counts)
+    prompt_conversations = replace_image_tokens_in_conversations(list(conversations), image_token_counts)
 
     input_ids: list[int] = []
     labels: list[int] = []
