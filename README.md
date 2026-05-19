@@ -85,7 +85,7 @@ VGR assistant 文本中的区域标注：
 <vq> <vis_i> ... </vq> <|replay_pad|> ...
 ```
 
-每个 `<vq>` 绑定对应的归一化原图 box，用于 `L_align`。视觉码由本地 IBQ codec 真实生成，并缓存到 `FT3_VISUAL_CODE_CACHE_DIR`。
+每个 `<vq>` 绑定对应的归一化原图 box，用于 `L_align`。视觉码由本地 IBQ codec 真实生成，并缓存到 `FT3_VISUAL_CODE_CACHE_DIR`。assistant 里不属于合法 region tag 的残留 `<image>`、孤立 `<SOT>`、孤立 `<EOT>` 会在这一步一起清掉。
 
 ## 训练目标
 

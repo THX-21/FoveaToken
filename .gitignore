@@ -11,4 +11,5 @@ checkpoints/
 docs/
 *.egg-info/
 data/
+outputs/
 PLAN.md

@@ -135,7 +135,7 @@ def maybe_enable_lora(model, model_args: ModelArguments):
     return model
 
 
-def print_loading_summary(model, loading_info: dict) -> None:
+def print_loading_summary(model, loading_info: dict, source_label: str) -> None:
     """Print a compact summary of checkpoint loading results."""
 
     missing_keys = loading_info.get("missing_keys", [])
@@ -146,7 +146,7 @@ def print_loading_summary(model, loading_info: dict) -> None:
     total_model_keys = len(model.state_dict())
     loaded_key_count = total_model_keys - len(missing_keys) - len(mismatched_keys)
 
-    print("=== Checkpoint Loading Summary ===")
+    print(f"=== Checkpoint Loading Summary ({source_label}) ===")
     print(f"total_model_keys: {total_model_keys}")
     print(f"loaded_keys: {loaded_key_count}")
     print(f"missing_keys: {len(missing_keys)}")
@@ -155,17 +155,17 @@ def print_loading_summary(model, loading_info: dict) -> None:
     print(f"error_msgs: {len(error_msgs)}")
 
     if missing_keys:
-        print("missing_key_names:")
+        print(f"missing_key_names_from_{source_label}:")
         for name in missing_keys:
             print(f"  {name}")
 
     if unexpected_keys:
-        print("unexpected_key_names:")
+        print(f"unexpected_key_names_from_{source_label}:")
         for name in unexpected_keys:
             print(f"  {name}")
 
     if mismatched_keys:
-        print("mismatched_key_names:")
+        print(f"mismatched_key_names_from_{source_label}:")
         for item in mismatched_keys:
             if isinstance(item, (list, tuple)) and len(item) >= 3:
                 print(f"  {item[0]} checkpoint_shape={item[1]} model_shape={item[2]}")
@@ -173,9 +173,17 @@ def print_loading_summary(model, loading_info: dict) -> None:
                 print(f"  {item}")
 
     if error_msgs:
-        print("loading_errors:")
+        print(f"loading_errors_from_{source_label}:")
         for msg in error_msgs:
             print(f"  {msg}")
+
+
+def should_load_model_from_checkpoint(model_name_or_path: str, resume_from_checkpoint: str | None, lora_enable: bool) -> bool:
+    if lora_enable or not resume_from_checkpoint:
+        return False
+    if os.path.abspath(model_name_or_path) == os.path.abspath(resume_from_checkpoint):
+        return True
+    return os.path.isfile(os.path.join(resume_from_checkpoint, "model.safetensors"))
 
 
 def print_parameter_summary(model) -> None:
@@ -333,8 +341,20 @@ def main() -> None:
         padding_side="right",
     )
     add_visual_query_tokens(tokenizer)
+
+    init_model_path = model_args.model_name_or_path
+    loading_source_label = "base_model"
+    if should_load_model_from_checkpoint(
+        model_name_or_path=model_args.model_name_or_path,
+        resume_from_checkpoint=training_args.resume_from_checkpoint,
+        lora_enable=model_args.lora_enable,
+    ):
+        init_model_path = training_args.resume_from_checkpoint
+        loading_source_label = "resume_checkpoint"
+        print(f"Initializing model weights from resume checkpoint: {init_model_path}")
+
     model, loading_info = FoveaForConditionalGeneration.from_pretrained(
-        model_args.model_name_or_path,
+        init_model_path,
         torch_dtype="auto",
         attn_implementation=training_args.attn_implementation,
         output_loading_info=True,
@@ -343,7 +363,7 @@ def main() -> None:
         model.resize_token_embeddings(len(tokenizer))
     model.config.visual_query_generated_replay_prob = float(model_args.visual_query_generated_replay_prob)
     sync_visual_query_token_ids(model.config, tokenizer)
-    print_loading_summary(model, loading_info)
+    print_loading_summary(model, loading_info, source_label=loading_source_label)
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token

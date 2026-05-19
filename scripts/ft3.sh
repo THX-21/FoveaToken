@@ -75,7 +75,9 @@ LAUNCHER=(
 RESUME_ARGS=()
 LATEST_CHECKPOINT="$(find "${OUTPUT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' 2>/dev/null | sort -V | tail -n 1)"
 if [[ -n "${LATEST_CHECKPOINT}" ]]; then
-    echo "Resuming from checkpoint: ${LATEST_CHECKPOINT}"
+    echo "[ft3] RESUME_CHECKPOINT=${LATEST_CHECKPOINT}"
+    echo "[ft3] Model weights will initialize from the resume checkpoint because lora_enable=false."
+    echo "[ft3] Trainer state will resume from the same checkpoint."
     RESUME_ARGS=(--resume_from_checkpoint "${LATEST_CHECKPOINT}")
 fi
 

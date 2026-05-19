@@ -105,21 +105,21 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
     @auto_docstring
     def get_video_features(self, pixel_values_videos: torch.FloatTensor, video_grid_thw: torch.LongTensor | None = None, **kwargs: Unpack[TransformersKwargs]):
-        """Return video features for packed video inputs.
-
-        Args:
-            pixel_values_videos: Packed video pixel tensor.
-            video_grid_thw: Temporal-height-width grid metadata for each packed video.
+        r"""
+        pixel_values_videos (`torch.FloatTensor`):
+            Packed video pixel tensor.
+        video_grid_thw (`torch.LongTensor`, *optional*):
+            Temporal-height-width grid metadata for each packed video.
         """
         return self.model.get_video_features(pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thw, **kwargs)
 
     @auto_docstring
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None, **kwargs: Unpack[TransformersKwargs]):
-        """Return image features for packed image inputs.
-
-        Args:
-            pixel_values: Packed image pixel tensor.
-            image_grid_thw: Temporal-height-width grid metadata for each packed image.
+        r"""
+        pixel_values (`torch.FloatTensor`):
+            Packed image pixel tensor.
+        image_grid_thw (`torch.LongTensor`, *optional*):
+            Temporal-height-width grid metadata for each packed image.
         """
         return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
