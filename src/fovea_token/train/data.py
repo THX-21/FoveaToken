@@ -278,7 +278,7 @@ def build_visual_query_metadata(
         code_positions.extend(codes)
         replay_positions.extend(range(replay_start, replay_end))
         code_query_indices.extend([query_index] * len(codes))
-        code_label_mask[pos : end + 1] = labels[pos : end + 1].ne(IGNORE_INDEX)
+        code_label_mask[codes] = labels[codes].ne(IGNORE_INDEX)
         query_index += 1
         pos = replay_end
 

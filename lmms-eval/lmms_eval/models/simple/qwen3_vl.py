@@ -237,6 +237,17 @@ class Qwen3_VL(lmms):
         template_kwargs.update(kwargs)
         return self.processor.apply_chat_template(batched_messages, tokenize=False, add_generation_prompt=True, **template_kwargs)
 
+    def _build_eos_token_ids(self):
+        eos_token_ids = []
+        for token_id in (
+            self.tokenizer.eos_token_id,
+            self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
+        ):
+            if token_id is None or token_id < 0 or token_id in eos_token_ids:
+                continue
+            eos_token_ids.append(int(token_id))
+        return eos_token_ids[0] if len(eos_token_ids) == 1 else eos_token_ids
+
     def _build_generate_kwargs(self, gen_kwargs):
         """Build model.generate() kwargs from user gen_kwargs merged with defaults."""
         current = {**self.DEFAULT_GEN_KWARGS, **gen_kwargs}
@@ -251,7 +262,7 @@ class Qwen3_VL(lmms):
             current.pop("top_k", None)
 
         generate_kwargs = {
-            "eos_token_id": self.tokenizer.eos_token_id,
+            "eos_token_id": self._build_eos_token_ids(),
             "pad_token_id": pad_token_id,
             "max_new_tokens": current["max_new_tokens"],
             "use_cache": self.use_cache,

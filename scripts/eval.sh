@@ -3,20 +3,20 @@
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
-export HF_HUB_OFFLINE=1
+# export HF_HUB_OFFLINE=1
 
 BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen3.5-9B}"
 CHECKPOINT_MODE="${EVAL_CHECKPOINT_MODE:-full}"
-LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-visual-query-replay/checkpoint-200}"
-FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-visual-query-replay/checkpoint-200}"
-TASKS="${EVAL_TASKS:-xlrs-lite}"
+LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-visual-query-replay/checkpoint-2000}"
+FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-visual-query-replay/checkpoint-2000}"
+TASKS="${EVAL_TASKS:-chartqa_reasoning}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 ATTN_IMPLEMENTATION="${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
 DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:0}"
 DEVICE="${EVAL_DEVICE:-${DEVICE_MAP}}"
 BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 
-COMMON_MODEL_ARGS="device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=False"
+COMMON_MODEL_ARGS="device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=True"
 case "${CHECKPOINT_MODE}" in
   full)
     RESOLVED_CHECKPOINT="${FULL_CHECKPOINT}"

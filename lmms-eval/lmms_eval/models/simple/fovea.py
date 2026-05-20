@@ -122,6 +122,7 @@ class Fovea(Qwen3_VL):
         reasoning_prompt: Optional[str] = None,
         max_image_tokens: int | None = 512,
         retrieve_max_image_tokens: int | None = 4096,
+        use_visual_query: Optional[bool] = False,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -169,6 +170,7 @@ class Fovea(Qwen3_VL):
         )
         self.vision_packer = vision_packer
         self.retrieve_max_image_tokens = retrieve_max_image_tokens
+        self.use_visual_query = use_visual_query
         self.processor = FoveaProcessor(
             image_processor=LocalVisionImageProcessor(vision_packer),
             tokenizer=self._tokenizer,
