@@ -9,12 +9,6 @@ from transformers.trainer_pt_utils import get_parameter_names
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
 from fovea_token import FoveaForConditionalGeneration, FoveaTokenizer
-from fovea_token.tokenizers.tokenization_ibq import (
-    DEFAULT_IBQ_CHECKPOINT,
-    DEFAULT_IBQ_CONFIG,
-    DEFAULT_IBQ_REPO,
-    IBQCodec,
-)
 from fovea_token.tokenizers.tokenization_visual_query import add_visual_query_tokens, sync_visual_query_token_ids
 
 from .data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
@@ -37,10 +31,6 @@ class DataArguments:
     image_folder: str = field(default=None)
     max_image_tokens: Optional[int] = field(default=None)
     retrieve_max_image_tokens: Optional[int] = field(default=4096)
-    ibq_repo: str = field(default=DEFAULT_IBQ_REPO)
-    ibq_checkpoint: str = field(default=DEFAULT_IBQ_CHECKPOINT)
-    ibq_config: str = field(default=DEFAULT_IBQ_CONFIG)
-    visual_code_cache_dir: Optional[str] = field(default=None)
     system_message: str = field(default="You are a helpful assistant.")
 
 
@@ -386,13 +376,6 @@ def main() -> None:
         vision_config=model.config.vision_config,
         max_image_tokens=data_args.max_image_tokens,
     )
-    visual_codec = IBQCodec.from_paths(
-        repo=data_args.ibq_repo,
-        checkpoint=data_args.ibq_checkpoint,
-        config=data_args.ibq_config,
-        cache_dir=data_args.visual_code_cache_dir,
-    )
-
     train_dataset = LazySupervisedDataset(
         data_path=data_args.data_path,
         image_folder=data_args.image_folder,
@@ -400,8 +383,8 @@ def main() -> None:
         vision_packer=vision_packer,
         image_token_id=model.config.image_token_id,
         system_message=data_args.system_message,
-        visual_codec=visual_codec,
         retrieve_max_image_tokens=data_args.retrieve_max_image_tokens,
+        model_max_length=training_args.model_max_length,
     )
     data_collator = DataCollatorForQwen3_5SFT(
         tokenizer=tokenizer,

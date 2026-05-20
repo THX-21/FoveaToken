@@ -428,14 +428,14 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             position_ids = position_ids + self.model.rope_deltas.to(position_ids.device).view(1, -1, 1)
         return position_ids
 
-    def _in_visual_query(self, input_ids, prompt_len, max_codes=64):
+    def _visual_query_state(self, input_ids, prompt_len, max_codes=64):
         ids = input_ids[0, prompt_len:].tolist()
         start_id = self.config.vq_start_token_id
         end_id = self.config.vq_end_token_id
         vis_start = self.config.vis_token_start_id
         vis_end = self.config.vis_token_end_id
         if None in (start_id, end_id, vis_start, vis_end):
-            return False, 0
+            return False, 0, False
         start = None
         for idx, token_id in enumerate(ids):
             if token_id == start_id:
@@ -443,21 +443,27 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             elif token_id == end_id and start is not None:
                 start = None
         if start is None:
-            return False, 0
+            return False, 0, False
         code_count = sum(1 for token_id in ids[start + 1 :] if int(vis_start) <= token_id <= int(vis_end))
-        return code_count < int(max_codes), code_count
+        return True, code_count, code_count < int(max_codes)
 
     def _constrained_next_token(self, logits, input_ids, prompt_len):
-        active, code_count = self._in_visual_query(input_ids, prompt_len)
-        if not active and code_count == 0:
-            return logits.argmax(dim=-1, keepdim=True)
         vis_start = int(self.config.vis_token_start_id)
         vis_end = int(self.config.vis_token_end_id)
         end_id = int(self.config.vq_end_token_id)
+        replay_id = int(self.config.replay_token_id)
+        in_query, code_count, can_add_code = self._visual_query_state(input_ids, prompt_len)
         masked = logits.new_full(logits.shape, torch.finfo(logits.dtype).min)
-        if active:
-            masked[:, vis_start : vis_end + 1] = logits[:, vis_start : vis_end + 1]
-        masked[:, end_id] = logits[:, end_id]
+        if in_query:
+            if can_add_code:
+                masked[:, vis_start : vis_end + 1] = logits[:, vis_start : vis_end + 1]
+            if code_count > 0:
+                masked[:, end_id] = logits[:, end_id]
+        else:
+            masked.copy_(logits)
+            masked[:, vis_start : vis_end + 1] = torch.finfo(logits.dtype).min
+            masked[:, end_id] = torch.finfo(logits.dtype).min
+            masked[:, replay_id] = torch.finfo(logits.dtype).min
         return masked.argmax(dim=-1, keepdim=True)
 
     def _query_spans_with_replay(self, input_ids):

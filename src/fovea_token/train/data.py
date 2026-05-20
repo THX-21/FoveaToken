@@ -22,7 +22,6 @@ from .image_packing import (
     pack_single_image_with_boxes,
     pack_single_image,
 )
-from ..tokenizers.tokenization_ibq import IBQCodec
 from ..tokenizers.tokenization_visual_query import (
     REPLAY_TOKEN,
     VQ_END_TOKEN,
@@ -82,7 +81,7 @@ def replace_vgr_regions_with_visual_queries(
     text: str,
     *,
     image_path: str,
-    visual_codec: IBQCodec,
+    visual_codec: Any,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Convert VGR `<SOT>box<EOT><image>` tags to `<vq> codes </vq> replay pads`.
 
@@ -279,6 +278,7 @@ def build_visual_query_metadata(
         replay_positions.extend(range(replay_start, replay_end))
         code_query_indices.extend([query_index] * len(codes))
         code_label_mask[codes] = labels[codes].ne(IGNORE_INDEX)
+        labels[replay_start:replay_end] = IGNORE_INDEX
         query_index += 1
         pos = replay_end
 
@@ -345,8 +345,8 @@ class LazySupervisedDataset(Dataset):
         vision_packer: VisionPacker,
         image_token_id: int,
         system_message: str = DEFAULT_SYSTEM_MESSAGE,
-        visual_codec: IBQCodec | None = None,
         retrieve_max_image_tokens: int | None = 4096,
+        model_max_length: int | None = None,
     ) -> None:
         self.records = load_training_records(data_path)
         self.image_folder = image_folder
@@ -354,8 +354,9 @@ class LazySupervisedDataset(Dataset):
         self.vision_packer = vision_packer
         self.image_token_id = image_token_id
         self.system_message = system_message
-        self.visual_codec = visual_codec
         self.retrieve_max_image_tokens = retrieve_max_image_tokens
+        self.model_max_length = int(model_max_length or getattr(tokenizer, "model_max_length", 0) or 0)
+        self._printed_overlength_indices: set[int] = set()
 
     def __len__(self) -> int:
         return len(self.records)
@@ -372,7 +373,7 @@ class LazySupervisedDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
         return self.vision_packer.pack_retrieve(image, self.retrieve_max_image_tokens)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def _build_instance(self, index: int) -> dict[str, Any]:
         """Build one training instance.
 
         Output fields:
@@ -420,22 +421,14 @@ class LazySupervisedDataset(Dataset):
                 retrieve_patch_boxes = torch.cat(retrieve_box_list, dim=0)
 
         conversations = copy.deepcopy(record["conversations"])
-        if self.visual_codec is None or image_field is None:
-            raise ValueError("VGR visual-query training requires an image and an IBQ codec.")
+        if image_field is None:
+            raise ValueError("VGR visual-query training requires an image.")
         image_names = image_field if isinstance(image_field, list) else [image_field]
         if len(image_names) != 1:
             raise ValueError("VGR visual-query training expects one image per sample.")
-        image_path = os.path.join(self.image_folder, image_names[0])
-        for sentence in conversations:
-            if sentence.get("from") not in {"gpt", "assistant"}:
-                continue
-            value, parsed_queries = replace_vgr_regions_with_visual_queries(
-                sentence["value"],
-                image_path=image_path,
-                visual_codec=self.visual_codec,
-            )
-            sentence["value"] = value
-            query_boxes.extend(query["box"] for query in parsed_queries)
+        if not record.get("fovea_preprocessed", False) or "fovea_query_boxes" not in record:
+            raise ValueError("Training requires offline-preprocessed VGR parquet with fovea_query_boxes.")
+        query_boxes.extend(tuple(float(v) for v in box) for box in record["fovea_query_boxes"])
 
         input_ids, labels = encode_chatml_example(
             tokenizer=self.tokenizer,
@@ -462,6 +455,23 @@ class LazySupervisedDataset(Dataset):
             "retrieve_patch_boxes": retrieve_patch_boxes,
             **vq_metadata,
         }
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        for offset in range(len(self.records)):
+            current_index = (index + offset) % len(self.records)
+            instance = self._build_instance(current_index)
+            if self.model_max_length <= 0 or instance["input_ids"].numel() <= self.model_max_length:
+                return instance
+            if current_index not in self._printed_overlength_indices:
+                self._printed_overlength_indices.add(current_index)
+                image_name = self.records[current_index].get("image", "<no-image>")
+                print(
+                    "[data] skip overlength sample "
+                    f"index={current_index} image={image_name} "
+                    f"tokens={instance['input_ids'].numel()} model_max_length={self.model_max_length}",
+                    flush=True,
+                )
+        raise RuntimeError(f"All {len(self.records)} training samples exceed model_max_length={self.model_max_length}.")
 
 
 @dataclass

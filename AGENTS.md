@@ -10,6 +10,7 @@ FoveaToken 基于 Qwen3.5 多模态实现，新增逻辑集中在：
 - `src/fovea_token/train/data.py`
 - `src/fovea_token/tokenizers/tokenization_ibq.py`
 - `src/fovea_token/tokenizers/tokenization_visual_query.py`
+- `scripts/preprocess_vgr.py`
 
 核心数据流：
 
@@ -23,11 +24,11 @@ FoveaToken 基于 Qwen3.5 多模态实现，新增逻辑集中在：
 
 ## 数据
 
-训练数据只使用 VGR parquet：
+原始数据只使用 VGR parquet：
 
 ```text
-data/vgr/data/vgr_shortcot.parquet
-data/vgr/data/vgr_longcot.parquet
+data/vgr/vgr_shortcot.parquet
+data/vgr/vgr_longcot.parquet
 ```
 
 VGR 中的：
@@ -42,11 +43,21 @@ VGR 中的：
 <vq> <vis_i> ... </vq> <|replay_pad|> ...
 ```
 
-每个 `<vq>` 必须绑定一个原图归一化 box，用于 `L_align`。图像路径相对 `image_folder`。assistant 文本里不属于合法 region tag 的残留 `<image>`、孤立 `<SOT>`、孤立 `<EOT>` 会在懒加载阶段直接清掉，不再参与 placeholder 展开。
+每个 `<vq>` 必须绑定一个原图归一化 box，用于 `L_align`。图像路径相对 `image_folder`。assistant 文本里不属于合法 region tag 的残留 `<image>`、孤立 `<SOT>`、孤立 `<EOT>` 会在离线预处理阶段直接清掉，不再参与 placeholder 展开。
+`<|replay_pad|>` 只作为 replay vector 占位，训练 labels 必须设为 `IGNORE_INDEX`，不参与 LM loss。
+
+训练默认读取离线预处理结果：
+
+```text
+data/vgr/preprocessed/vgr_shortcot.parquet
+data/vgr/preprocessed/vgr_longcot.parquet
+```
+
+训练阶段不调用 IBQ codec；IBQ 只允许在 `scripts/preprocess_vgr.py` 离线预处理阶段使用。
 
 ## 本地权重
 
-不要自动下载模型或图像。训练默认读取项目内本地路径：
+不要自动下载模型或图像。离线预处理默认读取项目内本地 IBQ 路径，训练默认读取预处理后的 parquet 和本地图像：
 
 ```bash
 src/fovea_token/models/Open-MAGVIT2
@@ -55,7 +66,7 @@ src/fovea_token/models/Open-MAGVIT2/IBQ_pretrain_16384.ckpt
 data/vgr/llava_next_raw_format
 ```
 
-需要换路径时，通过训练参数 `--ibq_repo`、`--ibq_config`、`--ibq_checkpoint`、`--image_folder` 显式传入。IBQ 必须是真实本地 16384 checkpoint，不使用伪码。
+需要换路径时，通过预处理参数 `--ibq_repo`、`--ibq_config`、`--ibq_checkpoint`、`--image_folder` 显式传入。IBQ 必须是真实本地 16384 checkpoint，不使用伪码。
 
 ## 训练入口
 
@@ -71,12 +82,8 @@ bash scripts/ft3.sh
 - `FT3_IMAGE_FOLDER`
 - `FT3_CKPT_PATH`
 - `FT3_OUTPUT_DIR`
-- `FT3_IBQ_REPO`
-- `FT3_IBQ_CONFIG`
-- `FT3_IBQ_CHECKPOINT`
 - `FT3_GENERATED_REPLAY_PROB`
 - `FT3_RETRIEVE_MAX_IMAGE_TOKENS`
-- `FT3_VISUAL_CODE_CACHE_DIR`
 
 运行时需要：
 
