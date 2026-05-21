@@ -7,9 +7,7 @@ project-local SEED-Voken checkout under `src/fovea_token/models/Open-MAGVIT2`.
 
 from __future__ import annotations
 
-import hashlib
 import inspect
-import json
 import os
 import sys
 from dataclasses import dataclass
@@ -38,7 +36,6 @@ class IBQConfig:
     repo: str = DEFAULT_IBQ_REPO
     checkpoint: str = DEFAULT_IBQ_CHECKPOINT
     config: str = DEFAULT_IBQ_CONFIG
-    cache_dir: str | None = None
     codebook_size: int = 16384
     max_latent_tokens: int = 64
     downsample_factor: int = 16
@@ -59,9 +56,6 @@ class IBQCodec:
             raise FileNotFoundError(f"IBQ checkpoint does not exist: {self.checkpoint}")
         if not self.config_path.exists():
             raise FileNotFoundError(f"IBQ config does not exist: {self.config_path}")
-        self.cache_dir = Path(config.cache_dir).expanduser().resolve() if config.cache_dir else None
-        if self.cache_dir is not None:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.device = torch.device(config.device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self._model: Any | None = None
 
@@ -72,52 +66,9 @@ class IBQCodec:
         repo: str = DEFAULT_IBQ_REPO,
         checkpoint: str = DEFAULT_IBQ_CHECKPOINT,
         config: str = DEFAULT_IBQ_CONFIG,
-        cache_dir: str | None = None,
         device: str | None = None,
     ) -> "IBQCodec":
-        return cls(IBQConfig(repo=repo, checkpoint=checkpoint, config=config, cache_dir=cache_dir, device=device))
-
-    def _cache_key(self, image_path: str, box: tuple[float, float, float, float]) -> str:
-        image_stat = os.stat(image_path)
-        ckpt_stat = os.stat(self.checkpoint)
-        payload = {
-            "path": str(Path(image_path).resolve()),
-            "mtime": image_stat.st_mtime_ns,
-            "size": image_stat.st_size,
-            "box": [round(float(v), 6) for v in box],
-            "ckpt": str(self.checkpoint),
-            "ckpt_mtime": ckpt_stat.st_mtime_ns,
-            "ckpt_size": ckpt_stat.st_size,
-            "max": self.config.max_latent_tokens,
-            "stride": self.config.downsample_factor,
-        }
-        config_stat = os.stat(self.config_path)
-        payload.update(
-            {
-                "config": str(self.config_path),
-                "config_mtime": config_stat.st_mtime_ns,
-                "config_size": config_stat.st_size,
-            }
-        )
-        return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-
-    def _load_cache(self, key: str) -> list[int] | None:
-        if self.cache_dir is None:
-            return None
-        path = self.cache_dir / f"{key}.json"
-        if not path.exists():
-            return None
-        with open(path, "r", encoding="utf-8") as handle:
-            return [int(v) for v in json.load(handle)["codes"]]
-
-    def _save_cache(self, key: str, codes: list[int]) -> None:
-        if self.cache_dir is None:
-            return
-        path = self.cache_dir / f"{key}.json"
-        tmp = path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"codes": [int(v) for v in codes]}, handle)
-        os.replace(tmp, path)
+        return cls(IBQConfig(repo=repo, checkpoint=checkpoint, config=config, device=device))
 
     def _crop_and_resize(self, image: Image.Image, box: tuple[float, float, float, float]) -> Image.Image:
         width, height = image.size
@@ -167,10 +118,6 @@ class IBQCodec:
 
     @torch.no_grad()
     def encode_crop(self, image_path: str, box: tuple[float, float, float, float]) -> list[int]:
-        key = self._cache_key(image_path, box)
-        cached = self._load_cache(key)
-        if cached is not None:
-            return cached
         image = Image.open(image_path).convert("RGB")
         crop = self._crop_and_resize(image, box)
         model = self._load_model()
@@ -195,7 +142,6 @@ class IBQCodec:
             raise ValueError("IBQ returned a code outside the configured 16384-token codebook.")
         if not codes:
             raise ValueError("IBQ returned an empty visual-code sequence.")
-        self._save_cache(key, codes)
         return codes
 
 

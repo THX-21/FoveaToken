@@ -13,7 +13,7 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 - `src/fovea_token/modeling_fovea.py`：`FoveaForConditionalGeneration` 和 packed visual-query retrieval/replay。
 - `src/fovea_token/train/data.py`：离线预处理后的 VGR parquet 读取、ChatML 编码、collator。
 - `src/fovea_token/train/image_packing.py`：Qwen vision patch packing 与 retrieval token box 生成。
-- `src/fovea_token/tokenizers/tokenization_ibq.py`：离线 VGR 预处理使用的本地 IBQ 视觉码 tokenizer 与 cache。
+- `src/fovea_token/tokenizers/tokenization_ibq.py`：离线 VGR 预处理使用的本地 IBQ 视觉码 tokenizer。
 - `src/fovea_token/tokenizers/tokenization_visual_query.py`：`<vq>`、`</vq>`、`<vis_i>`、`<|replay_pad|>` token helpers。
 - `scripts/preprocess_vgr.py`：把原始 VGR parquet 离线转换成训练 parquet。
 - `scripts/ft3.sh`：VGR 训练入口。
@@ -93,7 +93,7 @@ VGR assistant 文本中的区域标注：
 <vq> <vis_i> ... </vq> <|replay_pad|> ...
 ```
 
-每个 `<vq>` 绑定对应的归一化原图 box，用于 `L_align`。视觉码由本地 IBQ codec 在预处理阶段真实生成，并缓存到 `data/vgr/.visual_code_cache`。assistant 里不属于合法 region tag 的残留 `<image>`、孤立 `<SOT>`、孤立 `<EOT>` 会在这一步一起清掉。
+每个 `<vq>` 绑定对应的归一化原图 box，用于 `L_align`。视觉码由本地 IBQ codec 在预处理阶段真实生成。assistant 里不属于合法 region tag 的残留 `<image>`、孤立 `<SOT>`、孤立 `<EOT>` 会在这一步一起清掉。
 
 ## 训练目标
 

@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import inspect
-import json
 import math
 import os
 import sys
@@ -44,7 +42,6 @@ class OpenMAGVIT2Codec:
         repo: str,
         checkpoint: str,
         config: str,
-        cache_dir: str | None,
         device: str | None,
         codebook_size: int = 16384,
         max_latent_tokens: int = 256,
@@ -59,53 +56,11 @@ class OpenMAGVIT2Codec:
             raise FileNotFoundError(f"Open-MAGVIT2 checkpoint does not exist: {self.checkpoint}")
         if not self.config_path.exists():
             raise FileNotFoundError(f"Open-MAGVIT2 config does not exist: {self.config_path}")
-        self.cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir else None
-        if self.cache_dir is not None:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.codebook_size = int(codebook_size)
         self.max_latent_tokens = int(max_latent_tokens)
         self.downsample_factor = int(downsample_factor)
         self._model = None
-
-    def _cache_key(self, image_path: str, box: tuple[float, float, float, float]) -> str:
-        image_stat = os.stat(image_path)
-        ckpt_stat = os.stat(self.checkpoint)
-        config_stat = os.stat(self.config_path)
-        payload = {
-            "codec": "open_magvit2",
-            "path": str(Path(image_path).resolve()),
-            "mtime": image_stat.st_mtime_ns,
-            "size": image_stat.st_size,
-            "box": [round(float(v), 6) for v in box],
-            "ckpt": str(self.checkpoint),
-            "ckpt_mtime": ckpt_stat.st_mtime_ns,
-            "ckpt_size": ckpt_stat.st_size,
-            "config": str(self.config_path),
-            "config_mtime": config_stat.st_mtime_ns,
-            "config_size": config_stat.st_size,
-            "max": self.max_latent_tokens,
-            "stride": self.downsample_factor,
-        }
-        return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-
-    def _load_cache(self, key: str) -> list[int] | None:
-        if self.cache_dir is None:
-            return None
-        path = self.cache_dir / f"{key}.json"
-        if not path.exists():
-            return None
-        with open(path, "r", encoding="utf-8") as handle:
-            return [int(v) for v in json.load(handle)["codes"]]
-
-    def _save_cache(self, key: str, codes: list[int]) -> None:
-        if self.cache_dir is None:
-            return
-        path = self.cache_dir / f"{key}.json"
-        tmp = path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"codes": [int(v) for v in codes]}, handle)
-        os.replace(tmp, path)
 
     def _crop_and_resize(self, image: Image.Image, box: tuple[float, float, float, float]) -> Image.Image:
         width, height = image.size
@@ -158,10 +113,6 @@ class OpenMAGVIT2Codec:
 
     @torch.no_grad()
     def encode_crop(self, image_path: str, box: tuple[float, float, float, float]) -> list[int]:
-        key = self._cache_key(image_path, box)
-        cached = self._load_cache(key)
-        if cached is not None:
-            return cached
         image = Image.open(image_path).convert("RGB")
         crop = self._crop_and_resize(image, box)
         model = self._load_model()
@@ -183,7 +134,6 @@ class OpenMAGVIT2Codec:
             raise ValueError("Open-MAGVIT2 returned a code outside the configured 16384-token codebook.")
         if not codes:
             raise ValueError("Open-MAGVIT2 returned an empty visual-code sequence.")
-        self._save_cache(key, codes)
         return codes
 
 
@@ -200,7 +150,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--open-magvit2-repo", type=str, default=DEFAULT_OPEN_MAGVIT2_REPO)
     parser.add_argument("--open-magvit2-checkpoint", type=str, default=DEFAULT_OPEN_MAGVIT2_CHECKPOINT)
     parser.add_argument("--open-magvit2-config", type=str, default=DEFAULT_OPEN_MAGVIT2_CONFIG)
-    parser.add_argument("--visual-code-cache-dir", type=str, default="data/vgr/.visual_code_cache")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-text-width", type=int, default=110)
     return parser.parse_args()
@@ -443,7 +392,6 @@ def main() -> None:
             repo=args.ibq_repo,
             checkpoint=args.ibq_checkpoint,
             config=args.ibq_config,
-            cache_dir=args.visual_code_cache_dir,
             device=args.device,
         )
     else:
@@ -451,7 +399,6 @@ def main() -> None:
             repo=args.open_magvit2_repo,
             checkpoint=args.open_magvit2_checkpoint,
             config=args.open_magvit2_config,
-            cache_dir=args.visual_code_cache_dir,
             device=args.device,
         )
 

@@ -4,7 +4,7 @@
 This script is the only training-data path that calls the IBQ codec. It rewrites
 VGR parquet conversations from `<SOT>box<EOT><image>` into
 `<vq> <vis_i> ... </vq><|replay_pad|>...` and stores the matched boxes in
-`fovea_query_boxes` for training.
+`fovea_query_boxes` for training. Every crop is re-encoded on each run.
 """
 
 from __future__ import annotations
@@ -118,13 +118,12 @@ def preprocess_record(record: dict[str, Any], image_folder: Path, codec: IBQCode
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Offline preprocess VGR parquets into Fovea visual-query training parquets.")
-    parser.add_argument("--input", default="data/vgr", help="Input VGR parquet file or directory.")
+    parser.add_argument("--input", default="data/vgr/data", help="Input VGR parquet file or directory.")
     parser.add_argument("--output", default="data/vgr/preprocessed", help="Output parquet file or directory.")
     parser.add_argument("--image_folder", default="data/vgr/llava_next_raw_format", help="Folder containing VGR raw images.")
     parser.add_argument("--ibq_repo", default=DEFAULT_IBQ_REPO)
     parser.add_argument("--ibq_checkpoint", default=DEFAULT_IBQ_CHECKPOINT)
     parser.add_argument("--ibq_config", default=DEFAULT_IBQ_CONFIG)
-    parser.add_argument("--cache_dir", default="data/vgr/.visual_code_cache")
     parser.add_argument("--device", default=None, help="IBQ device, e.g. cuda, cuda:0, or cpu. Defaults to cuda when available.")
     parser.add_argument("--log_every", type=int, default=100)
     args = parser.parse_args()
@@ -136,7 +135,6 @@ def main() -> None:
         repo=args.ibq_repo,
         checkpoint=args.ibq_checkpoint,
         config=args.ibq_config,
-        cache_dir=args.cache_dir,
         device=args.device,
     )
 

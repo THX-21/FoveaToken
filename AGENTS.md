@@ -27,8 +27,8 @@ FoveaToken 基于 Qwen3.5 多模态实现，新增逻辑集中在：
 原始数据只使用 VGR parquet：
 
 ```text
-data/vgr/vgr_shortcot.parquet
-data/vgr/vgr_longcot.parquet
+data/vgr/data/vgr_shortcot.parquet
+data/vgr/data/vgr_longcot.parquet
 ```
 
 VGR 中的：
@@ -54,6 +54,7 @@ data/vgr/preprocessed/vgr_longcot.parquet
 ```
 
 训练阶段不调用 IBQ codec；IBQ 只允许在 `scripts/preprocess_vgr.py` 离线预处理阶段使用。
+离线预处理不使用视觉码缓存；每次运行都会重新调用 IBQ 对每个 crop 编码。
 
 ## 本地权重
 
