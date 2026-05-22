@@ -159,18 +159,20 @@ def build_merged_patch_boxes(
 
     _t, grid_h, grid_w = [int(v) for v in grid_thw.tolist()]
     merge = max(int(spatial_merge_size), 1)
-    boxes: list[list[float]] = []
-    for h in range(0, grid_h, merge):
-        for w in range(0, grid_w, merge):
-            boxes.append(
-                [
-                    w / max(grid_w, 1),
-                    h / max(grid_h, 1),
-                    min(w + merge, grid_w) / max(grid_w, 1),
-                    min(h + merge, grid_h) / max(grid_h, 1),
-                ]
-            )
-    return torch.tensor(boxes, dtype=torch.float32)
+    h_starts = torch.arange(0, grid_h, merge, dtype=torch.float32)
+    w_starts = torch.arange(0, grid_w, merge, dtype=torch.float32)
+    h_grid, w_grid = torch.meshgrid(h_starts, w_starts, indexing="ij")
+    grid_h_float = float(max(grid_h, 1))
+    grid_w_float = float(max(grid_w, 1))
+    return torch.stack(
+        [
+            w_grid / grid_w_float,
+            h_grid / grid_h_float,
+            (w_grid + merge).clamp_max(float(grid_w)) / grid_w_float,
+            (h_grid + merge).clamp_max(float(grid_h)) / grid_h_float,
+        ],
+        dim=-1,
+    ).reshape(-1, 4)
 
 
 def pack_single_image_with_boxes(
