@@ -335,27 +335,44 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         code_batch = code_pos[:, 0]
         code_token = code_pos[:, 1]
         query_hidden = hidden_states[code_batch, code_token]
-        memory_for_code = memory.index_select(0, code_batch)
-        memory_pos_for_code = memory_positions.index_select(0, code_batch)
         mask_for_code = memory_mask.index_select(0, code_batch)
         boxes_for_code = patch_boxes.index_select(0, code_batch)
 
         heads = self.visual_query_num_heads
         head_dim = self.visual_query_head_dim
-        q = self.visual_query_q_proj(query_hidden).view(-1, heads, head_dim)
-        k = self.visual_query_k_proj(memory_for_code).view(query_hidden.shape[0], memory.shape[1], heads, head_dim)
-        v = self.visual_query_v_proj(memory_for_code).view(query_hidden.shape[0], memory.shape[1], heads, head_dim)
-        q = self.visual_query_q_norm(q).unsqueeze(2)
-        k = self.visual_query_k_norm(k).permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+        num_codes = query_hidden.shape[0]
+        memory_len = memory.shape[1]
+        q_all = self.visual_query_q_proj(query_hidden).view(num_codes, heads, head_dim)
+        q_all = self.visual_query_q_norm(q_all)
 
-        scores = torch.matmul(q, k.transpose(-1, -2)).squeeze(2) * (head_dim**-0.5)
-        scores = scores.masked_fill((~mask_for_code).unsqueeze(1), torch.finfo(scores.dtype).min)
-        attn = torch.softmax(scores, dim=-1)
-        context = torch.matmul(attn.unsqueeze(2), v).squeeze(2).reshape(query_hidden.shape[0], -1)
-        replay_vectors = self.visual_query_o_proj(context).to(hidden_states.dtype)
+        replay_vectors = query_hidden.new_empty((num_codes, heads * head_dim))
+        attn_mean = query_hidden.new_empty((num_codes, memory_len))
+        replay_positions = torch.empty((num_codes, memory_positions.shape[-1]), device=hidden_states.device, dtype=torch.float32)
+        scale = head_dim**-0.5
+        for sample_idx in code_batch.unique(sorted=True):
+            code_indices = torch.nonzero(code_batch == sample_idx, as_tuple=False).squeeze(-1)
+            sample_id = int(sample_idx.item())
+            q = q_all.index_select(0, code_indices)
+            sample_memory = memory[sample_id : sample_id + 1]
+            sample_mask = memory_mask[sample_id]
 
-        attn_mean = attn.mean(dim=1)
+            k = self.visual_query_k_proj(sample_memory).view(1, memory_len, heads, head_dim)
+            v = self.visual_query_v_proj(sample_memory).view(1, memory_len, heads, head_dim)
+            k = self.visual_query_k_norm(k).squeeze(0).permute(1, 0, 2)
+            v = v.squeeze(0).permute(1, 0, 2)
+
+            scores = torch.matmul(q.permute(1, 0, 2), k.transpose(-1, -2)).permute(1, 0, 2) * scale
+            scores = scores.masked_fill((~sample_mask).view(1, 1, -1), torch.finfo(scores.dtype).min)
+            attn = torch.softmax(scores, dim=-1)
+            context = torch.matmul(attn.permute(1, 0, 2), v).permute(1, 0, 2).reshape(code_indices.shape[0], -1)
+            vectors = self.visual_query_o_proj(context).to(hidden_states.dtype)
+            sample_attn_mean = attn.mean(dim=1)
+            sample_replay_positions = (sample_attn_mean.float().unsqueeze(-1) * memory_positions[sample_id].float()).sum(dim=1)
+
+            replay_vectors.index_copy_(0, code_indices, vectors)
+            attn_mean.index_copy_(0, code_indices, sample_attn_mean)
+            replay_positions.index_copy_(0, code_indices, sample_replay_positions)
+
         centers = (boxes_for_code[..., :2] + boxes_for_code[..., 2:]) * 0.5
         if vq_boxes is None or vq_boxes.numel() == 0:
             align_loss = replay_vectors.new_zeros(())
@@ -372,7 +389,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 & mask_for_code
             )
             align_loss = -((attn_mean * inside.to(attn_mean.dtype)).sum(dim=-1).clamp_min(float(self.config.visual_query_align_eps)).log()).mean()
-        replay_positions = (attn_mean.float().unsqueeze(-1) * memory_pos_for_code.float()).sum(dim=1)
         replay_spatial_offsets = replay_positions[:, 1:] - replay_positions[:, 0:1]
         return {
             "vectors": replay_vectors,
