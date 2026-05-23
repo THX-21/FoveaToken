@@ -399,7 +399,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         q_all = self.visual_query_q_norm(q_all)
 
         replay_vectors = query_hidden.new_empty((num_codes, heads * head_dim))
-        attn_mean = query_hidden.new_empty((num_codes, memory_len))
+        attn_mean = torch.empty((num_codes, memory_len), device=device, dtype=torch.float32)
         replay_positions = torch.empty((num_codes, memory_positions.shape[-1]), device=device, dtype=torch.float32)
         scale = head_dim**-0.5
         for sample_idx in code_batch.unique(sorted=True):
@@ -419,7 +419,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             attn = torch.softmax(scores, dim=-1)
             context = torch.matmul(attn.permute(1, 0, 2), v).permute(1, 0, 2).reshape(code_indices.shape[0], -1)
             vectors = self.visual_query_o_proj(context).to(dtype)
-            sample_attn_mean = attn.mean(dim=1)
+            sample_attn_mean = attn.mean(dim=1).to(torch.float32)
             sample_replay_positions = (sample_attn_mean.float().unsqueeze(-1) * memory_positions[sample_id].float()).sum(dim=1)
 
             replay_vectors.index_copy_(0, code_indices, vectors)

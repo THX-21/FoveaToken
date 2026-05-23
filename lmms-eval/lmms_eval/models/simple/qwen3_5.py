@@ -15,9 +15,9 @@ class Qwen3_5(Qwen3_VL):
 
     DEFAULT_GEN_KWARGS = {
         "max_new_tokens": 1024,
-        "temperature": 0.7,
-        "top_p": 0.8,
-        "top_k": 20,
+        "temperature": 0.0,
+        "top_p": None,
+        "num_beams": 1,
     }
 
     @staticmethod
@@ -35,7 +35,7 @@ class Qwen3_5(Qwen3_VL):
         total_pixels: int = 224 * 1024 * 32 * 32,
         max_num_frames: int = 768,
         max_frames: Optional[int] = None,
-        enable_thinking: Optional[bool] = True,
+        enable_thinking: Optional[bool] = False,
         attn_implementation: Optional[str] = "sdpa",
         **kwargs,
     ):

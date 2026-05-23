@@ -1,51 +1,45 @@
 #!/bin/bash
 export OMP_NUM_THREADS=8
-export NCCL_DEBUG=INFO
-# export DS_IGNORE_CUDA_DETECTION=1
-# export DS_SKIP_CUDA_CHECK=1
+export NCCL_DEBUG=WARN
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-export NNODES=1
-export NUM_GPUS=1
-export MASTER_ADDR="127.0.0.1"
-if [[ -n "${FT3_MASTER_PORT:-}" ]]; then
-    export MASTER_PORT="${FT3_MASTER_PORT}"
-else
-    export MASTER_PORT=29599
-fi
-export WORLD_SIZE=$((NNODES * NUM_GPUS))
-export RANK=0
-
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
-RUN_NAME="${FT3_RUN_NAME:-fovea-visual-query-replay}"
+RUN_NAME="${FT3_RUN_NAME:-fovea-visual-query-replay-lora}"
 DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr/preprocessed}"
 IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/vgr/llava_next_raw_format}"
 CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
-SAVE_STEPS="${FT3_SAVE_STEPS:-100}"
+SAVE_STEPS="${FT3_SAVE_STEPS:-200}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
 ATTN_IMPLEMENTATION="${FT3_ATTN_IMPLEMENTATION:-sdpa}"
+REPORT_TO="${FT3_REPORT_TO:-none}"
+WORKERS="${FT3_DATALOADER_NUM_WORKERS:-4}"
 
-echo "[ft3] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
-echo "[ft3] RUN_NAME=${RUN_NAME}"
-echo "[ft3] DATA_PATH=${DATA_PATH}"
-echo "[ft3] IMAGE_FOLDER=${IMAGE_FOLDER}"
-echo "[ft3] CKPT_PATH=${CKPT_PATH}"
-echo "[ft3] OUTPUT_DIR=${OUTPUT_DIR}"
-echo "[ft3] SAVE_STEPS=${SAVE_STEPS}"
-echo "[ft3] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
+echo "[ft3_lora] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
+echo "[ft3_lora] RUN_NAME=${RUN_NAME}"
+echo "[ft3_lora] DATA_PATH=${DATA_PATH}"
+echo "[ft3_lora] IMAGE_FOLDER=${IMAGE_FOLDER}"
+echo "[ft3_lora] CKPT_PATH=${CKPT_PATH}"
+echo "[ft3_lora] OUTPUT_DIR=${OUTPUT_DIR}"
+echo "[ft3_lora] SAVE_STEPS=${SAVE_STEPS}"
+echo "[ft3_lora] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
+echo "[ft3_lora] DATALOADER_NUM_WORKERS=${WORKERS}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
+PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    PYTHON_BIN="python"
+fi
 
-if python - <<'PY'
+if "${PYTHON_BIN}" - <<'PY'
 import torch
 raise SystemExit(0 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 1)
 PY
 then
     PRECISION_ARGS=(--bf16 true --fp16 false --tf32 true)
-elif python - <<'PY'
+elif "${PYTHON_BIN}" - <<'PY'
 import torch
 raise SystemExit(0 if torch.cuda.is_available() else 1)
 PY
@@ -54,35 +48,21 @@ then
 else
     PRECISION_ARGS=(--bf16 false --fp16 false --tf32 false)
 fi
-# PRECISION_ARGS=(--bf16 false --fp16 false --tf32 true)
-
-LAUNCHER=(
-    torchrun
-    --nproc_per_node="${NUM_GPUS}"
-    --nnodes="${NNODES}"
-    --node_rank="${RANK}"
-    --master_addr="${MASTER_ADDR}"
-    --master_port="${MASTER_PORT}"
-    -m fovea_token.train.sft
-)
 
 RESUME_ARGS=()
 LATEST_CHECKPOINT="$(find "${OUTPUT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' 2>/dev/null | sort -V | tail -n 1)"
 if [[ -n "${LATEST_CHECKPOINT}" ]]; then
-    echo "[ft3] RESUME_CHECKPOINT=${LATEST_CHECKPOINT}"
-    echo "[ft3] Model weights will initialize from the resume checkpoint because lora_enable=false."
-    echo "[ft3] Trainer state will resume from the same checkpoint."
+    echo "[ft3_lora] RESUME_CHECKPOINT=${LATEST_CHECKPOINT}"
     RESUME_ARGS=(--resume_from_checkpoint "${LATEST_CHECKPOINT}")
 fi
 
-ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
-    --deepspeed "${PROJECT_ROOT}/scripts/zero2_tp2.json" \
+"${PYTHON_BIN}" -u -m fovea_token.train.sft \
     --model_name_or_path "${CKPT_PATH}" \
     --data_path "${DATA_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
     --max_image_tokens 512 \
     --retrieve_max_image_tokens "${FT3_RETRIEVE_MAX_IMAGE_TOKENS:-4096}" \
-    --lora_enable false \
+    --lora_enable true \
     --lora_r 64 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
@@ -108,8 +88,8 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --logging_steps 1 \
     --model_max_length 32768 \
     --gradient_checkpointing true \
-    --dataloader_num_workers "${FT3_DATALOADER_NUM_WORKERS:-8}" \
-    --report_to tensorboard \
+    --dataloader_num_workers "${WORKERS}" \
+    --report_to "${REPORT_TO}" \
     --remove_unused_columns false \
     --logging_nan_inf_filter false \
     "${RESUME_ARGS[@]}"

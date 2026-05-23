@@ -17,6 +17,7 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 - `src/fovea_token/tokenizers/tokenization_visual_query.py`：`<vq>`、`</vq>`、`<vis_i>`、`<|replay_pad|>` token helpers。
 - `scripts/preprocess_vgr.py`：把原始 VGR parquet 离线转换成训练 parquet。
 - `scripts/ft3.sh`：VGR 训练入口。
+- `scripts/ft3_lora.sh`：单卡 LoRA 训练入口，不使用 DeepSpeed CPU optimizer offload。
 - `lmms-eval/lmms_eval/models/simple/fovea.py`：本地 lmms-eval adapter。
 
 ## 本地依赖
@@ -47,6 +48,12 @@ data/vgr/llava_next_raw_format
 bash scripts/ft3.sh
 ```
 
+如果只想跑单卡、避免 DeepSpeed `ZeRO-2 + CPU offload` 带来的慢速 optimizer step，可以使用：
+
+```bash
+bash scripts/ft3_lora.sh
+```
+
 训练默认读取离线预处理后的 `data/vgr/preprocessed`，会合并：
 
 ```text
@@ -65,8 +72,21 @@ data/vgr/preprocessed/vgr_longcot.parquet
 - `FT3_GENERATED_REPLAY_PROB`
 - `FT3_RETRIEVE_MAX_IMAGE_TOKENS`
 - `FT3_DATALOADER_NUM_WORKERS`
+- `FT3_REPORT_TO`
 
 注意：训练阶段不调用 IBQ codec。请先运行离线预处理，生成带 `fovea_query_boxes` 的 parquet。
+
+`scripts/ft3_lora.sh` 默认：
+
+- 启用 LoRA
+- 冻结 vision tower
+- 不启用 DeepSpeed
+- `FT3_DATALOADER_NUM_WORKERS=0`
+- `FT3_REPORT_TO=none`
+
+这样更接近单卡可持续训练的快速配置，显存和 optimizer state 压力会明显小于全参数版本。
+
+如果 LoRA 训练时显式设置 `--unfreeze_vision true`，checkpoint 目录除了标准 `adapter_model.safetensors` 外，还会额外保存一个 `vision_tower.safetensors`，用于恢复 vision tower 的全参更新。
 
 ## 离线预处理
 

@@ -7,6 +7,7 @@ import torch
 from accelerate import Accelerator, DistributedType
 from loguru import logger as eval_logger
 from PIL import Image
+from safetensors.torch import load_file as safe_load_file
 from tqdm import tqdm
 from transformers.video_processing_utils import BaseVideoProcessor
 from transformers.image_processing_utils import ImageProcessingMixin
@@ -19,6 +20,7 @@ from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
 
 from fovea_token import FoveaForConditionalGeneration, FoveaTokenizer, FoveaProcessor
 from fovea_token.train.data import VisionPacker
+from fovea_token.train.sft import VISION_TOWER_WEIGHTS_NAME, get_visual_module
 from fovea_token.tokenizers.tokenization_visual_query import add_visual_query_tokens, sync_visual_query_token_ids
 
 
@@ -152,17 +154,17 @@ class Fovea(Qwen3_VL):
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
         self._model = FoveaForConditionalGeneration.from_pretrained(load_pretrained, **model_kwargs)
-        if load_peft is not None:
-            from peft import PeftModel
-
-            self._load_deepspeed_trainables(load_peft)
-            self._model = PeftModel.from_pretrained(self._model, load_peft)
         tokenizer_source = load_pretrained
         self._tokenizer = FoveaTokenizer.from_pretrained(tokenizer_source)
         add_visual_query_tokens(self._tokenizer)
         if len(self._tokenizer) != self._model.get_input_embeddings().weight.shape[0]:
             self._model.resize_token_embeddings(len(self._tokenizer))
         sync_visual_query_token_ids(self._model.config, self._tokenizer)
+        if load_peft is not None:
+            from peft import PeftModel
+
+            self._load_deepspeed_trainables(load_peft)
+            self._model = PeftModel.from_pretrained(self._model, load_peft)
         self._model = self._model.eval()
         vision_packer = VisionPacker(
             vision_config=self._model.config.vision_config,
@@ -210,15 +212,23 @@ class Fovea(Qwen3_VL):
             self._world_size = 1
 
     def _load_deepspeed_trainables(self, checkpoint_path: str) -> None:
-        """Load non-LoRA trainables saved in the Deepspeed checkpoint.
+        """Load vision tower trainables saved alongside a LoRA checkpoint.
 
-        PEFT's adapter file contains LoRA and visual-query modules_to_save tensors.
-        The vision tower is still stored in Deepspeed's model state file under
-        ``global_step*/mp_rank_00_model_states.pt``.
+        New checkpoints store vision tower weights in `vision_tower.safetensors`.
+        Older checkpoints may still only have them inside DeepSpeed model states.
         """
 
         checkpoint = Path(checkpoint_path)
         if not checkpoint.is_dir():
+            return
+
+        safe_path = checkpoint / VISION_TOWER_WEIGHTS_NAME
+        if safe_path.exists():
+            eval_logger.info(f"Loading vision tower weights from {safe_path}")
+            vision_module = get_visual_module(self._model)
+            vision_state = safe_load_file(str(safe_path))
+            vision_module.load_state_dict(vision_state, strict=True)
+            eval_logger.info(f"Loaded {len(vision_state)} vision tensors from {safe_path}")
             return
 
         latest_file = checkpoint / "latest"

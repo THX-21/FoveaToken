@@ -1,5 +1,4 @@
 import re
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -62,7 +61,7 @@ class Qwen3_VL(lmms):
     """
 
     DEFAULT_GEN_KWARGS = {
-        "max_new_tokens": 128,
+        "max_new_tokens": 1024,
         "temperature": 0.0,
         "top_p": None,
         "num_beams": 1,
@@ -76,6 +75,7 @@ class Qwen3_VL(lmms):
         device_map: Optional[str] = "auto",
         batch_size: Optional[Union[int, str]] = 1,
         use_cache=True,
+        torch_dtype: Optional[Union[str, torch.dtype]] = None,
         attn_implementation: Optional[str] = None,
         min_pixels: int = 256 * 28 * 28,
         max_pixels: int = 1605632,
@@ -108,8 +108,12 @@ class Qwen3_VL(lmms):
         is_moe = bool(re.search(r"A\d+B", pretrained))
         model_cls, dtype_key = _resolve_model_class(pretrained, is_moe)
 
+        dtype_value = torch_dtype if torch_dtype is not None else "bfloat16"
+        if isinstance(dtype_value, str) and dtype_value != "auto":
+            dtype_value = getattr(torch, dtype_value)
+
         model_kwargs = {
-            dtype_key: "bfloat16",
+            dtype_key: dtype_value,
             "device_map": self.device_map,
         }
         if attn_implementation is not None:
@@ -417,40 +421,34 @@ class Qwen3_VL(lmms):
         re_ords = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
         chunks = list(re_ords.get_batched(n=self.batch_size, batch_fn=None))
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._preprocess_chunk, chunks[0]) if chunks else None
+        for idx in range(len(chunks)):
+            inputs, contexts, gen_kwargs, until = self._preprocess_chunk(chunks[idx])
 
-            for idx in range(len(chunks)):
-                inputs, contexts, gen_kwargs, until = future.result()
+            if self.device_map == "auto":
+                inputs = inputs.to("cuda")
+            else:
+                inputs = inputs.to(self.device)
 
-                if idx + 1 < len(chunks):
-                    future = executor.submit(self._preprocess_chunk, chunks[idx + 1])
+            generate_kwargs = self._build_generate_kwargs(gen_kwargs)
+            cont = self.model.generate(**inputs, **generate_kwargs)
 
-                if self.device_map == "auto":
-                    inputs = inputs.to("cuda")
-                else:
-                    inputs = inputs.to(self.device)
+            generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
+            answers = self.processor.batch_decode(
+                generated_ids_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            for i, ans in enumerate(answers):
+                for term in until:
+                    if len(term) > 0:
+                        ans = ans.split(term)[0]
+                answers[i] = ans
 
-                generate_kwargs = self._build_generate_kwargs(gen_kwargs)
-                cont = self.model.generate(**inputs, **generate_kwargs)
-
-                generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
-                answers = self.processor.batch_decode(
-                    generated_ids_trimmed,
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                )
-                for i, ans in enumerate(answers):
-                    for term in until:
-                        if len(term) > 0:
-                            ans = ans.split(term)[0]
-                    answers[i] = ans
-
-                for ans, context in zip(answers, contexts):
-                    ans = self._strip_thinking(ans)
-                    res.append(ans)
-                    self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
-                    pbar.update(1)
+            for ans, context in zip(answers, contexts):
+                ans = self._strip_thinking(ans)
+                res.append(ans)
+                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
+                pbar.update(1)
 
         res = re_ords.get_original(res)
         pbar.close()

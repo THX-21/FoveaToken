@@ -77,6 +77,12 @@ data/vgr/llava_next_raw_format
 bash scripts/ft3.sh
 ```
 
+单卡快速入口：
+
+```bash
+bash scripts/ft3_lora.sh
+```
+
 常用环境变量：
 
 - `FT3_DATA_PATH`
@@ -85,12 +91,16 @@ bash scripts/ft3.sh
 - `FT3_OUTPUT_DIR`
 - `FT3_GENERATED_REPLAY_PROB`
 - `FT3_RETRIEVE_MAX_IMAGE_TOKENS`
+- `FT3_DATALOADER_NUM_WORKERS`
+- `FT3_REPORT_TO`
 
 运行时需要：
 
 ```bash
 export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 ```
+
+LoRA 训练如果同时开启 `unfreeze_vision=true`，checkpoint 目录需要连同额外的 `vision_tower.safetensors` 一起保留，恢复时会自动加载。
 
 ## 修改规则
 

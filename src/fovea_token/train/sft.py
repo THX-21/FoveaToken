@@ -4,6 +4,8 @@ from typing import Optional
 
 import torch
 import transformers
+from safetensors.torch import load_file as safe_load_file
+from safetensors.torch import save_file as safe_save_file
 from transformers import HfArgumentParser, Trainer
 from transformers.trainer_pt_utils import get_parameter_names
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
@@ -41,6 +43,9 @@ class TrainingArguments(transformers.TrainingArguments):
     report_to: str | None = field(default="tensorboard")
     attn_implementation: str = field(default="sdpa")
     vision_tower_lr: Optional[float] = field(default=None)
+
+
+VISION_TOWER_WEIGHTS_NAME = "vision_tower.safetensors"
 
 
 def freeze_for_vision_plus_lora(model: FoveaForConditionalGeneration, unfreeze_vision: bool, lora_enable: bool) -> None:
@@ -120,9 +125,32 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         target_modules=target_modules,
         exclude_modules=visual_query_modules,
         modules_to_save=visual_query_modules,
+        ensure_weight_tying=True,
     )
     model = get_peft_model(model, lora_config)
     return model
+
+
+def save_vision_tower_weights(model, output_dir: str) -> None:
+    vision_module = get_visual_module(model)
+    state_dict = {
+        name: param.detach().cpu().contiguous()
+        for name, param in vision_module.state_dict().items()
+    }
+    safe_save_file(state_dict, os.path.join(output_dir, VISION_TOWER_WEIGHTS_NAME), metadata={"format": "pt"})
+
+
+def maybe_load_vision_tower_weights(model, checkpoint_dir: str | None) -> bool:
+    if not checkpoint_dir:
+        return False
+    path = os.path.join(checkpoint_dir, VISION_TOWER_WEIGHTS_NAME)
+    if not os.path.isfile(path):
+        return False
+    vision_module = get_visual_module(model)
+    state_dict = safe_load_file(path)
+    vision_module.load_state_dict(state_dict, strict=True)
+    print(f"Loaded vision tower weights from: {path}")
+    return True
 
 
 def print_loading_summary(model, loading_info: dict, source_label: str) -> None:
@@ -276,6 +304,12 @@ class FT3Trainer(Trainer):
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
         return self.optimizer
 
+    def _save(self, output_dir: str | None = None, state_dict: dict | None = None) -> None:
+        super()._save(output_dir=output_dir, state_dict=state_dict)
+        if getattr(self.model, "peft_config", None) is None:
+            return
+        save_vision_tower_weights(self.model, output_dir if output_dir is not None else self.args.output_dir)
+
 
 class StopAtStepCallback(transformers.TrainerCallback):
     """Stop training cleanly at the requested global step.
@@ -370,6 +404,8 @@ def main() -> None:
     if model_args.unfreeze_vision:
         get_visual_module(model).requires_grad_(True)
     unfreeze_visual_query_parameters(model)
+    if model_args.lora_enable and training_args.resume_from_checkpoint:
+        maybe_load_vision_tower_weights(model, training_args.resume_from_checkpoint)
     print_parameter_summary(model)
 
     vision_packer = VisionPacker(

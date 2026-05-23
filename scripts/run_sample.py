@@ -1,29 +1,193 @@
 #!/usr/bin/env python
-"""Run one MMStar sample through the real Fovea visual-query inference path."""
+"""Run a few lmms-eval task samples through a chosen lmms-eval model."""
 
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a single Fovea sample with visual-query replay enabled.")
-    parser.add_argument("--checkpoint", default="checkpoints/fovea-visual-query-replay/checkpoint-2400")
-    parser.add_argument("--dataset", default="Lin-Chen/MMStar")
-    parser.add_argument("--split", default="val")
-    parser.add_argument("--index", type=int, default=120)
-    parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--device_map", default="cuda:0")
-    parser.add_argument("--attn_implementation", default="sdpa")
-    parser.add_argument("--max_new_tokens", type=int, default=1280)
-    parser.add_argument("--max_image_tokens", type=int, default=512)
-    parser.add_argument("--retrieve_max_image_tokens", type=int, default=4096)
-    parser.add_argument("--enable_thinking", action="store_true")
-    parser.add_argument("--online", action="store_true", help="Allow Hugging Face network access instead of offline cache only.")
+    parser = argparse.ArgumentParser(description="Run lmms-eval samples through a chosen lmms-eval model.")
+    parser.add_argument("--model", default="qwen3_5", help="lmms-eval model name")
+    parser.add_argument(
+        "--model_args",
+        default="pretrained=Qwen/Qwen3.5-9B,device=cuda:0,device_map=cuda:0,enable_thinking=true,attn_implementation=sdpa",
+        help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
+    )
+    parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")
+    parser.add_argument("--task", default="mmstar", help="lmms-eval task name")
+    parser.add_argument("--index", type=int, default=30, help="Start index in the task docs")
+    parser.add_argument("--num_samples", type=int, default=4, help="Number of consecutive samples to run")
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--temperature", type=float, default=0.0)
     return parser.parse_args()
+
+
+def _parse_scalar(text: str):
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "none":
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    return text
+
+
+def _parse_model_args(text: str) -> dict:
+    if not text.strip():
+        return {}
+    parsed = {}
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid model arg '{item}'. Expected key=value.")
+        key, value = item.split("=", 1)
+        parsed[key.strip()] = _parse_scalar(value.strip())
+    return parsed
+
+
+def _init_task(task_name: str, model_name: str, task_type: str):
+    from lmms_eval.tasks import TaskManager, get_task_dict
+
+    task_manager = TaskManager(model_name=model_name)
+    task_dict = get_task_dict(task_name, task_manager=task_manager, task_type=task_type)
+    if task_name not in task_dict:
+        raise ValueError(f"Task '{task_name}' not found in resolved task dict: {sorted(task_dict)}")
+    return task_dict[task_name]
+
+
+def _init_model(model_name: str, model_args: dict, force_simple: bool):
+    from lmms_eval.models import MODEL_REGISTRY_V2, get_model
+
+    resolved = MODEL_REGISTRY_V2.resolve(model_name, force_simple=force_simple)
+    model_cls = get_model(model_name, force_simple=force_simple)
+    return resolved, model_cls(**model_args)
+
+
+def _build_simple_messages(model, visuals, question: str):
+    content = []
+    for visual in visuals:
+        content.append({"type": "image", "image": visual})
+    content.append({"type": "text", "text": question})
+    return [
+        {"role": "system", "content": model.system_prompt},
+        {"role": "user", "content": content},
+    ]
+
+
+def _prepare_simple_inputs(model, visuals, question: str):
+    texts = model._apply_chat_template([_build_simple_messages(model, visuals, question)])
+    processor_kwargs = {
+        "text": texts,
+        "images": list(visuals),
+        "image_counts_per_sample": [len(visuals)],
+        "return_mm_token_type_ids": True,
+        "return_tensors": "pt",
+    }
+    inputs = model.processor(**processor_kwargs)
+
+    if hasattr(model, "vision_packer") and getattr(model, "retrieve_max_image_tokens", None) and visuals:
+        retrieve_pixels, retrieve_grid, retrieve_boxes = model.vision_packer.pack_retrieve(
+            visuals[0],
+            model.retrieve_max_image_tokens,
+        )
+        import torch
+
+        inputs["retrieve_pixel_values"] = retrieve_pixels
+        inputs["retrieve_grid_thw"] = retrieve_grid.unsqueeze(0)
+        inputs["retrieve_patch_boxes"] = retrieve_boxes
+        inputs["retrieve_image_counts"] = torch.tensor([1], dtype=torch.long)
+
+    return {
+        key: value.to(model.device) if hasattr(value, "to") else value
+        for key, value in inputs.items()
+    }, texts[0]
+
+
+def _prepare_chat_inputs(model, task, doc):
+    from lmms_eval.imports import optional_import
+    from lmms_eval.protocol import ChatMessages
+
+    process_vision_info, has_qwen_vl = optional_import("qwen_vl_utils", "process_vision_info")
+    if not has_qwen_vl:
+        raise RuntimeError("Chat sample path requires qwen_vl_utils to process media.")
+
+    messages = task.doc_to_messages(doc)
+    messages.insert(0, {"role": "system", "content": [{"type": "text", "text": model.system_prompt}]})
+    chat_message = ChatMessages(messages=messages)
+    video_kwargs = model._build_video_kwargs()
+    hf_messages = chat_message.to_hf_messages(video_kwargs=video_kwargs)
+    text = model._apply_chat_template([hf_messages])[0]
+
+    image_inputs, video_inputs, video_kwargs_qwen = process_vision_info(
+        [hf_messages],
+        return_video_kwargs=True,
+        image_patch_size=16,
+        return_video_metadata=True,
+    )
+    video_kwargs = {**video_kwargs, **video_kwargs_qwen}
+
+    video_metadatas = None
+    if video_inputs is not None:
+        video_inputs, video_metadatas = zip(*video_inputs)
+        video_inputs = list(video_inputs)
+        video_metadatas = list(video_metadatas)
+
+    inputs = model.processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        video_metadata=video_metadatas,
+        **video_kwargs,
+        do_resize=False,
+        return_tensors="pt",
+    )
+    if model.device_map == "auto":
+        inputs = inputs.to("cuda")
+    else:
+        inputs = inputs.to(model.device)
+    return inputs, text
+
+
+def _decode_raw(model, gen_ids):
+    decoder = getattr(model, "processor", None) or getattr(model, "tokenizer", None)
+    if decoder is None or not hasattr(decoder, "batch_decode"):
+        raise RuntimeError(f"Model '{type(model).__name__}' does not expose a batch_decode-capable processor/tokenizer.")
+    raw = decoder.batch_decode(
+        [gen_ids],
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )[0]
+    clean = decoder.batch_decode(
+        [gen_ids],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )[0]
+    return raw, clean
+
+
+def _count_visual_query_tokens(model, ids_list: list[int]) -> tuple[str, str]:
+    cfg = getattr(model.model, "config", None)
+    if cfg is None or not hasattr(cfg, "vq_start_token_id") or not hasattr(cfg, "vis_token_start_id"):
+        return "n/a", "n/a"
+    vq_count = ids_list.count(cfg.vq_start_token_id)
+    vis_count = sum(1 for token_id in ids_list if cfg.vis_token_start_id <= token_id <= cfg.vis_token_end_id)
+    return str(vq_count), str(vis_count)
 
 
 def main() -> None:
@@ -32,83 +196,69 @@ def main() -> None:
     sys.path.insert(0, str(root / "src"))
     sys.path.insert(0, str(root / "lmms-eval"))
 
-    if not args.online:
-        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
     import torch
-    from datasets import load_dataset
-    from lmms_eval.models.simple.fovea import Fovea
-    from lmms_eval.tasks._task_utils.reasoning_utils import DEFAULT_REASONING_SYSTEM_PROMPT
-    from lmms_eval.tasks.mmstar.utils import mmstar_doc_to_text, mmstar_doc_to_visual
 
-    checkpoint = str((root / args.checkpoint).resolve()) if not Path(args.checkpoint).is_absolute() else args.checkpoint
+    model_args = _parse_model_args(args.model_args)
+    resolved_model, model = _init_model(args.model, model_args, args.force_simple)
+    task = _init_task(args.task, resolved_model.model_id, resolved_model.model_type)
+    docs = task.task_docs
 
-    print(f"[sample] load dataset={args.dataset} split={args.split}")
-    ds = load_dataset(args.dataset, split=args.split)
-    doc = ds[args.index]
+    print(f"[sample] model={args.model} resolved_type={resolved_model.model_type}")
+    print(f"[sample] model_args={model_args}")
+    print(f"[sample] task={args.task} docs={len(docs)}")
 
-    print(f"[sample] load model={checkpoint}")
-    model = Fovea(
-        pretrained=checkpoint,
-        device=args.device,
-        device_map=args.device_map,
-        attn_implementation=args.attn_implementation,
-        enable_thinking=args.enable_thinking,
-        max_image_tokens=args.max_image_tokens,
-        retrieve_max_image_tokens=args.retrieve_max_image_tokens,
-        batch_size=1,
-    )
+    total_time = 0.0
+    for i in range(args.num_samples):
+        doc_idx = args.index + i
+        doc = docs[doc_idx]
+        question = task.doc_to_text(doc) if hasattr(task, "doc_to_text") else ""
+        answer = doc.get("answer", task.doc_to_target(doc) if hasattr(task, "doc_to_target") else "N/A")
 
-    context = mmstar_doc_to_text(doc, {})
-    visual = mmstar_doc_to_visual(doc)[0]
-    message = [
-        {"role": "system", "content": DEFAULT_REASONING_SYSTEM_PROMPT},
-        {"role": "user", "content": [{"type": "image", "image": visual}, {"type": "text", "text": context}]},
-    ]
-    text = model._apply_chat_template([message])[0]
+        if resolved_model.model_type == "chat":
+            inputs, context = _prepare_chat_inputs(model, task, doc)
+        else:
+            visuals = task.doc_to_visual(doc) or []
+            inputs, context = _prepare_simple_inputs(model, visuals, question)
 
-    inputs = model.processor(
-        text=[text],
-        images=[visual],
-        image_counts_per_sample=[1],
-        return_mm_token_type_ids=True,
-        return_tensors="pt",
-    )
+        gen_kwargs = model._build_generate_kwargs(
+            {
+                "max_new_tokens": args.max_new_tokens,
+                "temperature": args.temperature,
+                "do_sample": args.temperature > 0,
+            }
+        )
 
-    retrieve_pixels, retrieve_grid, retrieve_boxes = model.vision_packer.pack_retrieve(
-        visual,
-        model.retrieve_max_image_tokens,
-    )
-    inputs["retrieve_pixel_values"] = retrieve_pixels
-    inputs["retrieve_grid_thw"] = retrieve_grid.unsqueeze(0)
-    inputs["retrieve_patch_boxes"] = retrieve_boxes
-    inputs["retrieve_image_counts"] = torch.tensor([1], dtype=torch.long)
-    inputs = inputs.to(model.device)
+        t0 = time.time()
+        with torch.no_grad():
+            cont = model.model.generate(**inputs, **gen_kwargs)
+        elapsed = time.time() - t0
+        total_time += elapsed
 
-    print("[sample] generate with visual-query replay")
-    outputs = model.model.generate(
-        **inputs,
-        **model._build_generate_kwargs({"max_new_tokens": args.max_new_tokens}),
-    )
-    generated_ids = outputs[0, inputs["input_ids"].shape[1] :]
-    raw = model.processor.batch_decode(
-        [generated_ids],
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )[0]
-    clean = model.processor.batch_decode(
-        [generated_ids],
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )[0]
+        gen_ids = cont[0, inputs["input_ids"].shape[1] :]
+        n_tok = int(gen_ids.shape[0])
+        hit_limit = n_tok >= args.max_new_tokens
+        raw, clean = _decode_raw(model, gen_ids)
+        has_think_end = "</think>" in clean
+        vq_count, vis_count = _count_visual_query_tokens(model, gen_ids.tolist())
 
-    print("---RAW-ANSWER---")
-    print(raw)
-    print("---CLEAN-ANSWER---")
-    print(model._strip_thinking(clean))
-    print("---END---")
-    print(f"generated_tokens={generated_ids.shape[0]}")
+        print(f"\n{'=' * 80}")
+        print(
+            f"Sample {doc_idx} | time={elapsed:.1f}s | tokens={n_tok} | "
+            f"</think>={has_think_end} | VQ={vq_count} | VIS={vis_count} | hit_limit={hit_limit}"
+        )
+        print(f"GT Answer: {answer}")
+        if question:
+            print(f"Question: {question}")
+        else:
+            print(f"Context: {context}")
+        print(f"{'─' * 80}")
+        print(raw)
+        print(f"{'=' * 80}")
+
+    print(f"\nTotal time: {total_time:.1f}s | Avg: {total_time / args.num_samples:.1f}s/sample")
 
 
 if __name__ == "__main__":
