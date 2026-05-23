@@ -27,6 +27,8 @@ OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-100}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
 ATTN_IMPLEMENTATION="${FT3_ATTN_IMPLEMENTATION:-sdpa}"
+UNFREEZE_VISION="${FT3_UNFREEZE_VISION:-true}"
+FREEZE_EMBED_BASE="${FT3_FREEZE_EMBED_BASE:-true}"
 
 echo "[ft3] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
 echo "[ft3] RUN_NAME=${RUN_NAME}"
@@ -36,6 +38,8 @@ echo "[ft3] CKPT_PATH=${CKPT_PATH}"
 echo "[ft3] OUTPUT_DIR=${OUTPUT_DIR}"
 echo "[ft3] SAVE_STEPS=${SAVE_STEPS}"
 echo "[ft3] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
+echo "[ft3] UNFREEZE_VISION=${UNFREEZE_VISION}"
+echo "[ft3] FREEZE_EMBED_BASE=${FREEZE_EMBED_BASE}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 
@@ -86,7 +90,8 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --lora_r 64 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
-    --unfreeze_vision true \
+    --unfreeze_vision "${UNFREEZE_VISION}" \
+    --freeze_embed_base "${FREEZE_EMBED_BASE}" \
     --visual_query_generated_replay_prob "${FT3_GENERATED_REPLAY_PROB:-0.5}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
@@ -101,6 +106,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --save_total_limit 2 \
     --learning_rate 2e-5 \
     --vision_tower_lr 2e-6 \
+    --max_grad_norm 50.0 \
     --weight_decay 0.0 \
     --warmup_ratio 0.03 \
     --attn_implementation "${ATTN_IMPLEMENTATION}" \

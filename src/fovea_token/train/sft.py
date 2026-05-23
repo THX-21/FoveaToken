@@ -4,8 +4,6 @@ from typing import Optional
 
 import torch
 import transformers
-from safetensors.torch import load_file as safe_load_file
-from safetensors.torch import save_file as safe_save_file
 from transformers import HfArgumentParser, Trainer
 from transformers.trainer_pt_utils import get_parameter_names
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
@@ -24,6 +22,7 @@ class ModelArguments:
     lora_alpha: int = field(default=16)
     lora_dropout: float = field(default=0.05)
     unfreeze_vision: bool = field(default=True)
+    freeze_embed_base: bool = field(default=True)
     visual_query_generated_replay_prob: float = field(default=0.5)
 
 
@@ -45,24 +44,72 @@ class TrainingArguments(transformers.TrainingArguments):
     vision_tower_lr: Optional[float] = field(default=None)
 
 
-VISION_TOWER_WEIGHTS_NAME = "vision_tower.safetensors"
-
-
 def freeze_for_vision_plus_lora(model: FoveaForConditionalGeneration, unfreeze_vision: bool, lora_enable: bool) -> None:
     if not lora_enable:
         model.requires_grad_(True)
+        if not unfreeze_vision:
+            get_visual_module(model).requires_grad_(False)
         return
     model.requires_grad_(False)
-    if unfreeze_vision:
-        get_visual_module(model).requires_grad_(True)
 
 
-def unfreeze_visual_query_parameters(model) -> None:
+def unfreeze_visual_query_parameters(model, lora_enable: bool) -> None:
     """Keep retrieval modules and new token embeddings trainable."""
 
     for name, param in model.named_parameters():
-        if "visual_query_" in name or "embed_tokens" in name or "lm_head" in name:
-            param.requires_grad_(True)
+        is_fovea_module = "visual_query_" in name or "embed_tokens" in name or "lm_head" in name
+        if not is_fovea_module:
+            continue
+        if lora_enable and "modules_to_save" not in name:
+            continue
+        if not lora_enable and ".original_module." in name:
+            continue
+        param.requires_grad_(True)
+
+
+def get_visual_query_token_ids(config, vocab_size: int | None = None) -> list[int]:
+    token_ids: list[int] = []
+    for attr in ("vq_start_token_id", "vq_end_token_id", "mask_vis_token_id", "replay_token_id"):
+        token_id = getattr(config, attr, None)
+        if token_id is not None:
+            token_ids.append(int(token_id))
+    vis_start = getattr(config, "vis_token_start_id", None)
+    vis_end = getattr(config, "vis_token_end_id", None)
+    if vis_start is not None and vis_end is not None:
+        token_ids.extend(range(int(vis_start), int(vis_end) + 1))
+    if vocab_size is None:
+        vocab_size = int(getattr(getattr(config, "text_config", config), "vocab_size", 0))
+    return sorted({token_id for token_id in token_ids if 0 <= token_id < int(vocab_size)})
+
+
+def freeze_base_embedding_rows(model, config) -> None:
+    """Freeze base vocab rows while allowing visual-query token rows to learn."""
+
+    registered_params = set()
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "embed_tokens" not in name and "lm_head" not in name:
+            continue
+        if param.ndim != 2:
+            continue
+        trainable_token_ids = get_visual_query_token_ids(config, vocab_size=param.shape[0])
+        if not trainable_token_ids:
+            continue
+        if id(param) in registered_params:
+            continue
+        registered_params.add(id(param))
+        row_mask = torch.zeros((param.shape[0], 1), device=param.device, dtype=param.dtype)
+        row_mask[torch.tensor(trainable_token_ids, device=param.device, dtype=torch.long)] = 1
+        param.register_hook(lambda grad, mask=row_mask: grad * mask.to(device=grad.device, dtype=grad.dtype))
+
+
+def configure_vision_trainability_for_lora(model, unfreeze_vision: bool) -> None:
+    """For LoRA runs, train only vision LoRA weights when requested."""
+
+    visual_module = get_visual_module(model)
+    for name, param in visual_module.named_parameters():
+        param.requires_grad_("lora_" in name if unfreeze_vision else False)
 
 
 def get_visual_module(model):
@@ -116,6 +163,17 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         "in_proj_a",
         "out_proj",
     ]
+    if model_args.unfreeze_vision:
+        target_modules.extend(
+            [
+                "attn.qkv",
+                "attn.proj",
+                "mlp.linear_fc1",
+                "mlp.linear_fc2",
+                "merger.linear_fc1",
+                "merger.linear_fc2",
+            ]
+        )
     lora_config = LoraConfig(
         r=model_args.lora_r,
         lora_alpha=model_args.lora_alpha,
@@ -129,28 +187,6 @@ def maybe_enable_lora(model, model_args: ModelArguments):
     )
     model = get_peft_model(model, lora_config)
     return model
-
-
-def save_vision_tower_weights(model, output_dir: str) -> None:
-    vision_module = get_visual_module(model)
-    state_dict = {
-        name: param.detach().cpu().contiguous()
-        for name, param in vision_module.state_dict().items()
-    }
-    safe_save_file(state_dict, os.path.join(output_dir, VISION_TOWER_WEIGHTS_NAME), metadata={"format": "pt"})
-
-
-def maybe_load_vision_tower_weights(model, checkpoint_dir: str | None) -> bool:
-    if not checkpoint_dir:
-        return False
-    path = os.path.join(checkpoint_dir, VISION_TOWER_WEIGHTS_NAME)
-    if not os.path.isfile(path):
-        return False
-    vision_module = get_visual_module(model)
-    state_dict = safe_load_file(path)
-    vision_module.load_state_dict(state_dict, strict=True)
-    print(f"Loaded vision tower weights from: {path}")
-    return True
 
 
 def print_loading_summary(model, loading_info: dict, source_label: str) -> None:
@@ -304,13 +340,6 @@ class FT3Trainer(Trainer):
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
         return self.optimizer
 
-    def _save(self, output_dir: str | None = None, state_dict: dict | None = None) -> None:
-        super()._save(output_dir=output_dir, state_dict=state_dict)
-        if getattr(self.model, "peft_config", None) is None:
-            return
-        save_vision_tower_weights(self.model, output_dir if output_dir is not None else self.args.output_dir)
-
-
 class StopAtStepCallback(transformers.TrainerCallback):
     """Stop training cleanly at the requested global step.
 
@@ -401,11 +430,11 @@ def main() -> None:
     freeze_for_vision_plus_lora(model, unfreeze_vision=model_args.unfreeze_vision, lora_enable=model_args.lora_enable)
     model = maybe_enable_lora(model, model_args)
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
-    if model_args.unfreeze_vision:
-        get_visual_module(model).requires_grad_(True)
-    unfreeze_visual_query_parameters(model)
-    if model_args.lora_enable and training_args.resume_from_checkpoint:
-        maybe_load_vision_tower_weights(model, training_args.resume_from_checkpoint)
+    unfreeze_visual_query_parameters(model, lora_enable=model_args.lora_enable)
+    if model_args.freeze_embed_base:
+        freeze_base_embedding_rows(model, model.config)
+    if model_args.lora_enable:
+        configure_vision_trainability_for_lora(model, unfreeze_vision=model_args.unfreeze_vision)
     print_parameter_summary(model)
 
     vision_packer = VisionPacker(

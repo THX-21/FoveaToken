@@ -91,6 +91,8 @@ bash scripts/ft3_lora.sh
 - `FT3_OUTPUT_DIR`
 - `FT3_GENERATED_REPLAY_PROB`
 - `FT3_RETRIEVE_MAX_IMAGE_TOKENS`
+- `FT3_UNFREEZE_VISION`
+- `FT3_FREEZE_EMBED_BASE`
 - `FT3_DATALOADER_NUM_WORKERS`
 - `FT3_REPORT_TO`
 
@@ -100,7 +102,7 @@ bash scripts/ft3_lora.sh
 export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 ```
 
-LoRA 训练如果同时开启 `unfreeze_vision=true`，checkpoint 目录需要连同额外的 `vision_tower.safetensors` 一起保留，恢复时会自动加载。
+LoRA 训练如果同时开启 `unfreeze_vision=true`，vision tower 只训练 LoRA 参数；`unfreeze_vision=false` 时 vision tower 完全冻结，不额外保存全量 `vision_tower.safetensors`。全参训练（`lora_enable=false`）也遵守 `unfreeze_vision`：`true` 时全量训练 vision tower，`false` 时冻结 vision tower、其余参数继续全参训练。`freeze_embed_base=true` 时 embedding/`lm_head` 的 base vocab rows 冻结，只训练 visual-query 新增 token rows；设为 `false` 时不加 row-level gradient mask。
 
 ## 修改规则
 

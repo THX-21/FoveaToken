@@ -16,6 +16,8 @@ MAX_STEPS="${FT3_MAX_STEPS:--1}"
 ATTN_IMPLEMENTATION="${FT3_ATTN_IMPLEMENTATION:-sdpa}"
 REPORT_TO="${FT3_REPORT_TO:-none}"
 WORKERS="${FT3_DATALOADER_NUM_WORKERS:-4}"
+UNFREEZE_VISION="${FT3_UNFREEZE_VISION:-true}"
+FREEZE_EMBED_BASE="${FT3_FREEZE_EMBED_BASE:-true}"
 
 echo "[ft3_lora] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
 echo "[ft3_lora] RUN_NAME=${RUN_NAME}"
@@ -26,6 +28,8 @@ echo "[ft3_lora] OUTPUT_DIR=${OUTPUT_DIR}"
 echo "[ft3_lora] SAVE_STEPS=${SAVE_STEPS}"
 echo "[ft3_lora] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
 echo "[ft3_lora] DATALOADER_NUM_WORKERS=${WORKERS}"
+echo "[ft3_lora] UNFREEZE_VISION=${UNFREEZE_VISION}"
+echo "[ft3_lora] FREEZE_EMBED_BASE=${FREEZE_EMBED_BASE}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
@@ -66,7 +70,8 @@ fi
     --lora_r 64 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
-    --unfreeze_vision true \
+    --unfreeze_vision "${UNFREEZE_VISION}" \
+    --freeze_embed_base "${FREEZE_EMBED_BASE}" \
     --visual_query_generated_replay_prob "${FT3_GENERATED_REPLAY_PROB:-0.5}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
@@ -81,6 +86,7 @@ fi
     --save_total_limit 2 \
     --learning_rate 2e-5 \
     --vision_tower_lr 2e-6 \
+    --max_grad_norm 50.0 \
     --weight_decay 0.0 \
     --warmup_ratio 0.03 \
     --attn_implementation "${ATTN_IMPLEMENTATION}" \
