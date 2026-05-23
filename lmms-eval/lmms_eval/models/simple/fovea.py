@@ -20,10 +20,11 @@ from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
 
 from fovea_token import FoveaForConditionalGeneration, FoveaTokenizer, FoveaProcessor
 from fovea_token.train.data import VisionPacker
-from fovea_token.train.sft import VISION_TOWER_WEIGHTS_NAME, get_visual_module
+from fovea_token.train.sft import get_visual_module
 from fovea_token.tokenizers.tokenization_visual_query import add_visual_query_tokens, sync_visual_query_token_ids
 
 
+VISION_TOWER_WEIGHTS_NAME = "vision_tower.safetensors"
 MODEL_WEIGHT_FILENAMES = {
     "pytorch_model.bin",
     "model.safetensors",
@@ -212,11 +213,7 @@ class Fovea(Qwen3_VL):
             self._world_size = 1
 
     def _load_deepspeed_trainables(self, checkpoint_path: str) -> None:
-        """Load vision tower trainables saved alongside a LoRA checkpoint.
-
-        New checkpoints store vision tower weights in `vision_tower.safetensors`.
-        Older checkpoints may still only have them inside DeepSpeed model states.
-        """
+        """Load legacy non-LoRA vision trainables saved alongside a LoRA checkpoint."""
 
         checkpoint = Path(checkpoint_path)
         if not checkpoint.is_dir():

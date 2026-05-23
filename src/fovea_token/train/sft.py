@@ -183,7 +183,7 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         target_modules=target_modules,
         exclude_modules=visual_query_modules,
         modules_to_save=visual_query_modules,
-        ensure_weight_tying=True,
+        ensure_weight_tying=False,
     )
     model = get_peft_model(model, lora_config)
     return model
