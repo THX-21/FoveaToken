@@ -11,6 +11,7 @@ FoveaToken 基于 Qwen3.5 多模态实现，新增逻辑集中在：
 - `src/fovea_token/tokenizers/tokenization_ibq.py`
 - `src/fovea_token/tokenizers/tokenization_visual_query.py`
 - `scripts/preprocess_vgr.py`
+- `scripts/preprocess_pretrain_data.py`
 
 核心数据流：
 
@@ -53,8 +54,19 @@ data/vgr/preprocessed/vgr_shortcot.parquet
 data/vgr/preprocessed/vgr_longcot.parquet
 ```
 
-训练阶段不调用 IBQ codec；IBQ 只允许在 `scripts/preprocess_vgr.py` 离线预处理阶段使用。
+`data_path` 指向目录时读取目录下全部 parquet；混合 Stage A/B/VGR 时应把要训练的 parquet 放在同一目录，或显式传入单个 parquet 文件。
+
+训练阶段不调用 IBQ codec；IBQ 只允许在 `scripts/preprocess_vgr.py` 和 `scripts/preprocess_pretrain_data.py` 离线预处理阶段使用。
 离线预处理不使用视觉码缓存；每次运行都会重新调用 IBQ 对每个 crop 编码。
+
+为了给新增 `<vis_i>` token 做预训练，可以额外使用 `scripts/preprocess_pretrain_data.py` 生成两类 parquet：
+
+- Stage A / `fovea_task="visual_code_lm"`：例如 COCO captions。user 包含 `<image>` 和 caption 描述，assistant 只生成 `<vq> <vis_i> ... </vq>`，不生成 `<|replay_pad|>`，不要求 `fovea_query_boxes`，训练时使用图像 embedding 和普通 LM loss，不触发 retrieval。
+- Stage B：例如 Visual Genome region descriptions。输入包含 `<image>` 并询问 caption 对应图中什么位置，assistant 以 `caption + <vq> <vis_i> ... </vq><|replay_pad|>... + bbox` 的形式回答，每个 `<vq>` 必须绑定 `fovea_query_boxes`，并通过 `fovea_supervised_substrings` 只监督 visual-query 片段和 bbox 坐标；`<|replay_pad|>` 仍必须设为 `IGNORE_INDEX`。
+
+Stage A 默认不限制 IBQ visual code 数（`--stage_a_max_visual_tokens 0`）；Stage B 默认最多 256 个 code（`--stage_b_max_visual_tokens 256`）。推理生成的 `<vq>` code 上限由 `visual_query_max_codes` 控制，默认 256。
+
+除 Stage A 的 `visual_code_lm` 例外外，带 `<vq>` 的训练样本仍必须来自离线预处理并带 `fovea_query_boxes`。
 
 ## 本地权重
 

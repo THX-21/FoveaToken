@@ -37,7 +37,7 @@ class IBQConfig:
     checkpoint: str = DEFAULT_IBQ_CHECKPOINT
     config: str = DEFAULT_IBQ_CONFIG
     codebook_size: int = 16384
-    max_latent_tokens: int = 64
+    max_latent_tokens: int | None = 64
     downsample_factor: int = 16
     device: str | None = None
 
@@ -67,8 +67,9 @@ class IBQCodec:
         checkpoint: str = DEFAULT_IBQ_CHECKPOINT,
         config: str = DEFAULT_IBQ_CONFIG,
         device: str | None = None,
+        max_latent_tokens: int | None = 64,
     ) -> "IBQCodec":
-        return cls(IBQConfig(repo=repo, checkpoint=checkpoint, config=config, device=device))
+        return cls(IBQConfig(repo=repo, checkpoint=checkpoint, config=config, device=device, max_latent_tokens=max_latent_tokens))
 
     def _crop_and_resize(self, image: Image.Image, box: tuple[float, float, float, float]) -> Image.Image:
         width, height = image.size
@@ -79,7 +80,12 @@ class IBQCodec:
         bottom = max(top + 1, min(height, round(y2 * height)))
         crop = image.crop((left, top, right, bottom)).convert("RGB")
         stride = max(1, int(self.config.downsample_factor))
-        max_tokens = max(1, int(self.config.max_latent_tokens))
+        max_latent_tokens = self.config.max_latent_tokens
+        if max_latent_tokens is None or int(max_latent_tokens) <= 0:
+            target_w = max(stride, ((crop.width + stride - 1) // stride) * stride)
+            target_h = max(stride, ((crop.height + stride - 1) // stride) * stride)
+            return crop if (target_w, target_h) == crop.size else crop.resize((target_w, target_h), Image.Resampling.BICUBIC)
+        max_tokens = max(1, int(max_latent_tokens))
         latent_h = (crop.height + stride - 1) // stride
         latent_w = (crop.width + stride - 1) // stride
         if latent_h * latent_w <= max_tokens:
@@ -136,8 +142,9 @@ class IBQCodec:
         if torch.is_tensor(codes):
             codes = codes.detach().cpu().reshape(-1).tolist()
         codes = [int(v) for v in codes]
-        if len(codes) > self.config.max_latent_tokens:
-            raise ValueError(f"IBQ returned {len(codes)} codes, expected <= {self.config.max_latent_tokens}.")
+        max_latent_tokens = self.config.max_latent_tokens
+        if max_latent_tokens is not None and int(max_latent_tokens) > 0 and len(codes) > int(max_latent_tokens):
+            raise ValueError(f"IBQ returned {len(codes)} codes, expected <= {max_latent_tokens}.")
         if any(code < 0 or code >= self.config.codebook_size for code in codes):
             raise ValueError("IBQ returned a code outside the configured 16384-token codebook.")
         if not codes:

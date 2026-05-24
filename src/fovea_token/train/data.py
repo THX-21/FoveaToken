@@ -35,6 +35,7 @@ Image.MAX_IMAGE_PIXELS = None
 IGNORE_INDEX = -100
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
+VISUAL_CODE_LM_TASK = "visual_code_lm"
 SOT_EOT_IMAGE_RE = re.compile(r"<SOT>\s*(\[[^\]]+\])\s*<EOT>\s*<image>")
 ORPHAN_VGR_TAG_RE = re.compile(r"<SOT>|<EOT>")
 
@@ -44,10 +45,9 @@ def load_training_records(data_path: str) -> list[dict[str, Any]]:
 
     path = Path(data_path)
     if path.is_dir():
-        paths = [path / "vgr_shortcot.parquet", path / "vgr_longcot.parquet"]
-        paths = [item for item in paths if item.exists()]
+        paths = sorted(path.glob("*.parquet"))
         if not paths:
-            raise FileNotFoundError(f"No VGR parquet files found under {path}.")
+            raise FileNotFoundError(f"No parquet training files found under {path}.")
     else:
         paths = [path]
 
@@ -222,6 +222,47 @@ def encode_chatml_example(
     return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
 
+def apply_selective_label_substrings(
+    input_ids: torch.LongTensor,
+    labels: torch.LongTensor,
+    tokenizer: PreTrainedTokenizerBase,
+    substrings: Sequence[str],
+) -> torch.LongTensor:
+    """Keep labels only for exact tokenized substrings.
+
+    This is used by auxiliary grounding stages where template text should be
+    context, while specific generated artifacts such as visual-query tokens and
+    bbox coordinates remain supervised.
+    """
+
+    if not substrings:
+        return labels
+    ids = input_ids.tolist()
+    selective_labels = torch.full_like(labels, IGNORE_INDEX)
+    search_start = 0
+    for substring in substrings:
+        pattern = tokenize_text(tokenizer, str(substring))
+        if not pattern:
+            continue
+        found = -1
+        last_start = max(0, len(ids) - len(pattern))
+        for start in range(search_start, last_start + 1):
+            if ids[start : start + len(pattern)] == pattern:
+                found = start
+                break
+        if found < 0:
+            for start in range(0, last_start + 1):
+                if ids[start : start + len(pattern)] == pattern:
+                    found = start
+                    break
+        if found < 0:
+            raise ValueError(f"Could not locate supervised substring after tokenization: {substring!r}")
+        end = found + len(pattern)
+        selective_labels[found:end] = input_ids[found:end]
+        search_start = end
+    return selective_labels
+
+
 def build_visual_query_metadata(
     input_ids: torch.LongTensor,
     labels: torch.LongTensor,
@@ -291,6 +332,16 @@ def build_visual_query_metadata(
         "vq_code_query_indices": torch.tensor(code_query_indices, dtype=torch.long),
         "vq_boxes": torch.tensor(query_boxes, dtype=torch.float32),
         "vq_code_label_mask": code_label_mask,
+    }
+
+
+def empty_visual_query_metadata(labels: torch.LongTensor) -> dict[str, torch.Tensor]:
+    return {
+        "vq_code_positions": torch.empty((0,), dtype=torch.long),
+        "vq_replay_positions": torch.empty((0,), dtype=torch.long),
+        "vq_code_query_indices": torch.empty((0,), dtype=torch.long),
+        "vq_boxes": torch.empty((0, 4), dtype=torch.float32),
+        "vq_code_label_mask": torch.zeros_like(labels, dtype=torch.bool),
     }
 
 
@@ -421,14 +472,16 @@ class LazySupervisedDataset(Dataset):
                 retrieve_patch_boxes = torch.cat(retrieve_box_list, dim=0)
 
         conversations = copy.deepcopy(record["conversations"])
-        if image_field is None:
-            raise ValueError("VGR visual-query training requires an image.")
-        image_names = image_field if isinstance(image_field, list) else [image_field]
-        if len(image_names) != 1:
-            raise ValueError("VGR visual-query training expects one image per sample.")
-        if not record.get("fovea_preprocessed", False) or "fovea_query_boxes" not in record:
-            raise ValueError("Training requires offline-preprocessed VGR parquet with fovea_query_boxes.")
-        query_boxes.extend(tuple(float(v) for v in box) for box in record["fovea_query_boxes"])
+        is_visual_code_lm = record.get("fovea_task") == VISUAL_CODE_LM_TASK
+        if not is_visual_code_lm:
+            if image_field is None:
+                raise ValueError("VGR visual-query training requires an image.")
+            image_names = image_field if isinstance(image_field, list) else [image_field]
+            if len(image_names) != 1:
+                raise ValueError("VGR visual-query training expects one image per sample.")
+            if not record.get("fovea_preprocessed", False) or "fovea_query_boxes" not in record:
+                raise ValueError("Training requires offline-preprocessed VGR parquet with fovea_query_boxes.")
+            query_boxes.extend(tuple(float(v) for v in box) for box in record["fovea_query_boxes"])
 
         input_ids, labels = encode_chatml_example(
             tokenizer=self.tokenizer,
@@ -436,13 +489,22 @@ class LazySupervisedDataset(Dataset):
             image_token_counts=image_token_counts,
             system_message=self.system_message,
         )
-        mm_token_type_ids = build_mm_token_type_ids(input_ids=input_ids, image_token_id=self.image_token_id)
-        vq_metadata = build_visual_query_metadata(
+        labels = apply_selective_label_substrings(
             input_ids,
             labels,
-            tokenizer=self.tokenizer,
-            query_boxes=query_boxes,
+            self.tokenizer,
+            record.get("fovea_supervised_substrings") or [],
         )
+        mm_token_type_ids = build_mm_token_type_ids(input_ids=input_ids, image_token_id=self.image_token_id)
+        if is_visual_code_lm:
+            vq_metadata = empty_visual_query_metadata(labels)
+        else:
+            vq_metadata = build_visual_query_metadata(
+                input_ids,
+                labels,
+                tokenizer=self.tokenizer,
+                query_boxes=query_boxes,
+            )
 
         return {
             "input_ids": input_ids,

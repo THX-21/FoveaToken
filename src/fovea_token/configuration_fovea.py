@@ -118,6 +118,7 @@ class FoveaConfig(PretrainedConfig):
     visual_query_lambda_align: float = 0.5
     visual_query_align_eps: float = 1e-6
     visual_query_generated_replay_prob: float = 0.5
+    visual_query_max_codes: int = 256
     vq_start_token_id: int | None = None
     vq_end_token_id: int | None = None
     mask_vis_token_id: int | None = None

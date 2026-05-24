@@ -16,6 +16,7 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 - `src/fovea_token/tokenizers/tokenization_ibq.py`：离线 VGR 预处理使用的本地 IBQ 视觉码 tokenizer。
 - `src/fovea_token/tokenizers/tokenization_visual_query.py`：`<vq>`、`</vq>`、`<vis_i>`、`<|replay_pad|>` token helpers。
 - `scripts/preprocess_vgr.py`：把原始 VGR parquet 离线转换成训练 parquet。
+- `scripts/preprocess_pretrain_data.py`：把 COCO captions / Visual Genome regions 转成 Stage A/B visual-token 预训练 parquet。
 - `scripts/ft3.sh`：VGR 训练入口。
 - `scripts/ft3_lora.sh`：单卡 LoRA 训练入口，不使用 DeepSpeed CPU optimizer offload。
 - `lmms-eval/lmms_eval/models/simple/fovea.py`：本地 lmms-eval adapter。
@@ -54,7 +55,7 @@ bash scripts/ft3.sh
 bash scripts/ft3_lora.sh
 ```
 
-训练默认读取离线预处理后的 `data/vgr/preprocessed`，会合并：
+训练默认读取离线预处理后的 `data/vgr/preprocessed`，目录模式会读取该目录下全部 parquet。VGR 默认包含：
 
 ```text
 data/vgr/preprocessed/vgr_shortcot.parquet
@@ -103,6 +104,39 @@ PYTHONPATH="$PWD/src" python scripts/preprocess_vgr.py \
 ```
 
 预处理脚本会调用本地 IBQ checkpoint，把 VGR assistant 文本里的 region tag 替换成 visual-query tokens，并把对应 box 写入 `fovea_query_boxes`。训练时只读取这些结果，不再运行 codec。
+
+### Stage A/B visual-token 预训练数据
+
+`scripts/preprocess_pretrain_data.py` 支持两个额外离线预处理模式：
+
+- `--stage coco_a`：读取 `Multimodal-Fatima/COCO_captions_train`，把整图 IBQ code 写成 image-conditioned code LM 样本。user 包含 `<image>` 和 caption 描述，assistant 只包含 `<vq> <vis_i> ... </vq>`，不包含 `<|replay_pad|>`，训练时使用图像 embedding 和普通 LM loss，不触发 retrieval。
+- `--stage vg_b`：读取 Visual Genome `region_descriptions.json(.zip)` 和本地图像目录，把 region phrase + bbox crop 转成 VGR-style visual-query replay 定位样本。user 询问 caption 对应图中什么位置，assistant 以 `caption + <vq> <vis_i> ... </vq><|replay_pad|>... + bbox` 的形式回答，并写入 `fovea_query_boxes`。该阶段额外写入 `fovea_supervised_substrings`，只监督 visual-query 片段和 bbox 坐标；`<|replay_pad|>` 仍按规则设为 `IGNORE_INDEX`。
+
+Stage A 默认 `--stage_a_max_visual_tokens 0`，表示 IBQ 编码不限制 visual code 数；Stage B 默认 `--stage_b_max_visual_tokens 256`。生成时 `visual_query_max_codes` 默认也是 256。
+
+小样本 Stage A 测试：
+
+```bash
+PYTHONPATH="$PWD/src" python scripts/preprocess_pretrain_data.py \
+  --stage coco_a \
+  --output data/stage_a/coco_sample.parquet \
+  --streaming \
+  --max_samples 8
+```
+
+训练 Stage A 时，`FT3_IMAGE_FOLDER` 应指向 `data/stage_a`，因为预处理会把临时源图保存到输出目录旁的 `_stage_a_source_images/`。
+
+Stage B 需要先在服务器准备 Visual Genome 图片和标注，例如 `images.zip`/`images2.zip` 解压后的图片目录，以及 `region_descriptions.json.zip`、`image_data.json.zip`：
+
+```bash
+PYTHONPATH="$PWD/src" python scripts/preprocess_pretrain_data.py \
+  --stage vg_b \
+  --output data/stage_b/vg_regions_sample.parquet \
+  --vg_region_descriptions /path/to/region_descriptions.json.zip \
+  --vg_image_data /path/to/image_data.json.zip \
+  --vg_image_root /path/to/visual_genome_images \
+  --max_samples 8
+```
 
 ## 数据转换
 

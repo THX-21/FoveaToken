@@ -516,7 +516,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         ).view(3, attention_mask.shape[0], replay_count)
         return replay_visual_pos
 
-    def _visual_query_state(self, input_ids, prompt_len, max_codes=64):
+    def _visual_query_state(self, input_ids, prompt_len, max_codes=None):
         ids = input_ids[0, prompt_len:].tolist()
         start_id = self.config.vq_start_token_id
         end_id = self.config.vq_end_token_id
@@ -524,6 +524,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         vis_end = self.config.vis_token_end_id
         if None in (start_id, end_id, vis_start, vis_end):
             return False, 0, False
+        if max_codes is None:
+            max_codes = int(getattr(self.config, "visual_query_max_codes", 256))
         start = None
         for idx, token_id in enumerate(ids):
             if token_id == start_id:

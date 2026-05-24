@@ -12,7 +12,7 @@ aiohttp
 aiosignal
 annotated-doc
 annotated-types
-antlr4-python3-runtime
+antlr4-python3-runtime==4.9.*
 anyio
 async-timeout
 attrs
@@ -91,7 +91,7 @@ propcache
 protobuf
 psutil
 py-cpuinfo
-pyarrow
+pyarrow<21
 pybind11
 pycocoevalcap
 pycocotools
@@ -99,6 +99,9 @@ pydantic
 pydantic-core
 pygments
 pynvml
+lightning
+omegaconf
+pytorch-lightning
 pytablewriter
 python-dateutil
 python-discovery
