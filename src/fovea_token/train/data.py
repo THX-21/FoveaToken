@@ -263,6 +263,18 @@ def apply_selective_label_substrings(
     return selective_labels
 
 
+def normalize_supervised_substrings(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence):
+        return [str(item) for item in value if item is not None]
+    return [str(value)]
+
+
 def build_visual_query_metadata(
     input_ids: torch.LongTensor,
     labels: torch.LongTensor,
@@ -443,6 +455,8 @@ class LazySupervisedDataset(Dataset):
         image_token_counts: list[list[int]] = []
         query_boxes: list[tuple[float, float, float, float]] = []
 
+        is_visual_code_lm = record.get("fovea_task") == VISUAL_CODE_LM_TASK
+
         if image_field is not None:
             image_names = image_field if isinstance(image_field, list) else [image_field]
             pixel_values_list = []
@@ -452,10 +466,11 @@ class LazySupervisedDataset(Dataset):
             retrieve_box_list = []
             for image_name in image_names:
                 packed_pixels, packed_grid = self._load_image(image_name)
-                retrieve_pixels, retrieve_grid, retrieve_boxes = self._load_retrieve_image(image_name)
-                retrieve_pixels_list.append(retrieve_pixels)
-                retrieve_grid_list.append(retrieve_grid)
-                retrieve_box_list.append(retrieve_boxes)
+                if not is_visual_code_lm:
+                    retrieve_pixels, retrieve_grid, retrieve_boxes = self._load_retrieve_image(image_name)
+                    retrieve_pixels_list.append(retrieve_pixels)
+                    retrieve_grid_list.append(retrieve_grid)
+                    retrieve_box_list.append(retrieve_boxes)
                 pixel_values_list.append(packed_pixels)
                 image_grid_list.append(packed_grid)
                 image_token_counts.append([
@@ -467,12 +482,12 @@ class LazySupervisedDataset(Dataset):
             if pixel_values_list:
                 pixel_values = torch.cat(pixel_values_list, dim=0)
                 image_grid_thw = torch.stack(image_grid_list, dim=0)
-                retrieve_pixel_values = torch.cat(retrieve_pixels_list, dim=0)
-                retrieve_grid_thw = torch.stack(retrieve_grid_list, dim=0)
-                retrieve_patch_boxes = torch.cat(retrieve_box_list, dim=0)
+                if retrieve_pixels_list:
+                    retrieve_pixel_values = torch.cat(retrieve_pixels_list, dim=0)
+                    retrieve_grid_thw = torch.stack(retrieve_grid_list, dim=0)
+                    retrieve_patch_boxes = torch.cat(retrieve_box_list, dim=0)
 
         conversations = copy.deepcopy(record["conversations"])
-        is_visual_code_lm = record.get("fovea_task") == VISUAL_CODE_LM_TASK
         if not is_visual_code_lm:
             if image_field is None:
                 raise ValueError("VGR visual-query training requires an image.")
@@ -493,7 +508,7 @@ class LazySupervisedDataset(Dataset):
             input_ids,
             labels,
             self.tokenizer,
-            record.get("fovea_supervised_substrings") or [],
+            normalize_supervised_substrings(record.get("fovea_supervised_substrings")),
         )
         mm_token_type_ids = build_mm_token_type_ids(input_ids=input_ids, image_token_id=self.image_token_id)
         if is_visual_code_lm:

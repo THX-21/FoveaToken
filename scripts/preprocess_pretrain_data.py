@@ -7,8 +7,9 @@ Stage A converts image-caption rows into image-conditioned code LM samples:
 Stage B converts Visual Genome region descriptions into VGR-style replay
 samples where the assistant inserts visual-query tokens inside reasoning.
 
-The script supports small `--max_samples` dry runs and does not require
-downloading full Hugging Face datasets locally.
+The script supports small `--max_samples` dry runs. Stage A can stream COCO
+samples from Hugging Face; Stage B expects local Visual Genome annotation files
+and extracted images.
 """
 
 from __future__ import annotations
@@ -216,7 +217,7 @@ def build_visual_genome_stage_b(args: argparse.Namespace, codec: Any) -> None:
                 "source": "jn12/VisualGenome",
                 "fovea_preprocessed": True,
                 "fovea_query_boxes": [list(box)],
-                "fovea_supervised_substrings": [visual_query, box_text],
+                "fovea_supervised_substrings": [visual_query, f" {box_text}"],
                 "conversations": [
                     {
                         "from": "human",
