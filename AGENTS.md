@@ -62,7 +62,7 @@ data/vgr/preprocessed/vgr_longcot.parquet
 为了给新增 `<vis_i>` token 做预训练，可以额外使用 `scripts/preprocess_pretrain_data.py` 生成两类 parquet：
 
 - Stage A / `fovea_task="visual_code_lm"`：例如 COCO captions。user 包含 `<image>` 和 caption 描述，assistant 只生成 `<vq> <vis_i> ... </vq>`，不生成 `<|replay_pad|>`，不要求 `fovea_query_boxes`，训练时使用图像 embedding 和普通 LM loss，不触发 retrieval。
-- Stage B：例如 Visual Genome region descriptions。输入包含 `<image>` 并询问 caption 对应图中什么位置，assistant 以 `caption + <vq> <vis_i> ... </vq><|replay_pad|>... + bbox` 的形式回答，每个 `<vq>` 必须绑定 `fovea_query_boxes`，并通过 `fovea_supervised_substrings` 只监督 visual-query 片段和 bbox 坐标；`<|replay_pad|>` 仍必须设为 `IGNORE_INDEX`。
+- Stage B：例如 Visual Genome region descriptions。输入包含 `<image>` 并询问 caption 对应图中什么位置，assistant 以 `caption + <vq> <vis_i> ... </vq><|replay_pad|>... + bbox` 的形式回答，每个 `<vq>` 必须绑定 `fovea_query_boxes`，并通过 `fovea_supervised_substrings` 只监督 `<vq> <vis_i> ... </vq>` 和 bbox 坐标；`<|replay_pad|>` 不写入监督子串，且仍必须设为 `IGNORE_INDEX`。
 
 Stage A 默认不限制 IBQ visual code 数（`--stage_a_max_visual_tokens 0`）；Stage B 默认最多 256 个 code（`--stage_b_max_visual_tokens 256`）。推理生成的 `<vq>` code 上限由 `visual_query_max_codes` 控制，默认 256。
 

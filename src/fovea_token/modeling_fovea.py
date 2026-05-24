@@ -742,6 +742,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         hidden_a = outputs_a[0]
         logits_a = self.lm_head(hidden_a)
         code_mask = vq_code_label_mask.to(device=labels.device).bool()
+        pass_a_label_mask = code_mask | labels.eq(int(self.config.vq_start_token_id)) | labels.eq(int(self.config.vq_end_token_id))
         use_generated = self._use_generated_replay()
         pass_b_input_ids = self._generated_code_ids(input_ids, logits_a, vq_code_positions) if use_generated else input_ids
 
@@ -785,9 +786,9 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         outputs_b = self._language_forward_from_embeds(embeds_b, attention_mask, position_ids_b, **kwargs)
         hidden_b = outputs_b[0]
         full_logits_b = self.lm_head(hidden_b)
-        code_predictor_mask = torch.zeros_like(code_mask)
-        code_predictor_mask[:, :-1] = code_mask[:, 1:]
-        mixed_logits = torch.where(code_predictor_mask.unsqueeze(-1).to(full_logits_b.device), logits_a, full_logits_b)
+        pass_a_predictor_mask = torch.zeros_like(pass_a_label_mask)
+        pass_a_predictor_mask[:, :-1] = pass_a_label_mask[:, 1:]
+        mixed_logits = torch.where(pass_a_predictor_mask.unsqueeze(-1).to(full_logits_b.device), logits_a, full_logits_b)
         lm_loss = self.loss_function(
             logits=mixed_logits,
             labels=labels,

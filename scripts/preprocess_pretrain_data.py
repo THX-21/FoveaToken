@@ -209,6 +209,7 @@ def build_visual_genome_stage_b(args: argparse.Namespace, codec: Any) -> None:
         codes = codec.encode_crop(str(image_path), box)
         rel_image = str(image_path.relative_to(image_root))
         visual_query = _vq_text(codes, with_replay=True)
+        supervised_visual_query = _vq_text(codes, with_replay=False)
         box_text = f"[{box[0]:.4f}, {box[1]:.4f}, {box[2]:.4f}, {box[3]:.4f}]"
         records.append(
             {
@@ -217,7 +218,7 @@ def build_visual_genome_stage_b(args: argparse.Namespace, codec: Any) -> None:
                 "source": "jn12/VisualGenome",
                 "fovea_preprocessed": True,
                 "fovea_query_boxes": [list(box)],
-                "fovea_supervised_substrings": [visual_query, f" {box_text}"],
+                "fovea_supervised_substrings": [supervised_visual_query, f" {box_text}"],
                 "conversations": [
                     {
                         "from": "human",

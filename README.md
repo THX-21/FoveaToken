@@ -110,7 +110,7 @@ PYTHONPATH="$PWD/src" python scripts/preprocess_vgr.py \
 `scripts/preprocess_pretrain_data.py` 支持两个额外离线预处理模式：
 
 - `--stage coco_a`：读取 `Multimodal-Fatima/COCO_captions_train`，把整图 IBQ code 写成 image-conditioned code LM 样本。user 包含 `<image>` 和 caption 描述，assistant 只包含 `<vq> <vis_i> ... </vq>`，不包含 `<|replay_pad|>`，训练时使用图像 embedding 和普通 LM loss，不触发 retrieval。
-- `--stage vg_b`：读取 Visual Genome `region_descriptions.json(.zip)` 和本地图像目录，把 region phrase + bbox crop 转成 VGR-style visual-query replay 定位样本。user 询问 caption 对应图中什么位置，assistant 以 `caption + <vq> <vis_i> ... </vq><|replay_pad|>... + bbox` 的形式回答，并写入 `fovea_query_boxes`。该阶段额外写入 `fovea_supervised_substrings`，只监督 visual-query 片段和 bbox 坐标；`<|replay_pad|>` 仍按规则设为 `IGNORE_INDEX`。
+- `--stage vg_b`：读取 Visual Genome `region_descriptions.json(.zip)` 和本地图像目录，把 region phrase + bbox crop 转成 VGR-style visual-query replay 定位样本。user 询问 caption 对应图中什么位置，assistant 以 `caption + <vq> <vis_i> ... </vq><|replay_pad|>... + bbox` 的形式回答，并写入 `fovea_query_boxes`。该阶段额外写入 `fovea_supervised_substrings`，只监督 `<vq> <vis_i> ... </vq>` 和 bbox 坐标；`<|replay_pad|>` 不写入监督子串，训练 labels 固定为 `IGNORE_INDEX`。
 
 Stage A 默认 `--stage_a_max_visual_tokens 0`，表示 IBQ 编码不限制 visual code 数；Stage B 默认 `--stage_b_max_visual_tokens 256`。生成时 `visual_query_max_codes` 默认也是 256。
 
