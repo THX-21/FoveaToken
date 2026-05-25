@@ -61,7 +61,7 @@ class Qwen3_VL(lmms):
     """
 
     DEFAULT_GEN_KWARGS = {
-        "max_new_tokens": 1024,
+        "max_new_tokens": 4096,
         "temperature": 0.0,
         "top_p": None,
         "num_beams": 1,

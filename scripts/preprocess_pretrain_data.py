@@ -25,6 +25,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 from PIL import Image
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IBQ_REPO = str(PROJECT_ROOT / "src" / "fovea_token" / "models" / "Open-MAGVIT2")
@@ -97,7 +98,12 @@ def build_coco_stage_a(args: argparse.Namespace, codec: Any) -> None:
         streaming=args.streaming,
         trust_remote_code=True,
     )
-    for row_idx, row in enumerate(dataset):
+    iterator = enumerate(dataset)
+    if args.max_samples is not None:
+        iterator = tqdm(iterator, total=int(args.max_samples), desc="stage-a")
+    else:
+        iterator = tqdm(iterator, desc="stage-a")
+    for row_idx, row in iterator:
         if args.max_samples is not None and len(records) >= args.max_samples:
             break
         captions = row.get("sentences_raw") or row.get("captions") or row.get("caption")
@@ -180,7 +186,7 @@ def build_visual_genome_stage_b(args: argparse.Namespace, codec: Any) -> None:
     image_index = _build_vg_image_index(image_root)
     records: list[dict[str, Any]] = []
 
-    for region in _iter_vg_regions(region_data):
+    for region in tqdm(list(_iter_vg_regions(region_data)), desc="stage-b"):
         if args.max_samples is not None and len(records) >= args.max_samples:
             break
         phrase = str(region.get("phrase", "")).strip()

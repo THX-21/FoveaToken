@@ -10,7 +10,7 @@ MODEL="${EVAL_MODEL:-qwen3_5}"
 TASKS="${EVAL_TASKS:-mmstar}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 ATTN_IMPLEMENTATION="${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
-DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:2}"
+DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:3}"
 DEVICE="${EVAL_DEVICE:-${DEVICE_MAP}}"
 BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 LIMIT="${EVAL_LIMIT:-}"
@@ -55,4 +55,4 @@ echo "[eval_others] MODEL_ARGS=${MODEL_ARGS}"
   --log_samples \
   --log_samples_suffix "${LOG_SUFFIX}" \
   --output_path "${OUTPUT_PATH}" \
-  "${EXTRA_ARGS[@]}"
+  "${EXTRA_ARGS[@]}" \

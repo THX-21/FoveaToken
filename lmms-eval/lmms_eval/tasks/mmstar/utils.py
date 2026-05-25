@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+import re
 import string
 from collections import defaultdict
 
@@ -83,6 +84,9 @@ def exact_match(pred, gt):
         elif predict[0:7] == "option " and answer == predict[7]:
             return 1.0
         elif predict[0:14] == "the answer is " and answer == predict[14]:
+            return 1.0
+        match = re.search(r"(?:final answer|answer)\s*[:：]\s*\(?([a-z])\)?", predict)
+        if match and answer == match.group(1):
             return 1.0
     except Exception:
         return 0.0

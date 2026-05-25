@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 export NNODES=1
-export NUM_GPUS=1
+export NUM_GPUS="${FT3_NUM_GPUS:-1}"
 export MASTER_ADDR="127.0.0.1"
 if [[ -n "${FT3_MASTER_PORT:-}" ]]; then
     export MASTER_PORT="${FT3_MASTER_PORT}"
@@ -80,7 +80,7 @@ if [[ -n "${LATEST_CHECKPOINT}" ]]; then
 fi
 
 ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
-    --deepspeed "${PROJECT_ROOT}/scripts/zero2_tp2.json" \
+    --deepspeed "${PROJECT_ROOT}/scripts/zero2_tp2_gpu.json" \
     --model_name_or_path "${CKPT_PATH}" \
     --data_path "${DATA_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
@@ -98,8 +98,8 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --output_dir "${OUTPUT_DIR}" \
     --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
     --max_steps "${MAX_STEPS}" \
-    --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 8 \
+    --per_device_train_batch_size "${FT3_BATCH_SIZE:-1}" \
+    --gradient_accumulation_steps "${FT3_GRAD_ACCUM:-8}" \
     --eval_strategy no \
     --save_strategy steps \
     --save_steps "${SAVE_STEPS}" \

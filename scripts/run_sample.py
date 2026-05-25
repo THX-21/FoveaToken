@@ -15,14 +15,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="fovea", help="lmms-eval model name")
     parser.add_argument(
         "--model_args",
-        default="pretrained=checkpoints/fovea-visual-query-replay/checkpoint-1200,device=cuda:0,device_map=cuda:0,enable_thinking=true,attn_implementation=sdpa",
+        default="pretrained=checkpoints/fovea-visual-query-replay/checkpoint-3300,device=cuda:0,device_map=cuda:0,enable_thinking=true,attn_implementation=sdpa",
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")
     parser.add_argument("--task", default="mmstar", help="lmms-eval task name")
-    parser.add_argument("--index", type=int, default=30, help="Start index in the task docs")
-    parser.add_argument("--num_samples", type=int, default=4, help="Number of consecutive samples to run")
-    parser.add_argument("--max_new_tokens", type=int, default=1024)
+    parser.add_argument("--index", type=int, default=0, help="Start index in the task docs")
+    parser.add_argument("--num_samples", type=int, default=6, help="Number of consecutive samples to run")
+    parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     return parser.parse_args()
 
