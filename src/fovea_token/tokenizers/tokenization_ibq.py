@@ -122,10 +122,18 @@ class IBQCodec:
         tensor = tensor / 127.5 - 1.0
         return tensor.to(device=self.device)
 
+    def _load_image(self, source: str | Image.Image) -> Image.Image:
+        if isinstance(source, Image.Image):
+            return source.convert("RGB")
+        return Image.open(source).convert("RGB")
+
+    def _prep_crop(self, source: str | Image.Image, box: tuple[float, float, float, float]) -> Image.Image:
+        image = self._load_image(source)
+        return self._crop_and_resize(image, box)
+
     @torch.no_grad()
     def encode_crop(self, image_path: str, box: tuple[float, float, float, float]) -> list[int]:
-        image = Image.open(image_path).convert("RGB")
-        crop = self._crop_and_resize(image, box)
+        crop = self._prep_crop(image_path, box)
         model = self._load_model()
         images = self._to_model_tensor(crop)
         if getattr(model, "use_ema", False):
@@ -142,6 +150,95 @@ class IBQCodec:
         if torch.is_tensor(codes):
             codes = codes.detach().cpu().reshape(-1).tolist()
         codes = [int(v) for v in codes]
+        self._validate_codes(codes)
+        return codes
+
+    @torch.no_grad()
+    def encode_crops_batch(
+        self, items: list[tuple[str | Image.Image, tuple[float, float, float, float]]]
+    ) -> list[list[int]]:
+        """Batch-encode multiple (image_source, box) pairs in one forward pass."""
+        if not items:
+            return []
+
+        model = self._load_model()
+        crops: list[Image.Image] = []
+        orig_sizes: list[tuple[int, int]] = []
+
+        for source, box in items:
+            crop = self._prep_crop(source, box)
+            crops.append(crop)
+            orig_sizes.append(crop.size)  # (W, H)
+
+        # Pad to common size
+        max_w = max(s[0] for s in orig_sizes)
+        max_h = max(s[1] for s in orig_sizes)
+        tensors = []
+        for crop_img, (w, h) in zip(crops, orig_sizes):
+            if w != max_w or h != max_h:
+                padded = Image.new("RGB", (max_w, max_h), (0, 0, 0))
+                padded.paste(crop_img, (0, 0))
+                crop_img = padded
+            tensors.append(self._to_model_tensor(crop_img))
+        batch = torch.cat(tensors, dim=0)
+
+        # Use AMP for faster inference if on CUDA
+        with torch.cuda.amp.autocast(enabled=(self.device.type == "cuda")):
+            if getattr(model, "use_ema", False):
+                with model.ema_scope():
+                    output = model.encode(batch)
+            else:
+                output = model.encode(batch)
+
+        info = output[2]
+        if not isinstance(info, tuple) or len(info) < 3:
+            raise RuntimeError("Official IBQ.encode must return quantization info as (_, _, indices).")
+        all_codes = info[2]
+        if torch.is_tensor(all_codes):
+            all_codes = all_codes.detach().cpu()
+
+        # Split per-image codes, filtering out padding tokens
+        stride = max(1, int(self.config.downsample_factor))
+        max_latent_w = (max_w + stride - 1) // stride
+        max_latent_h = (max_h + stride - 1) // stride
+        batch_size = len(items)
+        all_codes = self._reshape_batch_codes(all_codes, batch_size, max_latent_h, max_latent_w)
+
+        results: list[list[int]] = []
+        for i, (w, h) in enumerate(orig_sizes):
+            latent_w = (w + stride - 1) // stride
+            latent_h = (h + stride - 1) // stride
+            sample_codes = all_codes[i]
+            valid_codes = sample_codes[:latent_h, :latent_w].reshape(-1).tolist()
+            codes = [int(v) for v in valid_codes]
+            self._validate_codes(codes)
+            results.append(codes)
+
+        return results
+
+    def _reshape_batch_codes(self, all_codes: Any, batch_size: int, latent_h: int, latent_w: int) -> torch.Tensor:
+        per_image = latent_h * latent_w
+        codes = torch.as_tensor(all_codes)
+
+        if codes.ndim == 1:
+            if codes.numel() != batch_size * per_image:
+                raise RuntimeError(f"IBQ returned {codes.numel()} codes, expected {batch_size * per_image} for batch size {batch_size}.")
+            return codes.reshape(batch_size, latent_h, latent_w)
+
+        if codes.ndim == 2:
+            if codes.shape == (batch_size, per_image):
+                return codes.reshape(batch_size, latent_h, latent_w)
+            if codes.shape == (batch_size * per_image, 1):
+                return codes.reshape(batch_size, latent_h, latent_w)
+            if codes.shape == (latent_h, latent_w) and batch_size == 1:
+                return codes.unsqueeze(0)
+
+        if codes.ndim == 3 and codes.shape[:3] == (batch_size, latent_h, latent_w):
+            return codes
+
+        raise RuntimeError(f"Unsupported IBQ code shape {tuple(codes.shape)} for batch size {batch_size}.")
+
+    def _validate_codes(self, codes: list[int]) -> None:
         max_latent_tokens = self.config.max_latent_tokens
         if max_latent_tokens is not None and int(max_latent_tokens) > 0 and len(codes) > int(max_latent_tokens):
             raise ValueError(f"IBQ returned {len(codes)} codes, expected <= {max_latent_tokens}.")
@@ -149,7 +246,6 @@ class IBQCodec:
             raise ValueError("IBQ returned a code outside the configured 16384-token codebook.")
         if not codes:
             raise ValueError("IBQ returned an empty visual-code sequence.")
-        return codes
 
 
 __all__ = [

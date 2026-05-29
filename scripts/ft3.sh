@@ -4,6 +4,9 @@ export NCCL_DEBUG=INFO
 # export DS_IGNORE_CUDA_DETECTION=1
 # export DS_SKIP_CUDA_CHECK=1
 
+export NCCL_P2P_DISABLE=1   # 分布式训练时禁用P2P通信，避免当前环境下的通信问题
+export NCCL_CUMEM_ENABLE=0
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
@@ -80,7 +83,7 @@ if [[ -n "${LATEST_CHECKPOINT}" ]]; then
 fi
 
 ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
-    --deepspeed "${PROJECT_ROOT}/scripts/zero2_tp2_gpu.json" \
+    --deepspeed "${PROJECT_ROOT}/scripts/zero2_tp2.json" \
     --model_name_or_path "${CKPT_PATH}" \
     --data_path "${DATA_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
@@ -99,7 +102,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
     --max_steps "${MAX_STEPS}" \
     --per_device_train_batch_size "${FT3_BATCH_SIZE:-1}" \
-    --gradient_accumulation_steps "${FT3_GRAD_ACCUM:-8}" \
+    --gradient_accumulation_steps "${FT3_GRAD_ACCUM:-4}" \
     --eval_strategy no \
     --save_strategy steps \
     --save_steps "${SAVE_STEPS}" \

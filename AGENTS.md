@@ -95,6 +95,14 @@ bash scripts/ft3.sh
 bash scripts/ft3_lora.sh
 ```
 
+双卡 DeepSpeed 冒烟测试：
+
+```bash
+bash scripts/test_deepspeed_2gpu.sh
+```
+
+这个测试脚本只验证本机 `torchrun + deepspeed` 双卡训练链路，使用随机数据和小模型，不读取 Fovea 数据、不加载本地权重。
+
 常用环境变量：
 
 - `FT3_DATA_PATH`

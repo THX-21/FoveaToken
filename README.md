@@ -19,6 +19,8 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 - `scripts/preprocess_pretrain_data.py`：把 COCO captions / Visual Genome regions 转成 Stage A/B visual-token 预训练 parquet。
 - `scripts/ft3.sh`：VGR 训练入口。
 - `scripts/ft3_lora.sh`：单卡 LoRA 训练入口，不使用 DeepSpeed CPU optimizer offload。
+- `scripts/test_deepspeed_2gpu.sh`：最小双卡 DeepSpeed 冒烟脚本，使用随机数据和小模型验证两卡训练链路。
+- `scripts/zero2_smoke_gpu.json`：给双卡冒烟测试用的最小 DeepSpeed ZeRO-2 配置。
 - `lmms-eval/lmms_eval/models/simple/fovea.py`：本地 lmms-eval adapter。
 
 ## 本地依赖
@@ -54,6 +56,14 @@ bash scripts/ft3.sh
 ```bash
 bash scripts/ft3_lora.sh
 ```
+
+如果只想先验证本机 `deepspeed + torchrun` 双卡链路是否通，可以运行：
+
+```bash
+bash scripts/test_deepspeed_2gpu.sh
+```
+
+这个脚本不会加载 Fovea/Qwen 权重，也不会读图像或 parquet，只会用随机数据跑一个很小的 MLP 训练 4 个 step。
 
 训练默认读取离线预处理后的 `data/vgr/preprocessed`，目录模式会读取该目录下全部 parquet。VGR 默认包含：
 

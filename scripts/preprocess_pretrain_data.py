@@ -87,6 +87,8 @@ def _load_ibq_codec(args: argparse.Namespace, max_latent_tokens: int | None):
 def build_coco_stage_a(args: argparse.Namespace, codec: Any) -> None:
     from datasets import load_dataset
 
+    batch_size = max(1, int(getattr(args, "batch_size", 1) or 1))
+
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     source_dir = output.parent / "_stage_a_source_images"
@@ -103,6 +105,38 @@ def build_coco_stage_a(args: argparse.Namespace, codec: Any) -> None:
         iterator = tqdm(iterator, total=int(args.max_samples), desc="stage-a")
     else:
         iterator = tqdm(iterator, desc="stage-a")
+
+    pending_rows: list[dict[str, Any]] = []
+    pending_items: list[tuple[Any, tuple[float, float, float, float]]] = []
+
+    def _flush_batch() -> None:
+        nonlocal pending_rows, pending_items
+        if not pending_items:
+            return
+        batch_codes = codec.encode_crops_batch(pending_items)
+        for row, codes in zip(pending_rows, batch_codes):
+            answer = _vq_text(codes, with_replay=False)
+            captions = row["_captions"]
+            for caption_idx, caption in enumerate(captions[: args.captions_per_image]):
+                records.append(
+                    {
+                        "id": f"coco_stage_a_{row['_row_id']}_{caption_idx}",
+                        "image": row["_rel_image"],
+                        "source": args.dataset_name,
+                        "fovea_task": "visual_code_lm",
+                        "fovea_preprocessed": True,
+                        "conversations": [
+                            {
+                                "from": "human",
+                                "value": f"<image>\nThis image shows: {caption}\nGenerate visual tokens for this image.",
+                            },
+                            {"from": "gpt", "value": answer},
+                        ],
+                    }
+                )
+        pending_rows = []
+        pending_items = []
+
     for row_idx, row in iterator:
         if args.max_samples is not None and len(records) >= args.max_samples:
             break
@@ -112,29 +146,19 @@ def build_coco_stage_a(args: argparse.Namespace, codec: Any) -> None:
         if not captions:
             continue
 
-        image_path = _save_temp_image(row.get("image"), source_dir, f"coco_{row.get('id', row_idx)}")
+        image = row.get("image")
+        image_path = _save_temp_image(image, source_dir, f"coco_{row.get('id', row_idx)}")
         rel_image = str(image_path.relative_to(output.parent))
-        codes = codec.encode_crop(str(image_path), (0.0, 0.0, 1.0, 1.0))
-        answer = _vq_text(codes, with_replay=False)
-        for caption_idx, caption in enumerate(captions[: args.captions_per_image]):
-            records.append(
-                {
-                    "id": f"coco_stage_a_{row.get('id', row_idx)}_{caption_idx}",
-                    "image": rel_image,
-                    "source": args.dataset_name,
-                    "fovea_task": "visual_code_lm",
-                    "fovea_preprocessed": True,
-                    "conversations": [
-                        {
-                            "from": "human",
-                            "value": f"<image>\nThis image shows: {caption}\nGenerate visual tokens for this image.",
-                        },
-                        {"from": "gpt", "value": answer},
-                    ],
-                }
-            )
-            if args.max_samples is not None and len(records) >= args.max_samples:
-                break
+
+        pending_rows.append({"_row_id": row.get("id", row_idx), "_rel_image": rel_image, "_captions": captions})
+        # Pass PIL Image directly to avoid disk re-read
+        pil_image = image if isinstance(image, Image.Image) else str(image_path)
+        pending_items.append((pil_image, (0.0, 0.0, 1.0, 1.0)))
+
+        if len(pending_items) >= batch_size:
+            _flush_batch()
+
+    _flush_batch()
 
     pd.DataFrame(records).to_parquet(output, index=False)
     print(f"[stage-a] wrote {output} records={len(records)}", flush=True)
@@ -173,6 +197,8 @@ def _build_vg_image_index(image_root: Path) -> dict[int, Path]:
 
 
 def build_visual_genome_stage_b(args: argparse.Namespace, codec: Any) -> None:
+    batch_size = max(1, int(getattr(args, "batch_size", 1) or 1))
+
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     image_root = Path(args.vg_image_root).expanduser().resolve()
@@ -185,6 +211,42 @@ def build_visual_genome_stage_b(args: argparse.Namespace, codec: Any) -> None:
     }
     image_index = _build_vg_image_index(image_root)
     records: list[dict[str, Any]] = []
+
+    pending_items: list[tuple[str, tuple[float, float, float, float]]] = []
+    pending_meta: list[dict[str, Any]] = []
+
+    def _flush_batch() -> None:
+        nonlocal pending_items, pending_meta
+        if not pending_items:
+            return
+        batch_codes = codec.encode_crops_batch(pending_items)
+        for meta, codes in zip(pending_meta, batch_codes):
+            box = meta["_box"]
+            box_text = f"[{box[0]:.4f}, {box[1]:.4f}, {box[2]:.4f}, {box[3]:.4f}]"
+            visual_query = _vq_text(codes, with_replay=True)
+            supervised_visual_query = _vq_text(codes, with_replay=False)
+            records.append(
+                {
+                    "id": meta["_rec_id"],
+                    "image": meta["_rel_image"],
+                    "source": "jn12/VisualGenome",
+                    "fovea_preprocessed": True,
+                    "fovea_query_boxes": [list(box)],
+                    "fovea_supervised_substrings": [supervised_visual_query, f" {box_text}"],
+                    "conversations": [
+                        {
+                            "from": "human",
+                            "value": f'<image>\nDescribe where the caption "{meta["_phrase"]}" corresponds in the image.',
+                        },
+                        {
+                            "from": "gpt",
+                            "value": f'The caption "{meta["_phrase"]}" {visual_query} corresponds to the image region {box_text}.',
+                        },
+                    ],
+                }
+            )
+        pending_items = []
+        pending_meta = []
 
     for region in tqdm(list(_iter_vg_regions(region_data)), desc="stage-b"):
         if args.max_samples is not None and len(records) >= args.max_samples:
@@ -212,31 +274,20 @@ def build_visual_genome_stage_b(args: argparse.Namespace, codec: Any) -> None:
         )
         if box[2] <= box[0] or box[3] <= box[1]:
             continue
-        codes = codec.encode_crop(str(image_path), box)
         rel_image = str(image_path.relative_to(image_root))
-        visual_query = _vq_text(codes, with_replay=True)
-        supervised_visual_query = _vq_text(codes, with_replay=False)
-        box_text = f"[{box[0]:.4f}, {box[1]:.4f}, {box[2]:.4f}, {box[3]:.4f}]"
-        records.append(
+        pending_items.append((str(image_path), box))
+        pending_meta.append(
             {
-                "id": f"vg_stage_b_{image_id}_{region.get('region_id', len(records))}",
-                "image": rel_image,
-                "source": "jn12/VisualGenome",
-                "fovea_preprocessed": True,
-                "fovea_query_boxes": [list(box)],
-                "fovea_supervised_substrings": [supervised_visual_query, f" {box_text}"],
-                "conversations": [
-                    {
-                        "from": "human",
-                        "value": f'<image>\nDescribe where the caption "{phrase}" corresponds in the image.',
-                    },
-                    {
-                        "from": "gpt",
-                        "value": f'The caption "{phrase}" {visual_query} corresponds to the image region {box_text}.',
-                    },
-                ],
+                "_rec_id": f"vg_stage_b_{image_id}_{region.get('region_id', len(records) + len(pending_meta))}",
+                "_rel_image": rel_image,
+                "_phrase": phrase,
+                "_box": box,
             }
         )
+        if len(pending_items) >= batch_size:
+            _flush_batch()
+
+    _flush_batch()
 
     pd.DataFrame(records).to_parquet(output, index=False)
     print(f"[stage-b] wrote {output} records={len(records)} image_root={image_root}", flush=True)
@@ -251,6 +302,7 @@ def main() -> None:
     parser.add_argument("--ibq_checkpoint", default=DEFAULT_IBQ_CHECKPOINT)
     parser.add_argument("--ibq_config", default=DEFAULT_IBQ_CONFIG)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for IBQ encoding. Larger = faster but more GPU memory.")
     parser.add_argument(
         "--stage_a_max_visual_tokens",
         type=int,

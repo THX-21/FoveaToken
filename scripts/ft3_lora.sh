@@ -2,6 +2,9 @@
 export OMP_NUM_THREADS=8
 export NCCL_DEBUG=WARN
 
+export NCCL_P2P_DISABLE=1   # 分布式训练时禁用P2P通信，避免当前环境下的通信问题
+export NCCL_CUMEM_ENABLE=0
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
