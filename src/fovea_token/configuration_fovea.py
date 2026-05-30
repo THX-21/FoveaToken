@@ -52,6 +52,9 @@ class FoveaConfig(LlavaNextConfig):
         kwargs.pop("model_type", None)
         kwargs.setdefault("image_grid_pinpoints", EXPANDED_LLAVA_NEXT_IMAGE_GRID_PINPOINTS)
         super().__init__(*args, **kwargs)
+        for attr in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            if not hasattr(self, attr):
+                setattr(self, attr, getattr(self.text_config, attr, None))
         self.fovea_num_tokens = int(fovea_num_tokens)
         self.fovea_lambda_align = float(fovea_lambda_align)
         self.fovea_align_eps = float(fovea_align_eps)
@@ -67,6 +70,36 @@ class FoveaConfig(LlavaNextConfig):
     @image_token_id.setter
     def image_token_id(self, value: int) -> None:
         self.image_token_index = value
+
+    @property
+    def pad_token_id(self) -> int | None:
+        return getattr(self, "_pad_token_id", getattr(self.text_config, "pad_token_id", None))
+
+    @pad_token_id.setter
+    def pad_token_id(self, value: int | None) -> None:
+        self._pad_token_id = value
+        if hasattr(self, "text_config"):
+            self.text_config.pad_token_id = value
+
+    @property
+    def bos_token_id(self) -> int | None:
+        return getattr(self, "_bos_token_id", getattr(self.text_config, "bos_token_id", None))
+
+    @bos_token_id.setter
+    def bos_token_id(self, value: int | None) -> None:
+        self._bos_token_id = value
+        if hasattr(self, "text_config"):
+            self.text_config.bos_token_id = value
+
+    @property
+    def eos_token_id(self) -> int | None:
+        return getattr(self, "_eos_token_id", getattr(self.text_config, "eos_token_id", None))
+
+    @eos_token_id.setter
+    def eos_token_id(self, value: int | None) -> None:
+        self._eos_token_id = value
+        if hasattr(self, "text_config"):
+            self.text_config.eos_token_id = value
 
 
 __all__ = [

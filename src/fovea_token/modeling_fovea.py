@@ -8,6 +8,7 @@ from torch.nn import init
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
+from transformers.models.llava_next.configuration_llava_next import LlavaNextConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import can_return_tuple
 
@@ -21,6 +22,43 @@ from .modeling_llava_next import (
     LlavaNextPreTrainedModel,
     unpad_image,
 )
+
+
+def _box_giou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Compute GIoU between two sets of boxes in [x1, y1, x2, y2] format.
+
+    Args:
+        boxes1: (N, 4)
+        boxes2: (N, M, 4)
+
+    Returns:
+        giou: (N, M) in [-1, 1]
+    """
+    a = boxes1.unsqueeze(1)  # (N, 1, 4)
+    b = boxes2               # (N, M, 4)
+
+    # Intersection
+    inter_x1 = torch.max(a[..., 0], b[..., 0])
+    inter_y1 = torch.max(a[..., 1], b[..., 1])
+    inter_x2 = torch.min(a[..., 2], b[..., 2])
+    inter_y2 = torch.min(a[..., 3], b[..., 3])
+    inter_area = (inter_x2 - inter_x1).clamp_min(0) * (inter_y2 - inter_y1).clamp_min(0)
+
+    # Areas
+    area1 = (a[..., 2] - a[..., 0]) * (a[..., 3] - a[..., 1])
+    area2 = (b[..., 2] - b[..., 0]) * (b[..., 3] - b[..., 1])
+
+    union = area1 + area2 - inter_area
+    iou = inter_area / union.clamp_min(1e-6)
+
+    # Enclosing box
+    c_x1 = torch.min(a[..., 0], b[..., 0])
+    c_y1 = torch.min(a[..., 1], b[..., 1])
+    c_x2 = torch.max(a[..., 2], b[..., 2])
+    c_y2 = torch.max(a[..., 3], b[..., 3])
+    c_area = ((c_x2 - c_x1) * (c_y2 - c_y1)).clamp_min(1e-6)
+
+    return iou - (c_area - union) / c_area
 from .train.data import IGNORE_INDEX
 
 
@@ -131,13 +169,28 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         "^image_newline": "model.image_newline",
         "^language_model.lm_head": "lm_head",
     }
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     accepts_loss_kwargs = False
     config: FoveaConfig
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = LlavaNextModel(config)
+        llava_config_dict = config.to_dict()
+        for key in (
+            "fovea_num_tokens",
+            "fovea_lambda_align",
+            "fovea_align_eps",
+            "fovea_input_base_pool",
+            "fovea_input_highres_pool",
+            "fovea_retrieve_pool",
+            "fovea_token_id",
+        ):
+            llava_config_dict.pop(key, None)
+        llava_config_dict["model_type"] = "llava_next"
+        llava_config = LlavaNextConfig(**llava_config_dict)
+        for attr in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            setattr(llava_config, attr, getattr(config, attr, getattr(config.text_config, attr, None)))
+        self.model = LlavaNextModel(llava_config)
         hidden_size = config.text_config.hidden_size
         self.lm_head = nn.Linear(hidden_size, config.text_config.vocab_size, bias=False)
 
@@ -587,16 +640,13 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             boxes_for_memory = patch_boxes.index_select(0, trigger_batch).to(device=device, dtype=torch.float32)
             mask_for_trigger = memory_mask.index_select(0, trigger_batch)
             valid_boxes = boxes_for_memory.ge(0).all(dim=-1)
-            centers = (boxes_for_memory[..., :2] + boxes_for_memory[..., 2:]) * 0.5
-            inside = (
-                (centers[..., 0] >= boxes_for_trigger[:, 0:1])
-                & (centers[..., 0] <= boxes_for_trigger[:, 2:3])
-                & (centers[..., 1] >= boxes_for_trigger[:, 1:2])
-                & (centers[..., 1] <= boxes_for_trigger[:, 3:4])
-                & mask_for_trigger
-                & valid_boxes
-            )
-            prob = (attn_mean * inside[:, None, :].to(attn_mean.dtype)).sum(dim=-1)
+
+            # GIoU soft weight instead of hard center-in-box
+            giou = _box_giou(boxes_for_trigger, boxes_for_memory)  # (N_q, N_patch)
+            giou = giou * mask_for_trigger.to(giou.dtype) * valid_boxes.to(giou.dtype)
+            giou_weight = giou.clamp_min(0)
+
+            prob = (attn_mean * giou_weight[:, None, :].to(attn_mean.dtype)).sum(dim=-1)
             align_loss = -(prob.clamp_min(float(self.config.fovea_align_eps)).log()).mean()
         return vectors, align_loss
 

@@ -114,17 +114,23 @@ def replace_image_tokens_in_conversations(
                 sentence["value"] = value.replace(DEFAULT_IMAGE_TOKEN, joined_placeholder, 1)
                 return conversations
 
-    image_index = 0
     for sentence in conversations:
         value = sentence["value"]
-        while DEFAULT_IMAGE_TOKEN in value:
-            if image_index >= len(image_token_groups):
+        if DEFAULT_IMAGE_TOKEN not in value:
+            continue
+        pieces = value.split(DEFAULT_IMAGE_TOKEN)
+        if len(pieces) - 1 > len(image_token_groups):
+            raise ValueError("Conversation references more <image> placeholders than the sample provides.")
+        rebuilt = [pieces[0]]
+        for idx, piece in enumerate(pieces[1:]):
+            if idx >= len(image_token_groups):
                 raise ValueError("Conversation references more <image> placeholders than the sample provides.")
-            placeholder = "".join(DEFAULT_IMAGE_TOKEN * count for count in image_token_groups[image_index])
-            value = value.replace(DEFAULT_IMAGE_TOKEN, placeholder, 1)
-            image_index += 1
-        sentence["value"] = value
-    if image_index != len(image_token_groups):
+            placeholder = "".join(DEFAULT_IMAGE_TOKEN * count for count in image_token_groups[idx])
+            rebuilt.append(placeholder)
+            rebuilt.append(piece)
+        sentence["value"] = "".join(rebuilt)
+        image_token_groups = image_token_groups[len(pieces) - 1 :]
+    if image_token_groups:
         raise ValueError("Sample provides more images than there are <image> placeholders in the conversation.")
     return conversations
 
