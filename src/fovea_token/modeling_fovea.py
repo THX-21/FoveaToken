@@ -1,58 +1,170 @@
-"""Fovea visual-query replay model.
-
-This file intentionally contains only the current mechanism:
-`<vq> <vis_i> ... </vq>` hidden states retrieve high-resolution visual memory,
-then replay vectors are scattered into the replay placeholder positions for a
-second decoder pass.
-"""
+"""Fixed-token Fovea model on top of HF LLaVA-NeXT."""
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.nn import init
 
+from transformers.cache_utils import Cache
+from transformers.generation import GenerationMixin
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
+from transformers.processing_utils import Unpack
+from transformers.utils import can_return_tuple
+
 from .configuration_fovea import FoveaConfig
-from .modeling_qwen3_5 import (
-    Cache,
-    GenerationMixin,
-    Qwen3_5CausalLMOutputWithPast,
-    Qwen3_5Model,
-    Qwen3_5PreTrainedModel,
-    Qwen3_5RMSNorm,
-    TransformersKwargs,
-    Unpack,
-    auto_docstring,
-    can_return_tuple,
+from .modeling_llava_next import (
+    get_anyres_image_grid_shape,
+    image_size_to_num_patches,
+    KwargsForCausalLM,
+    LlavaNextCausalLMOutputWithPast,
+    LlavaNextModel,
+    LlavaNextPreTrainedModel,
+    unpad_image,
 )
 from .train.data import IGNORE_INDEX
 
 
-class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-    """Qwen3.5 multimodal LM with packed visual-query retrieval."""
+class FoveaRMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
 
-    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+    def forward(self, hidden_states, gate):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+        return hidden_states.to(input_dtype)
+
+
+def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
+    return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+
+
+def _torch_chunk_gated_delta_rule(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    chunk_size=64,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+):
+    initial_dtype = query.dtype
+    if use_qk_l2norm_in_kernel:
+        query = _l2norm(query, dim=-1, eps=1e-6)
+        key = _l2norm(key, dim=-1, eps=1e-6)
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+    ]
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+    total_sequence_length = sequence_length + pad_size
+    query = query * (query.shape[-1] ** -0.5)
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    query, key, value, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)
+    ]
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
+
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for idx in range(1, chunk_size):
+        row = attn[..., idx, :idx].clone()
+        sub = attn[..., :idx, :idx].clone()
+        attn[..., idx, :idx] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+    core_attn_out = torch.zeros_like(value)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
+
+    for idx in range(0, total_sequence_length // chunk_size):
+        q_i, k_i, v_i = query[:, :, idx], key[:, :, idx], value[:, :, idx]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, idx]).masked_fill_(mask, 0)
+        v_prime = (k_cumdecay[:, :, idx]) @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, idx, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, idx] = attn_inter + attn @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, idx, -1, None, None].exp()
+            + (k_i * (g[:, :, idx, -1, None] - g[:, :, idx]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    if not output_final_state:
+        last_recurrent_state = None
+    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state
+
+
+class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
+    """LLaVA-NeXT LM with 64 fixed fovea query tokens inserted after `<fovea>`."""
+
+    config_class = FoveaConfig
+    _checkpoint_conversion_mapping = {
+        "^language_model.model": "model.language_model",
+        "^vision_tower": "model.vision_tower",
+        "^multi_modal_projector": "model.multi_modal_projector",
+        "^image_newline": "model.image_newline",
+        "^language_model.lm_head": "lm_head",
+    }
+    _tied_weights_keys = ["lm_head.weight"]
     accepts_loss_kwargs = False
     config: FoveaConfig
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3_5Model(config)
+        self.model = LlavaNextModel(config)
         hidden_size = config.text_config.hidden_size
         self.lm_head = nn.Linear(hidden_size, config.text_config.vocab_size, bias=False)
 
-        self.visual_query_num_heads = int(config.text_config.num_attention_heads)
-        self.visual_query_head_dim = int(getattr(config.text_config, "head_dim", hidden_size // self.visual_query_num_heads))
-        if self.visual_query_num_heads * self.visual_query_head_dim != hidden_size:
-            raise ValueError("Visual-query retrieval requires num_attention_heads * head_dim to equal hidden_size.")
+        self.fovea_num_heads = int(config.text_config.num_attention_heads)
+        self.fovea_head_dim = int(getattr(config.text_config, "head_dim", hidden_size // self.fovea_num_heads))
+        if self.fovea_num_heads * self.fovea_head_dim != hidden_size:
+            raise ValueError("Fovea retrieval requires num_attention_heads * head_dim to equal hidden_size.")
 
-        self.visual_query_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.visual_query_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.visual_query_v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.visual_query_o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.visual_query_q_norm = Qwen3_5RMSNorm(self.visual_query_head_dim, eps=config.text_config.rms_norm_eps)
-        self.visual_query_k_norm = Qwen3_5RMSNorm(self.visual_query_head_dim, eps=config.text_config.rms_norm_eps)
-        self._visual_query_aux: dict[str, torch.Tensor] = {}
+        eps = float(getattr(config.text_config, "rms_norm_eps", 1e-6))
+        self.fovea_tokens = nn.Embedding(int(config.fovea_num_tokens), hidden_size)
+        self.fovea_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.fovea_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.fovea_v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.fovea_o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.fovea_q_norm = LlamaRMSNorm(self.fovea_head_dim, eps=eps)
+        self.fovea_k_norm = LlamaRMSNorm(self.fovea_head_dim, eps=eps)
+        self.fovea_ssm_in_proj_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=False)
+        self.fovea_ssm_in_proj_z = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.fovea_ssm_in_proj_b = nn.Linear(hidden_size, self.fovea_num_heads, bias=False)
+        self.fovea_ssm_in_proj_a = nn.Linear(hidden_size, self.fovea_num_heads, bias=False)
+        self.fovea_ssm_dt_bias = nn.Embedding(1, self.fovea_num_heads)
+        self.fovea_ssm_A_log = nn.Embedding(1, self.fovea_num_heads)
+        self.fovea_ssm_out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.fovea_ssm_norm = FoveaRMSNormGated(self.fovea_head_dim, eps=eps)
+        self._fovea_aux: dict[str, torch.Tensor] = {}
         self.post_init()
-        self._init_visual_query_modules()
+        self._init_fovea_modules()
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
@@ -60,9 +172,9 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         loaded = super().from_pretrained(*args, **kwargs)
         if output_loading_info:
             model, loading_info = loaded
-            model._repair_visual_query_init()
+            model._repair_fovea_init()
             return model, loading_info
-        loaded._repair_visual_query_init()
+        loaded._repair_fovea_init()
         return loaded
 
     def get_input_embeddings(self):
@@ -71,113 +183,238 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     def set_input_embeddings(self, value):
         self.model.set_input_embeddings(value)
 
+    def get_output_embeddings(self) -> nn.Module:
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model.set_decoder(decoder)
+
+    def get_decoder(self):
+        return self.model.get_decoder()
+
     @torch.no_grad()
-    def _init_visual_query_modules(self) -> None:
+    def _init_fovea_modules(self) -> None:
         std = float(getattr(self.config.text_config, "initializer_range", 0.02))
+        init.normal_(self.fovea_tokens.weight, mean=0.0, std=std)
+        init.uniform_(self.fovea_ssm_A_log.weight, 1e-4, 16)
+        self.fovea_ssm_A_log.weight.log_()
+        init.ones_(self.fovea_ssm_dt_bias.weight)
         for module in (
-            self.visual_query_q_proj,
-            self.visual_query_k_proj,
-            self.visual_query_v_proj,
-            self.visual_query_o_proj,
+            self.fovea_q_proj,
+            self.fovea_k_proj,
+            self.fovea_v_proj,
+            self.fovea_o_proj,
+            self.fovea_ssm_in_proj_qkv,
+            self.fovea_ssm_in_proj_z,
+            self.fovea_ssm_in_proj_b,
+            self.fovea_ssm_in_proj_a,
+            self.fovea_ssm_out_proj,
         ):
             init.normal_(module.weight, mean=0.0, std=std)
-        init.zeros_(self.visual_query_q_norm.weight)
-        init.zeros_(self.visual_query_k_norm.weight)
+        init.ones_(self.fovea_q_norm.weight)
+        init.ones_(self.fovea_k_norm.weight)
+        init.ones_(self.fovea_ssm_norm.weight)
 
     @torch.no_grad()
-    def _repair_visual_query_init(self) -> None:
-        """Repair missing visual-query params after checkpoint loading."""
-
+    def _repair_fovea_init(self) -> None:
         std = float(getattr(self.config.text_config, "initializer_range", 0.02))
-        for module in (
-            self.visual_query_q_proj,
-            self.visual_query_k_proj,
-            self.visual_query_v_proj,
-            self.visual_query_o_proj,
-        ):
-            weight = module.weight
-            if torch.isfinite(weight).all() and weight.float().std() > 0:
+        tensors = [self.fovea_tokens.weight]
+        tensors.extend(
+            module.weight
+            for module in (
+                self.fovea_q_proj,
+                self.fovea_k_proj,
+                self.fovea_v_proj,
+                self.fovea_o_proj,
+                self.fovea_ssm_in_proj_qkv,
+                self.fovea_ssm_in_proj_z,
+                self.fovea_ssm_in_proj_b,
+                self.fovea_ssm_in_proj_a,
+                self.fovea_ssm_out_proj,
+            )
+        )
+        for tensor in tensors:
+            if torch.isfinite(tensor).all() and tensor.float().std() > 0:
                 continue
-            init.normal_(weight, mean=0.0, std=std)
-        for module in (self.visual_query_q_norm, self.visual_query_k_norm):
-            if not torch.isfinite(module.weight).all():
-                init.zeros_(module.weight)
+            init.normal_(tensor, mean=0.0, std=std)
+        a_log = self.fovea_ssm_A_log.weight
+        a_log_float = a_log.float()
+        if (
+            not torch.isfinite(a_log).all()
+            or a_log_float.exp().le(0).any()
+            or a_log_float.abs().sum() == 0
+            or (a_log.numel() > 1 and a_log_float.std() == 0)
+        ):
+            init.uniform_(a_log, 1e-4, 16)
+            a_log.log_()
+        dt_bias = self.fovea_ssm_dt_bias.weight
+        if not torch.isfinite(dt_bias).all() or dt_bias.float().abs().sum() == 0:
+            init.ones_(dt_bias)
+        for module in (self.fovea_q_norm, self.fovea_k_norm, self.fovea_ssm_norm):
+            if not torch.isfinite(module.weight).all() or module.weight.float().abs().sum() == 0:
+                init.ones_(module.weight)
 
-    @auto_docstring
-    def get_video_features(self, pixel_values_videos: torch.FloatTensor, video_grid_thw: torch.LongTensor | None = None, **kwargs: Unpack[TransformersKwargs]):
-        r"""
-        pixel_values_videos (`torch.FloatTensor`):
-            Packed video pixel tensor.
-        video_grid_thw (`torch.LongTensor`, *optional*):
-            Temporal-height-width grid metadata for each packed video.
-        """
-        return self.model.get_video_features(pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thw, **kwargs)
+    def _pool_spatial_feature_grid(self, feature_grid: torch.Tensor, pool_size: int) -> torch.Tensor:
+        pool_size = int(pool_size)
+        if pool_size <= 1:
+            return feature_grid
+        channels, height, width = feature_grid.shape
+        pad_h = (pool_size - height % pool_size) % pool_size
+        pad_w = (pool_size - width % pool_size) % pool_size
+        feature = F.pad(feature_grid.unsqueeze(0), (0, pad_w, 0, pad_h))
+        mask = feature_grid.new_ones((1, 1, height, width))
+        mask = F.pad(mask, (0, pad_w, 0, pad_h))
+        pooled = F.avg_pool2d(feature, kernel_size=pool_size, stride=pool_size)
+        pooled_mask = F.avg_pool2d(mask, kernel_size=pool_size, stride=pool_size).clamp_min(1e-6)
+        return (pooled / pooled_mask).squeeze(0)
 
-    @auto_docstring
-    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None, **kwargs: Unpack[TransformersKwargs]):
-        r"""
-        pixel_values (`torch.FloatTensor`):
-            Packed image pixel tensor.
-        image_grid_thw (`torch.LongTensor`, *optional*):
-            Temporal-height-width grid metadata for each packed image.
-        """
-        return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
+    def _pool_flat_square_features(self, features: torch.Tensor, grid_size: int, pool_size: int) -> torch.Tensor:
+        if int(pool_size) <= 1:
+            return features
+        grid = features.view(grid_size, grid_size, -1).permute(2, 0, 1).contiguous()
+        pooled = self._pool_spatial_feature_grid(grid, pool_size)
+        return pooled.flatten(1, 2).transpose(0, 1).contiguous()
 
-    def _build_multimodal_embeddings_and_positions(
+    def _pack_image_features_pooled(
+        self,
+        image_features,
+        image_sizes,
+        *,
+        base_pool: int,
+        highres_pool: int,
+        include_base: bool,
+        include_newline: bool,
+    ):
+        new_image_features = []
+        feature_lens = []
+        grid_size = self.config.vision_config.image_size // self.config.vision_config.patch_size
+        for image_idx, image_feature in enumerate(image_features):
+            if image_feature.shape[0] > 1:
+                base_image_feature = self._pool_flat_square_features(image_feature[0], grid_size, base_pool)
+                highres_feature = image_feature[1:]
+                num_patch_height, num_patch_width = get_anyres_image_grid_shape(
+                    image_sizes[image_idx],
+                    self.config.image_grid_pinpoints,
+                    self.config.vision_config.image_size,
+                )
+                highres_feature = highres_feature.view(num_patch_height, num_patch_width, grid_size, grid_size, -1)
+                highres_feature = highres_feature.permute(4, 0, 2, 1, 3).contiguous()
+                highres_feature = highres_feature.flatten(1, 2).flatten(2, 3)
+                highres_feature = unpad_image(highres_feature, image_sizes[image_idx])
+                highres_feature = self._pool_spatial_feature_grid(highres_feature, highres_pool)
+                if include_newline:
+                    highres_feature = torch.cat(
+                        (
+                            highres_feature,
+                            self.model.image_newline[:, None, None]
+                            .expand(*highres_feature.shape[:-1], 1)
+                            .to(highres_feature.device, highres_feature.dtype),
+                        ),
+                        dim=-1,
+                    )
+                highres_feature = highres_feature.flatten(1, 2).transpose(0, 1).contiguous()
+                if include_base:
+                    image_feature = torch.cat((base_image_feature, highres_feature), dim=0)
+                else:
+                    image_feature = highres_feature
+            else:
+                image_feature = self._pool_flat_square_features(image_feature[0], grid_size, base_pool)
+                if include_newline:
+                    image_feature = torch.cat((image_feature, self.model.image_newline[None].to(image_feature)), dim=0)
+                if not include_base:
+                    image_feature = image_feature[:0]
+            new_image_features.append(image_feature)
+            feature_lens.append(image_feature.size(0))
+        feature_lens = torch.tensor(feature_lens, dtype=torch.long, device=image_features[0].device)
+        return new_image_features, feature_lens
+
+    def get_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_sizes: torch.Tensor,
+        vision_feature_layer=None,
+        vision_feature_select_strategy=None,
+        base_pool: int | None = None,
+        highres_pool: int | None = None,
+        include_base: bool = True,
+        include_newline: bool = True,
+    ):
+        vision_feature_layer = (
+            vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
+        )
+        vision_feature_select_strategy = (
+            vision_feature_select_strategy
+            if vision_feature_select_strategy is not None
+            else self.config.vision_feature_select_strategy
+        )
+        if vision_feature_select_strategy != "default":
+            raise ValueError("Fovea pooled image features require vision_feature_select_strategy='default'.")
+        base_pool = int(base_pool if base_pool is not None else self.config.fovea_input_base_pool)
+        highres_pool = int(highres_pool if highres_pool is not None else self.config.fovea_input_highres_pool)
+
+        image_num_patches = [
+            image_size_to_num_patches(
+                image_size=imsize,
+                grid_pinpoints=self.config.image_grid_pinpoints,
+                patch_size=self.config.vision_config.image_size,
+            )
+            for imsize in image_sizes
+        ]
+        if pixel_values.dim() == 5:
+            pixel_values = torch.cat([pix_val[:num_patch] for pix_val, num_patch in zip(pixel_values, image_num_patches)], dim=0)
+        elif pixel_values.dim() != 4:
+            raise ValueError(f"pixel_values of shape {pixel_values.shape}, expect to be of 4 or 5 dimensions")
+
+        image_features = self.model.vision_tower(pixel_values, output_hidden_states=True)
+        if isinstance(vision_feature_layer, int):
+            selected_image_feature = image_features.hidden_states[vision_feature_layer]
+        else:
+            selected_image_feature = torch.cat([image_features.hidden_states[layer_idx] for layer_idx in vision_feature_layer], dim=-1)
+        selected_image_feature = selected_image_feature[:, 1:]
+        image_features = self.model.multi_modal_projector(selected_image_feature)
+        image_features = torch.split(image_features, image_num_patches, dim=0)
+        image_features, _ = self._pack_image_features_pooled(
+            image_features,
+            image_sizes,
+            base_pool=base_pool,
+            highres_pool=highres_pool,
+            include_base=include_base,
+            include_newline=include_newline,
+        )
+        return image_features
+
+    def _build_multimodal_embeddings(
         self,
         input_ids,
-        attention_mask,
         pixel_values,
-        image_grid_thw,
-        pixel_values_videos=None,
-        video_grid_thw=None,
-        mm_token_type_ids=None,
+        image_sizes,
         input_embeds_override=None,
+        vision_feature_layer=None,
+        vision_feature_select_strategy=None,
     ):
         inputs_embeds = self.get_input_embeddings()(input_ids) if input_embeds_override is None else input_embeds_override
-        if pixel_values is not None:
-            image_outputs = self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, return_dict=True)
-            image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.model.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-        if pixel_values_videos is not None:
-            video_outputs = self.model.get_video_features(pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thw, return_dict=True)
-            video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.model.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-        self.model.rope_deltas = None
-        position_ids = self.model.compute_3d_position_ids(
-            input_ids=input_ids,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=None,
-            mm_token_type_ids=mm_token_type_ids,
-        )
-        return inputs_embeds, position_ids
+        image_features = None
+        if pixel_values is not None and pixel_values.size(0) > 0:
+            image_features = self.get_image_features(
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+                vision_feature_layer=vision_feature_layer,
+                vision_feature_select_strategy=vision_feature_select_strategy,
+            )
+            image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask = input_ids.eq(int(self.config.image_token_index)).unsqueeze(-1).expand_as(inputs_embeds)
+            if inputs_embeds[image_mask].numel() != image_features.numel():
+                raise ValueError(
+                    "Image features and image tokens do not match: "
+                    f"tokens={int(input_ids.eq(int(self.config.image_token_index)).sum())}, features={image_features.shape[0]}"
+                )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+        return inputs_embeds, image_features
 
-    def _position_ids_from_embeds(
-        self,
-        input_ids,
-        attention_mask,
-        inputs_embeds,
-        image_grid_thw,
-        video_grid_thw=None,
-        mm_token_type_ids=None,
-    ):
-        self.model.rope_deltas = None
-        return self.model.compute_3d_position_ids(
-            input_ids=input_ids,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=None,
-            mm_token_type_ids=mm_token_type_ids,
-        )
-
-    def _language_forward_from_embeds(self, inputs_embeds, attention_mask, position_ids, **kwargs):
+    def _language_forward_from_embeds(self, inputs_embeds, attention_mask=None, position_ids=None, **kwargs):
         return self.model.language_model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
@@ -186,388 +423,237 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             **kwargs,
         )
 
-    def _masked_visual_code_embeddings(self, input_ids, labels, vq_code_label_mask):
-        inputs_embeds = self.get_input_embeddings()(input_ids)
-        mask_id = self.config.mask_vis_token_id
-        if mask_id is None or vq_code_label_mask is None or vq_code_label_mask.numel() == 0:
-            return inputs_embeds
-        if not self.training:
-            return inputs_embeds
-        mask = vq_code_label_mask.to(device=input_ids.device).bool()
-        mask_ratio = torch.rand((), device=input_ids.device)
-        mask = mask & (torch.rand(mask.shape, device=input_ids.device) < mask_ratio) & labels.ne(IGNORE_INDEX)
-        if not mask.any():
-            return inputs_embeds
-        mask_embeds = self.get_input_embeddings()(torch.full_like(input_ids, int(mask_id)))
-        return torch.where(mask.unsqueeze(-1), mask_embeds, inputs_embeds)
-
-    def _use_generated_replay(self) -> bool:
-        if not self.training:
-            return False
-        prob = float(getattr(self.config, "visual_query_generated_replay_prob", 0.0))
-        if prob <= 0:
-            return False
-        if prob >= 1:
-            return True
-        return bool(torch.rand((), device=next(self.parameters()).device) < prob)
-
-    def _generated_code_ids(self, input_ids, logits, vq_code_positions):
-        vis_start = self.config.vis_token_start_id
-        vis_end = self.config.vis_token_end_id
-        if vis_start is None or vis_end is None or vq_code_positions.numel() == 0:
-            return input_ids
-        code_pos = vq_code_positions.to(device=logits.device, dtype=torch.long)
-        code_batch = code_pos[:, 0]
-        code_token = code_pos[:, 1]
-        predictor_token = (code_token - 1).clamp_min(0)
-        code_logits = logits[code_batch, predictor_token, int(vis_start) : int(vis_end) + 1]
-        generated = code_logits.argmax(dim=-1).to(device=input_ids.device) + int(vis_start)
-        generated_ids = input_ids.clone()
-        generated_ids[code_batch.to(input_ids.device), code_token.to(input_ids.device)] = generated
-        return generated_ids
-
-    def _retrieve_image_position_bases(self, position_ids, mm_token_type_ids, retrieve_image_counts, device):
-        counts = retrieve_image_counts.to(device="cpu", dtype=torch.long).tolist()
-        if position_ids is None or mm_token_type_ids is None:
-            return [0] * sum(int(count) for count in counts)
-        bases = []
-        for batch_idx, count in enumerate(counts):
-            image_mask = mm_token_type_ids[batch_idx].to(device=position_ids.device).eq(1)
-            starts = torch.where(image_mask & torch.cat([image_mask.new_tensor([True]), ~image_mask[:-1]]))[0]
-            for item in starts[: int(count)]:
-                bases.append(int(position_ids[:, batch_idx, item].min().item()))
-            bases.extend([0] * (int(count) - min(len(starts), int(count))))
-        return bases
-
-    def _split_retrieve_features_by_sample(
-        self,
-        retrieve_pixel_values,
-        retrieve_grid_thw,
-        retrieve_image_counts,
-        batch_size,
-        position_ids=None,
-        mm_token_type_ids=None,
-    ):
-        outputs = self.model.get_image_features(pixel_values=retrieve_pixel_values, image_grid_thw=retrieve_grid_thw, return_dict=True)
-        flat_features = list(outputs.pooler_output)
-        position_bases = self._retrieve_image_position_bases(
-            position_ids,
-            mm_token_type_ids,
-            retrieve_image_counts,
-            retrieve_pixel_values.device,
+    def _split_retrieve_features_by_sample(self, retrieve_pixel_values, retrieve_image_sizes, retrieve_image_counts):
+        features = self.get_image_features(
+            pixel_values=retrieve_pixel_values,
+            image_sizes=retrieve_image_sizes,
+            base_pool=self.config.fovea_retrieve_pool,
+            highres_pool=self.config.fovea_retrieve_pool,
+            include_base=False,
+            include_newline=False,
         )
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-        flat_positions = [
-            self.model.get_vision_position_ids(
-                position_bases[idx],
-                grid,
-                1,
-                spatial_merge_size,
-                device=retrieve_pixel_values.device,
-            ).transpose(0, 1)
-            for idx, grid in enumerate(retrieve_grid_thw)
-        ]
         counts = retrieve_image_counts.to(device="cpu", dtype=torch.long).tolist()
-        per_sample, per_sample_positions, start = [], [], 0
+        per_sample, start = [], 0
         for count in counts:
             count = int(count)
-            sample_features = flat_features[start : start + count]
-            sample_positions = flat_positions[start : start + count]
-            per_sample.append(torch.cat(sample_features, dim=0))
-            per_sample_positions.append(torch.cat(sample_positions, dim=0))
+            if count > 0:
+                per_sample.append(torch.cat(features[start : start + count], dim=0))
+            else:
+                hidden_size = int(self.config.text_config.hidden_size)
+                per_sample.append(retrieve_pixel_values.new_zeros((0, hidden_size)))
             start += count
-        if len(per_sample) != batch_size:
-            raise ValueError("retrieve_image_counts must contain one entry per batch sample.")
-        return per_sample, per_sample_positions
+        return per_sample
 
     def _build_retrieve_memory(
         self,
         retrieve_pixel_values,
-        retrieve_grid_thw,
+        retrieve_image_sizes,
         retrieve_patch_boxes,
         retrieve_image_counts,
         batch_size,
-        position_ids=None,
-        mm_token_type_ids=None,
         device=None,
         dtype=None,
     ):
-        memories, memory_positions = self._split_retrieve_features_by_sample(
-            retrieve_pixel_values,
-            retrieve_grid_thw,
-            retrieve_image_counts,
-            batch_size,
-            position_ids,
-            mm_token_type_ids,
-        )
+        if retrieve_pixel_values is None or retrieve_image_sizes is None or retrieve_patch_boxes is None or retrieve_image_counts is None:
+            raise ValueError("Fovea retrieval requires retrieve_pixel_values, retrieve_image_sizes, retrieve_patch_boxes, and retrieve_image_counts.")
+        memories = self._split_retrieve_features_by_sample(retrieve_pixel_values, retrieve_image_sizes, retrieve_image_counts)
+        if len(memories) != batch_size:
+            raise ValueError("retrieve_image_counts must contain one entry per batch sample.")
         return self._pad_sample_memory(
             memories,
-            memory_positions,
             retrieve_patch_boxes,
             device or retrieve_pixel_values.device,
             dtype or retrieve_pixel_values.dtype,
         )
 
-    def _pad_sample_memory(self, memories, memory_positions, patch_boxes, device, dtype):
-        max_len = max(mem.shape[0] for mem in memories)
-        hidden = memories[0].shape[-1]
+    def _pad_sample_memory(self, memories, patch_boxes, device, dtype):
+        max_len = max(max(1, mem.shape[0]) for mem in memories)
+        hidden = int(self.config.text_config.hidden_size)
         batch_size = len(memories)
         memory = torch.zeros((batch_size, max_len, hidden), device=device, dtype=dtype)
-        positions = torch.zeros((batch_size, max_len, 3), device=device, dtype=torch.long)
         mask = torch.zeros((batch_size, max_len), device=device, dtype=torch.bool)
         boxes = torch.zeros((batch_size, max_len, 4), device=device, dtype=torch.float32)
         box_start = 0
-        for batch_idx, (mem, pos) in enumerate(zip(memories, memory_positions)):
-            count = mem.shape[0]
-            memory[batch_idx, :count] = mem.to(device=device, dtype=dtype)
-            positions[batch_idx, :count] = pos.to(device=device, dtype=torch.long)
-            mask[batch_idx, :count] = True
-            boxes[batch_idx, :count] = patch_boxes[box_start : box_start + count].to(device=device, dtype=torch.float32)
+        for batch_idx, mem in enumerate(memories):
+            count = int(mem.shape[0])
+            if count > 0:
+                memory[batch_idx, :count] = mem.to(device=device, dtype=dtype)
+                mask[batch_idx, :count] = True
+            if box_start + count > patch_boxes.shape[0]:
+                raise ValueError(
+                    "retrieve_patch_boxes is shorter than the LLaVA-NeXT retrieval memory: "
+                    f"need {box_start + count}, got {patch_boxes.shape[0]}."
+                )
+            if count > 0:
+                boxes[batch_idx, :count] = patch_boxes[box_start : box_start + count].to(device=device, dtype=torch.float32)
             box_start += count
-        return memory, positions, mask, boxes
+        if box_start != patch_boxes.shape[0]:
+            raise ValueError(
+                "retrieve_patch_boxes must match the LLaVA-NeXT retrieval memory length exactly: "
+                f"used {box_start}, got {patch_boxes.shape[0]}."
+            )
+        return memory, mask, boxes
 
-    def _retrieve_visual_queries(
-        self,
-        hidden_states,
-        retrieve_pixel_values,
-        retrieve_grid_thw,
-        retrieve_patch_boxes,
-        retrieve_image_counts,
-        vq_code_positions,
-        vq_replay_positions,
-        vq_code_query_indices,
-        vq_boxes,
-        position_ids=None,
-        mm_token_type_ids=None,
-    ):
-        if retrieve_pixel_values is None or retrieve_grid_thw is None or retrieve_patch_boxes is None or retrieve_image_counts is None:
-            raise ValueError("Visual-query training requires retrieve_pixel_values, retrieve_grid_thw, retrieve_patch_boxes, and retrieve_image_counts.")
+    def _condition_fovea_queries_from_text(self, hidden_states, attention_mask, input_ids, fovea_positions):
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        num_fovea = int(self.config.fovea_num_tokens)
+        text_mask = torch.ones(hidden_states.shape[:2], device=device, dtype=torch.bool)
+        if attention_mask is not None:
+            text_mask &= attention_mask.to(device=device).bool()
+        if input_ids is not None:
+            text_mask &= input_ids.to(device=device).ne(int(self.config.image_token_index))
+        if fovea_positions.numel() == 0:
+            return hidden_states.new_empty((0, num_fovea, hidden_states.shape[-1]))
 
-        memory, memory_positions, memory_mask, patch_boxes = self._build_retrieve_memory(
-            retrieve_pixel_values,
-            retrieve_grid_thw,
-            retrieve_patch_boxes,
-            retrieve_image_counts,
-            hidden_states.shape[0],
-            position_ids,
-            mm_token_type_ids,
-            hidden_states.device,
-            hidden_states.dtype,
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        base = self.fovea_tokens.weight.to(device=device, dtype=dtype)
+        x = hidden_states.unsqueeze(1) + base.view(1, num_fovea, 1, -1)
+        x = x.reshape(batch_size * num_fovea, seq_len, hidden_size)
+        flat_mask = text_mask[:, None, :].expand(batch_size, num_fovea, seq_len).reshape(batch_size * num_fovea, seq_len)
+        x = x * flat_mask[..., None].to(dtype)
+
+        mixed_qkv = self.fovea_ssm_in_proj_qkv(x)
+        query, key, value = mixed_qkv.split(hidden_size, dim=-1)
+        query = query.view(batch_size * num_fovea, seq_len, self.fovea_num_heads, self.fovea_head_dim)
+        key = key.view(batch_size * num_fovea, seq_len, self.fovea_num_heads, self.fovea_head_dim)
+        value = value.view(batch_size * num_fovea, seq_len, self.fovea_num_heads, self.fovea_head_dim)
+        gate = self.fovea_ssm_in_proj_z(x).view(batch_size * num_fovea, seq_len, self.fovea_num_heads, self.fovea_head_dim)
+        beta = torch.sigmoid(self.fovea_ssm_in_proj_b(x))
+        a_log = self.fovea_ssm_A_log.weight[0].float()
+        dt_bias = self.fovea_ssm_dt_bias.weight[0]
+        g = -a_log.exp() * F.softplus(self.fovea_ssm_in_proj_a(x).float() + dt_bias)
+        beta = beta * flat_mask[..., None].to(beta.dtype)
+        g = torch.where(flat_mask[..., None], g, torch.zeros_like(g))
+
+        core_attn_out, _ = _torch_chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
         )
+        core_attn_out = core_attn_out.reshape(-1, self.fovea_head_dim)
+        gate = gate.reshape(-1, self.fovea_head_dim)
+        states = self.fovea_ssm_norm(core_attn_out, gate)
+        states = states.reshape(batch_size, num_fovea, seq_len, hidden_size)
+        states = base.view(1, num_fovea, 1, -1) + self.fovea_ssm_out_proj(states)
 
-        code_pos = vq_code_positions.to(device=hidden_states.device, dtype=torch.long)
-        code_batch = code_pos[:, 0]
-        code_token = code_pos[:, 1]
-        query_hidden = hidden_states[code_batch, code_token]
-        return self._retrieve_visual_queries_from_memory(
-            query_hidden,
-            code_batch,
-            memory,
-            memory_positions,
-            memory_mask,
-            patch_boxes,
-            vq_replay_positions,
-            vq_code_query_indices,
-            vq_boxes,
-            hidden_states.device,
-            hidden_states.dtype,
-        )
+        positions = fovea_positions.to(device=device, dtype=torch.long)
+        return states[positions[:, 0], :, positions[:, 1], :]
 
-    def _retrieve_visual_queries_from_memory(
-        self,
-        query_hidden,
-        code_batch,
-        memory,
-        memory_positions,
-        memory_mask,
-        patch_boxes,
-        vq_replay_positions,
-        vq_code_query_indices,
-        vq_boxes,
-        device,
-        dtype,
-    ):
-        code_batch = code_batch.to(device=device, dtype=torch.long)
-        mask_for_code = memory_mask.index_select(0, code_batch)
-        boxes_for_code = patch_boxes.index_select(0, code_batch)
+    def _retrieve_fovea_from_memory(self, fovea_queries, trigger_batch, memory, memory_mask, patch_boxes, fovea_box_indices=None, fovea_boxes=None):
+        device = fovea_queries.device
+        dtype = fovea_queries.dtype
+        num_triggers = int(fovea_queries.shape[0])
+        num_fovea = int(self.config.fovea_num_tokens)
+        heads = self.fovea_num_heads
+        head_dim = self.fovea_head_dim
+        memory_len = int(memory.shape[1])
 
-        heads = self.visual_query_num_heads
-        head_dim = self.visual_query_head_dim
-        num_codes = query_hidden.shape[0]
-        memory_len = memory.shape[1]
-        q_all = self.visual_query_q_proj(query_hidden).view(num_codes, heads, head_dim)
-        q_all = self.visual_query_q_norm(q_all)
+        q_all = self.fovea_q_proj(fovea_queries).view(num_triggers, num_fovea, heads, head_dim)
+        q_all = self.fovea_q_norm(q_all)
 
-        replay_vectors = query_hidden.new_empty((num_codes, heads * head_dim))
-        attn_mean = torch.empty((num_codes, memory_len), device=device, dtype=torch.float32)
-        replay_positions = torch.empty((num_codes, memory_positions.shape[-1]), device=device, dtype=torch.float32)
+        vectors = fovea_queries.new_empty((num_triggers, num_fovea, heads * head_dim))
+        attn_mean = torch.empty((num_triggers, num_fovea, memory_len), device=device, dtype=torch.float32)
         scale = head_dim**-0.5
-        for sample_idx in code_batch.unique(sorted=True):
-            code_indices = torch.nonzero(code_batch == sample_idx, as_tuple=False).squeeze(-1)
-            sample_id = int(sample_idx.item())
-            q = q_all.index_select(0, code_indices)
-            sample_memory = memory[sample_id : sample_id + 1]
-            sample_mask = memory_mask[sample_id]
+        trigger_batch = trigger_batch.to(device=device, dtype=torch.long)
 
-            k = self.visual_query_k_proj(sample_memory).view(1, memory_len, heads, head_dim)
-            v = self.visual_query_v_proj(sample_memory).view(1, memory_len, heads, head_dim)
-            k = self.visual_query_k_norm(k).squeeze(0).permute(1, 0, 2)
+        for sample_idx in trigger_batch.unique(sorted=True):
+            trigger_indices = torch.nonzero(trigger_batch == sample_idx, as_tuple=False).squeeze(-1)
+            sample_id = int(sample_idx.item())
+            sample_mask = memory_mask[sample_id]
+            sample_memory = memory[sample_id : sample_id + 1]
+            q = q_all.index_select(0, trigger_indices)
+            k = self.fovea_k_proj(sample_memory).view(1, memory_len, heads, head_dim)
+            v = self.fovea_v_proj(sample_memory).view(1, memory_len, heads, head_dim)
+            k = self.fovea_k_norm(k).squeeze(0).permute(1, 0, 2)
             v = v.squeeze(0).permute(1, 0, 2)
 
-            scores = torch.matmul(q.permute(1, 0, 2), k.transpose(-1, -2)).permute(1, 0, 2) * scale
-            scores = scores.masked_fill((~sample_mask).view(1, 1, -1), torch.finfo(scores.dtype).min)
+            scores = torch.einsum("tnhd,hmd->tnhm", q, k) * scale
+            scores = scores.masked_fill((~sample_mask).view(1, 1, 1, -1), torch.finfo(scores.dtype).min)
             attn = torch.softmax(scores, dim=-1)
-            context = torch.matmul(attn.permute(1, 0, 2), v).permute(1, 0, 2).reshape(code_indices.shape[0], -1)
-            vectors = self.visual_query_o_proj(context).to(dtype)
-            sample_attn_mean = attn.mean(dim=1).to(torch.float32)
-            sample_replay_positions = (sample_attn_mean.float().unsqueeze(-1) * memory_positions[sample_id].float()).sum(dim=1)
+            context = torch.einsum("tnhm,hmd->tnhd", attn, v).reshape(trigger_indices.shape[0], num_fovea, -1)
+            retrieved = self.fovea_o_proj(context).to(dtype)
+            vectors.index_copy_(0, trigger_indices, retrieved)
+            attn_mean.index_copy_(0, trigger_indices, attn.mean(dim=2).to(torch.float32))
 
-            replay_vectors.index_copy_(0, code_indices, vectors)
-            attn_mean.index_copy_(0, code_indices, sample_attn_mean)
-            replay_positions.index_copy_(0, code_indices, sample_replay_positions)
-
-        centers = (boxes_for_code[..., :2] + boxes_for_code[..., 2:]) * 0.5
-        if vq_boxes is None or vq_boxes.numel() == 0:
-            align_loss = replay_vectors.new_zeros(())
-        else:
-            query_boxes = vq_boxes.to(device=device, dtype=torch.float32).index_select(
-                0,
-                vq_code_query_indices.to(device=device, dtype=torch.long),
-            )
+        align_loss = vectors.new_zeros(())
+        if fovea_boxes is not None and fovea_boxes.numel() > 0 and fovea_box_indices is not None and fovea_box_indices.numel() > 0:
+            boxes_for_trigger = fovea_boxes.to(device=device, dtype=torch.float32).index_select(0, fovea_box_indices.to(device=device, dtype=torch.long))
+            boxes_for_memory = patch_boxes.index_select(0, trigger_batch).to(device=device, dtype=torch.float32)
+            mask_for_trigger = memory_mask.index_select(0, trigger_batch)
+            valid_boxes = boxes_for_memory.ge(0).all(dim=-1)
+            centers = (boxes_for_memory[..., :2] + boxes_for_memory[..., 2:]) * 0.5
             inside = (
-                (centers[..., 0] >= query_boxes[:, 0:1])
-                & (centers[..., 0] <= query_boxes[:, 2:3])
-                & (centers[..., 1] >= query_boxes[:, 1:2])
-                & (centers[..., 1] <= query_boxes[:, 3:4])
-                & mask_for_code
+                (centers[..., 0] >= boxes_for_trigger[:, 0:1])
+                & (centers[..., 0] <= boxes_for_trigger[:, 2:3])
+                & (centers[..., 1] >= boxes_for_trigger[:, 1:2])
+                & (centers[..., 1] <= boxes_for_trigger[:, 3:4])
+                & mask_for_trigger
+                & valid_boxes
             )
-            align_loss = -((attn_mean * inside.to(attn_mean.dtype)).sum(dim=-1).clamp_min(float(self.config.visual_query_align_eps)).log()).mean()
-        replay_spatial_offsets = replay_positions[:, 1:] - replay_positions[:, 0:1]
-        return {
-            "vectors": replay_vectors,
-            "spatial_offsets": replay_spatial_offsets,
-            "align_loss": align_loss,
-            "replay_positions": vq_replay_positions.to(device=device, dtype=torch.long),
-            "replay_query_indices": vq_code_query_indices.to(device=device, dtype=torch.long),
-        }
+            prob = (attn_mean * inside[:, None, :].to(attn_mean.dtype)).sum(dim=-1)
+            align_loss = -(prob.clamp_min(float(self.config.fovea_align_eps)).log()).mean()
+        return vectors, align_loss
 
-    def _scatter_replay(self, base_embeds, position_ids, retrieval):
-        replay_pos = retrieval["replay_positions"]
-        vectors = retrieval["vectors"].to(device=base_embeds.device, dtype=base_embeds.dtype)
-        if replay_pos.shape[0] != vectors.shape[0]:
-            raise ValueError("Replay position count must equal retrieved vector count.")
-        out = base_embeds.clone()
-        out[replay_pos[:, 0], replay_pos[:, 1]] = vectors
-        if position_ids is None:
-            return out, None
-        pos = position_ids.clone()
-        replay_query = retrieval["replay_query_indices"].to(device=pos.device, dtype=torch.long)
-        batch_ids = replay_pos[:, 0].to(device=pos.device, dtype=torch.long)
-        token_ids = replay_pos[:, 1].to(device=pos.device, dtype=torch.long)
+    def _expand_with_fovea_tokens(self, base_embeds, attention_mask, labels, fovea_positions, fovea_vectors):
+        batch_size, seq_len, hidden_size = base_embeds.shape
+        num_fovea = int(self.config.fovea_num_tokens)
+        by_batch: list[list[tuple[int, int]]] = [[] for _ in range(batch_size)]
+        for query_idx, (batch_idx, token_pos) in enumerate(fovea_positions.to(device="cpu", dtype=torch.long).tolist()):
+            if 0 <= batch_idx < batch_size and 0 <= token_pos < seq_len:
+                by_batch[batch_idx].append((token_pos, query_idx))
+        for items in by_batch:
+            items.sort(key=lambda item: item[0])
 
-        for batch_idx in batch_ids.unique(sorted=True):
-            batch_mask = batch_ids == batch_idx
-            batch_queries = replay_query[batch_mask]
-            batch_tokens = token_ids[batch_mask]
-            batch_idx = int(batch_idx.item())
-            for query_idx in batch_queries.unique(sorted=True):
-                query_tokens = batch_tokens[batch_queries == query_idx]
-                first_token = int(query_tokens.min().item())
-                extra_tokens = int(query_tokens.numel() - 1)
-                if extra_tokens > 0 and first_token + 1 < pos.shape[-1]:
-                    pos[:, batch_idx, first_token + 1 :] -= extra_tokens
+        lengths = [seq_len + len(items) * num_fovea for items in by_batch]
+        max_len = max(lengths)
+        new_embeds = base_embeds.new_zeros((batch_size, max_len, hidden_size))
+        new_attention = attention_mask.new_zeros((batch_size, max_len)) if attention_mask is not None else None
+        new_labels = labels.new_full((batch_size, max_len), IGNORE_INDEX) if labels is not None else None
 
-        base_t = pos[0, batch_ids, token_ids]
-        spatial_offsets = retrieval["spatial_offsets"].round().to(device=pos.device, dtype=pos.dtype)
-        replay_visual_pos = torch.stack(
-            [
-                base_t,
-                base_t + spatial_offsets[:, 0],
-                base_t + spatial_offsets[:, 1],
-            ],
-            dim=0,
-        )
-        pos[:, batch_ids, token_ids] = replay_visual_pos
-        return out, pos
+        for batch_idx, items in enumerate(by_batch):
+            src_cursor = 0
+            dst_cursor = 0
+            for token_pos, query_idx in items:
+                copy_len = token_pos - src_cursor + 1
+                if copy_len > 0:
+                    new_embeds[batch_idx, dst_cursor : dst_cursor + copy_len] = base_embeds[batch_idx, src_cursor : token_pos + 1]
+                    if new_attention is not None:
+                        new_attention[batch_idx, dst_cursor : dst_cursor + copy_len] = attention_mask[batch_idx, src_cursor : token_pos + 1]
+                    if new_labels is not None:
+                        new_labels[batch_idx, dst_cursor : dst_cursor + copy_len] = labels[batch_idx, src_cursor : token_pos + 1]
+                    dst_cursor += copy_len
+                new_embeds[batch_idx, dst_cursor : dst_cursor + num_fovea] = fovea_vectors[query_idx].to(base_embeds.dtype)
+                if new_attention is not None:
+                    new_attention[batch_idx, dst_cursor : dst_cursor + num_fovea] = 1
+                dst_cursor += num_fovea
+                src_cursor = token_pos + 1
+            tail_len = seq_len - src_cursor
+            if tail_len > 0:
+                new_embeds[batch_idx, dst_cursor : dst_cursor + tail_len] = base_embeds[batch_idx, src_cursor:]
+                if new_attention is not None:
+                    new_attention[batch_idx, dst_cursor : dst_cursor + tail_len] = attention_mask[batch_idx, src_cursor:]
+                if new_labels is not None:
+                    new_labels[batch_idx, dst_cursor : dst_cursor + tail_len] = labels[batch_idx, src_cursor:]
+        return new_embeds, new_attention, new_labels
 
     def _cached_decode_position_ids(self, attention_mask):
-        position_ids = attention_mask.long().cumsum(-1)[:, -1:] - 1
-        position_ids = position_ids.clamp_min(0).view(1, attention_mask.shape[0], 1).repeat(3, 1, 1)
-        if self.model.rope_deltas is not None:
-            position_ids = position_ids + self.model.rope_deltas.to(position_ids.device).view(1, -1, 1)
-        return position_ids
-
-    def _cached_replay_position_ids(self, attention_mask, retrieval):
-        replay_count = int(retrieval["vectors"].shape[0])
-        position_ids = attention_mask.long().cumsum(-1)[:, -replay_count:] - 1
-        position_ids = position_ids.clamp_min(0).view(1, attention_mask.shape[0], replay_count).repeat(3, 1, 1)
-        if self.model.rope_deltas is not None:
-            position_ids = position_ids + self.model.rope_deltas.to(position_ids.device).view(1, -1, 1)
-
-        base_t = position_ids[0, :, :].reshape(-1)
-        spatial_offsets = retrieval["spatial_offsets"].round().to(device=position_ids.device, dtype=position_ids.dtype)
-        replay_visual_pos = torch.stack(
-            [
-                base_t,
-                base_t + spatial_offsets[:, 0],
-                base_t + spatial_offsets[:, 1],
-            ],
-            dim=0,
-        ).view(3, attention_mask.shape[0], replay_count)
-        return replay_visual_pos
-
-    def _visual_query_state(self, input_ids, prompt_len, max_codes=None):
-        ids = input_ids[0, prompt_len:].tolist()
-        start_id = self.config.vq_start_token_id
-        end_id = self.config.vq_end_token_id
-        vis_start = self.config.vis_token_start_id
-        vis_end = self.config.vis_token_end_id
-        if None in (start_id, end_id, vis_start, vis_end):
-            return False, 0, False
-        if max_codes is None:
-            max_codes = int(getattr(self.config, "visual_query_max_codes", 256))
-        start = None
-        for idx, token_id in enumerate(ids):
-            if token_id == start_id:
-                start = idx
-            elif token_id == end_id and start is not None:
-                start = None
-        if start is None:
-            return False, 0, False
-        code_count = sum(1 for token_id in ids[start + 1 :] if int(vis_start) <= token_id <= int(vis_end))
-        return True, code_count, code_count < int(max_codes)
-
-    def _constrained_next_token(self, logits, input_ids, prompt_len):
-        vis_start = int(self.config.vis_token_start_id)
-        vis_end = int(self.config.vis_token_end_id)
-        end_id = int(self.config.vq_end_token_id)
-        replay_id = int(self.config.replay_token_id)
-        in_query, code_count, can_add_code = self._visual_query_state(input_ids, prompt_len)
-        masked = logits.new_full(logits.shape, torch.finfo(logits.dtype).min)
-        if in_query:
-            if can_add_code:
-                masked[:, vis_start : vis_end + 1] = logits[:, vis_start : vis_end + 1]
-            if code_count > 0:
-                masked[:, end_id] = logits[:, end_id]
-        else:
-            masked.copy_(logits)
-            masked[:, vis_start : vis_end + 1] = torch.finfo(logits.dtype).min
-            masked[:, end_id] = torch.finfo(logits.dtype).min
-            masked[:, replay_id] = torch.finfo(logits.dtype).min
-        return masked.argmax(dim=-1, keepdim=True)
+        return attention_mask.long().cumsum(-1)[:, -1:] - 1
 
     @torch.no_grad()
-    def visual_query_generate(
+    def fovea_generate(
         self,
         input_ids,
         attention_mask=None,
         pixel_values=None,
-        pixel_values_videos=None,
-        image_grid_thw=None,
-        video_grid_thw=None,
-        mm_token_type_ids=None,
+        image_sizes=None,
         retrieve_pixel_values=None,
-        retrieve_grid_thw=None,
+        retrieve_image_sizes=None,
         retrieve_patch_boxes=None,
         retrieve_image_counts=None,
         max_new_tokens=128,
@@ -579,300 +665,288 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         **kwargs,
     ):
         if input_ids.shape[0] != 1:
-            raise ValueError("visual-query replay generation currently expects batch_size=1.")
+            raise ValueError("Fovea generation currently expects batch_size=1.")
         if do_sample or int(num_beams) != 1:
-            raise ValueError("visual-query replay generation supports greedy decoding only.")
-        if not use_cache:
-            raise ValueError("visual-query replay generation requires use_cache=True.")
+            raise ValueError("Fovea generation supports greedy decoding only.")
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
-        if mm_token_type_ids is None:
-            mm_token_type_ids = input_ids.new_zeros(input_ids.shape)
 
         model_kwargs = {"use_cache": use_cache}
         for key in ("output_attentions", "output_hidden_states", "return_dict"):
             if key in kwargs:
                 model_kwargs[key] = kwargs[key]
 
-        prompt_len = input_ids.shape[1]
-        inputs_embeds, position_ids = self._build_multimodal_embeddings_and_positions(
-            input_ids,
-            attention_mask,
-            pixel_values,
-            image_grid_thw,
-            pixel_values_videos,
-            video_grid_thw,
-            mm_token_type_ids,
-        )
+        inputs_embeds, _ = self._build_multimodal_embeddings(input_ids, pixel_values, image_sizes)
         retrieve_memory_cache = None
         if retrieve_pixel_values is not None:
             retrieve_memory_cache = self._build_retrieve_memory(
                 retrieve_pixel_values,
-                retrieve_grid_thw,
+                retrieve_image_sizes,
                 retrieve_patch_boxes,
                 retrieve_image_counts,
                 input_ids.shape[0],
-                position_ids,
-                mm_token_type_ids,
                 inputs_embeds.device,
                 inputs_embeds.dtype,
             )
-        outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask, position_ids, **model_kwargs)
+        fovea_id = getattr(self.config, "fovea_token_id", None)
+        text_hidden_history = None
+        text_input_id_history = input_ids
+        if fovea_id is not None and retrieve_memory_cache is not None:
+            prompt_positions = torch.nonzero(input_ids.eq(int(fovea_id)), as_tuple=False)
+            if prompt_positions.numel() > 0:
+                prompt_outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask=attention_mask, **model_kwargs)
+                prompt_hidden = prompt_outputs[0]
+                text_hidden_history = prompt_hidden
+                trigger_batch = prompt_positions[:, 0].to(device=prompt_hidden.device, dtype=torch.long)
+                fovea_queries = self._condition_fovea_queries_from_text(
+                    prompt_hidden,
+                    attention_mask,
+                    input_ids,
+                    prompt_positions,
+                )
+                fovea_vectors, _ = self._retrieve_fovea_from_memory(
+                    fovea_queries,
+                    trigger_batch,
+                    *retrieve_memory_cache,
+                )
+                inputs_embeds, attention_mask, _ = self._expand_with_fovea_tokens(
+                    inputs_embeds,
+                    attention_mask,
+                    None,
+                    prompt_positions.to(device=prompt_hidden.device, dtype=torch.long),
+                    fovea_vectors,
+                )
+        outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask=attention_mask, **model_kwargs)
+        if text_hidden_history is None:
+            text_hidden_history = outputs[0]
         logits = self.lm_head(outputs[0][:, -1:, :]).squeeze(1)
         past_key_values = outputs.past_key_values
         eos_ids = {int(eos_token_id)} if isinstance(eos_token_id, int) else {int(item) for item in (eos_token_id or [])}
-        active_code_hiddens = []
-        vis_start = int(self.config.vis_token_start_id)
-        vis_end = int(self.config.vis_token_end_id)
-        vq_start = int(self.config.vq_start_token_id)
-        vq_end = int(self.config.vq_end_token_id)
-        replay_id = int(self.config.replay_token_id)
 
         for _ in range(int(max_new_tokens)):
-            next_token = self._constrained_next_token(logits, input_ids, prompt_len)
+            next_token = logits.argmax(dim=-1, keepdim=True)
             next_embed = self.get_input_embeddings()(next_token).to(inputs_embeds.dtype)
             input_ids = torch.cat([input_ids, next_token], dim=1)
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones((1, 1))], dim=1)
-            mm_token_type_ids = torch.cat([mm_token_type_ids, mm_token_type_ids.new_zeros((1, 1))], dim=1)
-            inputs_embeds = torch.cat([inputs_embeds, next_embed], dim=1)
-
             if int(next_token.item()) in eos_ids:
                 break
 
-            position_ids = self._cached_decode_position_ids(attention_mask)
             outputs = self._language_forward_from_embeds(
                 next_embed,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=self._cached_decode_position_ids(attention_mask),
                 past_key_values=past_key_values,
                 **model_kwargs,
             )
             token_hidden = outputs[0][:, -1, :]
             logits = self.lm_head(token_hidden)
             past_key_values = outputs.past_key_values
-            token_id = int(next_token.item())
+            text_hidden_history = torch.cat([text_hidden_history, token_hidden.unsqueeze(1)], dim=1)
+            text_input_id_history = torch.cat([text_input_id_history, next_token], dim=1)
 
-            if token_id == vq_start:
-                active_code_hiddens = []
-            elif vis_start <= token_id <= vis_end:
-                active_code_hiddens.append(token_hidden.squeeze(0))
-            elif token_id == vq_end:
-                if retrieve_memory_cache is not None and active_code_hiddens:
-                    replay_count = len(active_code_hiddens)
-                    replay_start = input_ids.shape[1]
-                    replay_ids = input_ids.new_full((1, replay_count), replay_id)
-                    replay_mask = attention_mask.new_ones((1, replay_count))
-                    replay_types = mm_token_type_ids.new_zeros((1, replay_count))
-                    input_ids = torch.cat([input_ids, replay_ids], dim=1)
-                    attention_mask = torch.cat([attention_mask, replay_mask], dim=1)
-                    mm_token_type_ids = torch.cat([mm_token_type_ids, replay_types], dim=1)
-
-                    query_hidden = torch.stack(active_code_hiddens, dim=0).to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-                    code_batch = torch.zeros((replay_count,), device=inputs_embeds.device, dtype=torch.long)
-                    replay_pos = torch.tensor(
-                        [[0, replay_start + idx] for idx in range(replay_count)],
-                        device=inputs_embeds.device,
-                        dtype=torch.long,
-                    )
-                    query_indices = torch.zeros((replay_count,), device=inputs_embeds.device, dtype=torch.long)
-                    retrieval = self._retrieve_visual_queries_from_memory(
-                        query_hidden,
-                        code_batch,
-                        *retrieve_memory_cache,
-                        replay_pos,
-                        query_indices,
-                        None,
-                        inputs_embeds.device,
-                        inputs_embeds.dtype,
-                    )
-                    replay_embeds = retrieval["vectors"].unsqueeze(0).to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-                    inputs_embeds = torch.cat([inputs_embeds, replay_embeds], dim=1)
-                    replay_position_ids = self._cached_replay_position_ids(attention_mask, retrieval)
-                    outputs = self._language_forward_from_embeds(
-                        replay_embeds,
-                        attention_mask=attention_mask,
-                        position_ids=replay_position_ids,
-                        past_key_values=past_key_values,
-                        **model_kwargs,
-                    )
-                    logits = self.lm_head(outputs[0][:, -1, :])
-                    past_key_values = outputs.past_key_values
-                active_code_hiddens = []
+            if fovea_id is not None and int(next_token.item()) == int(fovea_id) and retrieve_memory_cache is not None:
+                trigger_batch = torch.zeros((1,), device=token_hidden.device, dtype=torch.long)
+                history_attention = text_input_id_history.new_ones(text_input_id_history.shape)
+                history_position = torch.tensor(
+                    [[0, text_hidden_history.shape[1] - 1]],
+                    device=token_hidden.device,
+                    dtype=torch.long,
+                )
+                fovea_queries = self._condition_fovea_queries_from_text(
+                    text_hidden_history,
+                    history_attention,
+                    text_input_id_history,
+                    history_position,
+                )
+                fovea_vectors, _ = self._retrieve_fovea_from_memory(fovea_queries, trigger_batch, *retrieve_memory_cache)
+                fovea_embeds = fovea_vectors.squeeze(0).unsqueeze(0).to(device=token_hidden.device, dtype=inputs_embeds.dtype)
+                attention_mask = torch.cat([attention_mask, attention_mask.new_ones((1, fovea_embeds.shape[1]))], dim=1)
+                outputs = self._language_forward_from_embeds(
+                    fovea_embeds,
+                    attention_mask=attention_mask,
+                    position_ids=None,
+                    past_key_values=past_key_values,
+                    **model_kwargs,
+                )
+                logits = self.lm_head(outputs[0][:, -1, :])
+                past_key_values = outputs.past_key_values
         return input_ids
 
     def generate(self, *args, **kwargs):
         if kwargs.get("retrieve_pixel_values") is not None:
-            return self.visual_query_generate(*args, **kwargs)
+            return self.fovea_generate(*args, **kwargs)
         return super().generate(*args, **kwargs)
 
-    def _visual_query_forward(
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        inputs_embeds=None,
+        pixel_values=None,
+        image_sizes=None,
+        attention_mask=None,
+        cache_position=None,
+        logits_to_keep=None,
+        **kwargs,
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
+        )
+        if cache_position is None or cache_position[0] == 0:
+            model_inputs["pixel_values"] = pixel_values
+            model_inputs["image_sizes"] = image_sizes
+        return model_inputs
+
+    def _fovea_forward(
         self,
         input_ids,
         attention_mask,
         labels,
         pixel_values,
-        pixel_values_videos,
-        image_grid_thw,
-        video_grid_thw,
-        mm_token_type_ids,
+        image_sizes,
         retrieve_pixel_values,
-        retrieve_grid_thw,
+        retrieve_image_sizes,
         retrieve_patch_boxes,
         retrieve_image_counts,
-        vq_code_positions,
-        vq_replay_positions,
-        vq_code_query_indices,
-        vq_boxes,
-        vq_code_label_mask,
+        fovea_positions,
+        fovea_box_indices,
+        fovea_boxes,
         logits_to_keep=0,
         **kwargs,
     ):
-        masked_embeds = self._masked_visual_code_embeddings(input_ids, labels, vq_code_label_mask)
-        embeds_a, position_ids_a = self._build_multimodal_embeddings_and_positions(
+        vision_feature_layer = kwargs.pop("vision_feature_layer", None)
+        vision_feature_select_strategy = kwargs.pop("vision_feature_select_strategy", None)
+        embeds_a, _ = self._build_multimodal_embeddings(
             input_ids,
-            attention_mask,
             pixel_values,
-            image_grid_thw,
-            pixel_values_videos,
-            video_grid_thw,
-            mm_token_type_ids,
-            input_embeds_override=masked_embeds,
+            image_sizes,
+            vision_feature_layer=vision_feature_layer,
+            vision_feature_select_strategy=vision_feature_select_strategy,
         )
-        outputs_a = self._language_forward_from_embeds(embeds_a, attention_mask, position_ids_a, **kwargs)
+        outputs_a = self._language_forward_from_embeds(embeds_a, attention_mask=attention_mask, **kwargs)
         hidden_a = outputs_a[0]
-        logits_a = self.lm_head(hidden_a)
-        code_mask = vq_code_label_mask.to(device=labels.device).bool()
-        pass_a_label_mask = code_mask | labels.eq(int(self.config.vq_start_token_id)) | labels.eq(int(self.config.vq_end_token_id))
-        use_generated = self._use_generated_replay()
-        pass_b_input_ids = self._generated_code_ids(input_ids, logits_a, vq_code_positions) if use_generated else input_ids
-
-        retrieval = self._retrieve_visual_queries(
+        fovea_positions = fovea_positions.to(device=hidden_a.device, dtype=torch.long)
+        trigger_batch = fovea_positions[:, 0]
+        fovea_queries = self._condition_fovea_queries_from_text(
             hidden_a,
+            attention_mask,
+            input_ids,
+            fovea_positions,
+        )
+
+        memory = self._build_retrieve_memory(
             retrieve_pixel_values,
-            retrieve_grid_thw,
+            retrieve_image_sizes,
             retrieve_patch_boxes,
             retrieve_image_counts,
-            vq_code_positions,
-            vq_replay_positions,
-            vq_code_query_indices,
-            vq_boxes,
-            position_ids_a,
-            mm_token_type_ids,
+            hidden_a.shape[0],
+            hidden_a.device,
+            hidden_a.dtype,
         )
-        if use_generated:
-            base_embeds = embeds_a.clone()
-            code_pos = vq_code_positions.to(device=base_embeds.device, dtype=torch.long)
-            generated_embeds = self.get_input_embeddings()(pass_b_input_ids)
-            base_embeds[code_pos[:, 0], code_pos[:, 1]] = generated_embeds[code_pos[:, 0], code_pos[:, 1]]
-            position_ids_b = self._position_ids_from_embeds(
-                pass_b_input_ids,
-                attention_mask,
-                base_embeds,
-                image_grid_thw,
-                video_grid_thw,
-                mm_token_type_ids,
-            )
-        else:
-            base_embeds = embeds_a
-            position_ids_b = self._position_ids_from_embeds(
-                input_ids,
-                attention_mask,
-                base_embeds,
-                image_grid_thw,
-                video_grid_thw,
-                mm_token_type_ids,
-            )
-        embeds_b, position_ids_b = self._scatter_replay(base_embeds, position_ids_b, retrieval)
-        outputs_b = self._language_forward_from_embeds(embeds_b, attention_mask, position_ids_b, **kwargs)
+        fovea_vectors, align_loss = self._retrieve_fovea_from_memory(
+            fovea_queries,
+            trigger_batch,
+            *memory,
+            fovea_box_indices=fovea_box_indices,
+            fovea_boxes=fovea_boxes,
+        )
+        embeds_b, attention_b, labels_b = self._expand_with_fovea_tokens(embeds_a, attention_mask, labels, fovea_positions, fovea_vectors)
+        outputs_b = self._language_forward_from_embeds(embeds_b, attention_mask=attention_b, **kwargs)
         hidden_b = outputs_b[0]
         full_logits_b = self.lm_head(hidden_b)
-        pass_a_predictor_mask = torch.zeros_like(pass_a_label_mask)
-        pass_a_predictor_mask[:, :-1] = pass_a_label_mask[:, 1:]
-        mixed_logits = torch.where(pass_a_predictor_mask.unsqueeze(-1).to(full_logits_b.device), logits_a, full_logits_b)
-        lm_loss = self.loss_function(
-            logits=mixed_logits,
-            labels=labels,
-            vocab_size=mixed_logits.shape[-1],
-        )
-        align_loss = retrieval["align_loss"]
-        loss = lm_loss + float(self.config.visual_query_lambda_align) * align_loss
-        self._visual_query_aux = {
+        lm_loss = self.loss_function(logits=full_logits_b, labels=labels_b, vocab_size=full_logits_b.shape[-1])
+        loss = lm_loss + float(self.config.fovea_lambda_align) * align_loss
+        self._fovea_aux = {
             "lm_loss": lm_loss.detach(),
             "align_loss": align_loss.detach(),
-            "generated_replay": hidden_b.new_tensor(float(use_generated)),
-            "num_queries": hidden_b.new_tensor(float(vq_boxes.shape[0])),
+            "num_queries": hidden_b.new_tensor(float(fovea_positions.shape[0])),
+            "tokens_per_query": hidden_b.new_tensor(float(self.config.fovea_num_tokens)),
         }
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        return Qwen3_5CausalLMOutputWithPast(
+        return LlavaNextCausalLMOutputWithPast(
             loss=loss,
             logits=full_logits_b[:, slice_indices, :],
             past_key_values=outputs_b.past_key_values,
             hidden_states=outputs_b.hidden_states,
             attentions=outputs_b.attentions,
-            rope_deltas=self.model.rope_deltas,
+            image_hidden_states=None,
         )
 
     @can_return_tuple
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        image_sizes: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
-        image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
-        mm_token_type_ids: torch.IntTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         retrieve_pixel_values: torch.Tensor | None = None,
-        retrieve_grid_thw: torch.LongTensor | None = None,
+        retrieve_image_sizes: torch.LongTensor | None = None,
         retrieve_patch_boxes: torch.Tensor | None = None,
         retrieve_image_counts: torch.Tensor | None = None,
-        vq_code_positions: torch.LongTensor | None = None,
-        vq_replay_positions: torch.LongTensor | None = None,
-        vq_code_query_indices: torch.LongTensor | None = None,
-        vq_boxes: torch.Tensor | None = None,
-        vq_code_label_mask: torch.Tensor | None = None,
+        fovea_positions: torch.LongTensor | None = None,
+        fovea_box_indices: torch.LongTensor | None = None,
+        fovea_boxes: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | Qwen3_5CausalLMOutputWithPast:
-        if labels is not None and vq_code_positions is not None and vq_code_positions.numel() > 0:
-            return self._visual_query_forward(
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> tuple | LlavaNextCausalLMOutputWithPast:
+        model_kwargs = {
+            "use_cache": use_cache,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": True,
+            "cache_position": cache_position,
+            **kwargs,
+        }
+        if labels is not None and fovea_positions is not None and fovea_positions.numel() > 0:
+            return self._fovea_forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
                 pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                mm_token_type_ids=mm_token_type_ids,
+                image_sizes=image_sizes,
                 retrieve_pixel_values=retrieve_pixel_values,
-                retrieve_grid_thw=retrieve_grid_thw,
+                retrieve_image_sizes=retrieve_image_sizes,
                 retrieve_patch_boxes=retrieve_patch_boxes,
                 retrieve_image_counts=retrieve_image_counts,
-                vq_code_positions=vq_code_positions,
-                vq_replay_positions=vq_replay_positions,
-                vq_code_query_indices=vq_code_query_indices,
-                vq_boxes=vq_boxes,
-                vq_code_label_mask=vq_code_label_mask,
+                fovea_positions=fovea_positions,
+                fovea_box_indices=fovea_box_indices,
+                fovea_boxes=fovea_boxes,
                 logits_to_keep=logits_to_keep,
-                **kwargs,
+                **model_kwargs,
             )
 
-        outputs = self.model(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            position_ids=position_ids,
+        vision_feature_layer = model_kwargs.pop("vision_feature_layer", None)
+        vision_feature_select_strategy = model_kwargs.pop("vision_feature_select_strategy", None)
+        if inputs_embeds is None:
+            inputs_embeds, image_hidden_states = self._build_multimodal_embeddings(
+                input_ids,
+                pixel_values,
+                image_sizes,
+                vision_feature_layer=vision_feature_layer,
+                vision_feature_select_strategy=vision_feature_select_strategy,
+            )
+        else:
+            image_hidden_states = None
+        outputs = self._language_forward_from_embeds(
+            inputs_embeds,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            mm_token_type_ids=mm_token_type_ids,
-            **kwargs,
+            **model_kwargs,
         )
         hidden_states = outputs[0]
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -880,13 +954,13 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
-        return Qwen3_5CausalLMOutputWithPast(
+        return LlavaNextCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=outputs.rope_deltas,
+            image_hidden_states=image_hidden_states,
         )
 
 

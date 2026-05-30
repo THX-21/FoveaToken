@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="fovea", help="lmms-eval model name")
     parser.add_argument(
         "--model_args",
-        default="pretrained=checkpoints/fovea-visual-query-replay/checkpoint-3300,device=cuda:0,device_map=cuda:0,enable_thinking=true,attn_implementation=sdpa",
+        default="pretrained=checkpoints/fovea-fixed-token/checkpoint-3300,device=cuda:0,device_map=cuda:0,attn_implementation=sdpa",
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")
@@ -96,20 +96,16 @@ def _prepare_simple_inputs(model, visuals, question: str):
         "text": texts,
         "images": list(visuals),
         "image_counts_per_sample": [len(visuals)],
-        "return_mm_token_type_ids": True,
         "return_tensors": "pt",
     }
     inputs = model.processor(**processor_kwargs)
 
-    if hasattr(model, "vision_packer") and getattr(model, "retrieve_max_image_tokens", None) and visuals:
-        retrieve_pixels, retrieve_grid, retrieve_boxes = model.vision_packer.pack_retrieve(
-            visuals[0],
-            model.retrieve_max_image_tokens,
-        )
+    if hasattr(model, "vision_packer") and visuals:
+        retrieve_pixels, retrieve_sizes, retrieve_boxes = model.vision_packer.pack_retrieve(visuals[0])
         import torch
 
         inputs["retrieve_pixel_values"] = retrieve_pixels
-        inputs["retrieve_grid_thw"] = retrieve_grid.unsqueeze(0)
+        inputs["retrieve_image_sizes"] = retrieve_sizes
         inputs["retrieve_patch_boxes"] = retrieve_boxes
         inputs["retrieve_image_counts"] = torch.tensor([1], dtype=torch.long)
 
@@ -120,48 +116,7 @@ def _prepare_simple_inputs(model, visuals, question: str):
 
 
 def _prepare_chat_inputs(model, task, doc):
-    from lmms_eval.imports import optional_import
-    from lmms_eval.protocol import ChatMessages
-
-    process_vision_info, has_qwen_vl = optional_import("qwen_vl_utils", "process_vision_info")
-    if not has_qwen_vl:
-        raise RuntimeError("Chat sample path requires qwen_vl_utils to process media.")
-
-    messages = task.doc_to_messages(doc)
-    messages.insert(0, {"role": "system", "content": [{"type": "text", "text": model.system_prompt}]})
-    chat_message = ChatMessages(messages=messages)
-    video_kwargs = model._build_video_kwargs()
-    hf_messages = chat_message.to_hf_messages(video_kwargs=video_kwargs)
-    text = model._apply_chat_template([hf_messages])[0]
-
-    image_inputs, video_inputs, video_kwargs_qwen = process_vision_info(
-        [hf_messages],
-        return_video_kwargs=True,
-        image_patch_size=16,
-        return_video_metadata=True,
-    )
-    video_kwargs = {**video_kwargs, **video_kwargs_qwen}
-
-    video_metadatas = None
-    if video_inputs is not None:
-        video_inputs, video_metadatas = zip(*video_inputs)
-        video_inputs = list(video_inputs)
-        video_metadatas = list(video_metadatas)
-
-    inputs = model.processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        video_metadata=video_metadatas,
-        **video_kwargs,
-        do_resize=False,
-        return_tensors="pt",
-    )
-    if model.device_map == "auto":
-        inputs = inputs.to("cuda")
-    else:
-        inputs = inputs.to(model.device)
-    return inputs, text
+    raise RuntimeError("scripts/run_sample.py currently supports the simple lmms-eval path for Fovea/LLaVA-NeXT.")
 
 
 def _decode_raw(model, gen_ids):
@@ -181,13 +136,11 @@ def _decode_raw(model, gen_ids):
     return raw, clean
 
 
-def _count_visual_query_tokens(model, ids_list: list[int]) -> tuple[str, str]:
+def _count_fovea_tokens(model, ids_list: list[int]) -> str:
     cfg = getattr(model.model, "config", None)
-    if cfg is None or not hasattr(cfg, "vq_start_token_id") or not hasattr(cfg, "vis_token_start_id"):
-        return "n/a", "n/a"
-    vq_count = ids_list.count(cfg.vq_start_token_id)
-    vis_count = sum(1 for token_id in ids_list if cfg.vis_token_start_id <= token_id <= cfg.vis_token_end_id)
-    return str(vq_count), str(vis_count)
+    if cfg is None or getattr(cfg, "fovea_token_id", None) is None:
+        return "n/a"
+    return str(ids_list.count(int(cfg.fovea_token_id)))
 
 
 def main() -> None:
@@ -242,12 +195,12 @@ def main() -> None:
         hit_limit = n_tok >= args.max_new_tokens
         raw, clean = _decode_raw(model, gen_ids)
         has_think_end = "</think>" in clean
-        vq_count, vis_count = _count_visual_query_tokens(model, gen_ids.tolist())
+        fovea_count = _count_fovea_tokens(model, gen_ids.tolist())
 
         print(f"\n{'=' * 80}")
         print(
             f"Sample {doc_idx} | time={elapsed:.1f}s | tokens={n_tok} | "
-            f"</think>={has_think_end} | VQ={vq_count} | VIS={vis_count} | hit_limit={hit_limit}"
+            f"</think>={has_think_end} | fovea={fovea_count} | hit_limit={hit_limit}"
         )
         print(f"GT Answer: {answer}")
         if question:

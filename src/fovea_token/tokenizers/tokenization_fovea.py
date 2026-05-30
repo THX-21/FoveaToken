@@ -1,73 +1,22 @@
-from tokenizers import Regex, Tokenizer, decoders, normalizers, pre_tokenizers
-from tokenizers.models import BPE
+"""Special-token helpers for fixed fovea retrieval."""
 
-from transformers.tokenization_utils_tokenizers import TokenizersBackend
-from transformers.utils import logging
+FOVEA_TOKEN = "<fovea>"
 
 
-logger = logging.get_logger(__name__)
+def add_fovea_tokens(tokenizer) -> int:
+    """Add the fixed fovea trigger token if it is missing."""
 
-PRETOKENIZE_REGEX = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
-
-
-class FoveaTokenizer(TokenizersBackend):
-    model_input_names = ["input_ids", "attention_mask"]
-    model = BPE
-
-    def __init__(
-        self,
-        vocab: str | dict[str, int] | None = None,
-        merges: str | list[str] | None = None,
-        vocab_file=None,
-        merges_file=None,
-        unk_token: str = "<|endoftext|>",
-        bos_token=None,
-        eos_token: str = "<|endoftext|>",
-        pad_token: str = "<|endoftext|>",
-        add_prefix_space=None,
-        **kwargs,
-    ):
-        self.add_prefix_space = add_prefix_space if add_prefix_space is not None else False
-        self._vocab = vocab if vocab is not None else {"<|endoftext|>": 0}
-        self._merges = merges or []
-        self._tokenizer = Tokenizer(
-            BPE(
-                vocab=self._vocab,
-                merges=self._merges,
-                dropout=None,
-                unk_token=None,
-                continuing_subword_prefix="",
-                end_of_word_suffix="",
-                fuse_unk=False,
-                byte_fallback=False,
-            )
-        )
-        self._tokenizer.decoder = decoders.ByteLevel()
-        self._tokenizer.normalizer = normalizers.NFC()
-        self._tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
-            [
-                pre_tokenizers.Split(
-                    Regex(PRETOKENIZE_REGEX),
-                    behavior="isolated",
-                    invert=False,
-                ),
-                pre_tokenizers.ByteLevel(
-                    add_prefix_space=self.add_prefix_space,
-                    use_regex=False,
-                ),
-            ]
-        )
-
-        super().__init__(
-            vocab_file=vocab_file,
-            merges_file=merges_file,
-            unk_token=unk_token,
-            bos_token=bos_token,
-            eos_token=eos_token,
-            pad_token=pad_token,
-            add_prefix_space=add_prefix_space,
-            **kwargs,
-        )
+    return tokenizer.add_special_tokens({"additional_special_tokens": [FOVEA_TOKEN]})
 
 
-__all__ = ["FoveaTokenizer"]
+def sync_fovea_token_ids(config, tokenizer) -> None:
+    """Mirror fovea token ids onto the model config."""
+
+    config.fovea_token_id = tokenizer.convert_tokens_to_ids(FOVEA_TOKEN)
+
+
+__all__ = [
+    "FOVEA_TOKEN",
+    "add_fovea_tokens",
+    "sync_fovea_token_ids",
+]

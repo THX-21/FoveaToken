@@ -1,154 +1,77 @@
-# Fovea configuration for the visual-query replay model.
-from typing import Any
+"""Fovea configuration on top of the HF LLaVA-NeXT config."""
 
-from transformers.configuration_utils import PretrainedConfig
-
-
-class FoveaTextConfig(PretrainedConfig):
-    r"""
-    linear_conv_kernel_dim (`int`, *optional*, defaults to 4):
-        Kernel size of the convolution used in linear attention layers.
-    linear_key_head_dim (`int`, *optional*, defaults to 128):
-        Dimension of each key head in linear attention.
-    linear_value_head_dim (`int`, *optional*, defaults to 128):
-        Dimension of each value head in linear attention.
-    linear_num_key_heads (`int`, *optional*, defaults to 16):
-        Number of key heads used in linear attention layers.
-    linear_num_value_heads (`int`, *optional*, defaults to 32):
-        Number of value heads used in linear attention layers.
-    """
-    model_type = "fovea_text"
-    keys_to_ignore_at_inference = ["past_key_values"]
-
-    base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
-    }
-    base_model_pp_plan = {
-        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
-        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
-        "norm": (["hidden_states"], ["hidden_states"]),
-    }
-
-    vocab_size: int = 248320
-    hidden_size: int = 4096
-    intermediate_size: int = 12288
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 4
-    hidden_act: str = "silu"
-    max_position_embeddings: int = 32768
-    initializer_range: float = 0.02
-    rms_norm_eps: float = 1e-6
-    use_cache: bool = True
-    tie_word_embeddings: bool = False
-    rope_parameters: Any | dict | None = None
-    attention_bias: bool = False
-    attention_dropout: float | int = 0.0
-    head_dim: int = 256
-    linear_conv_kernel_dim: int = 4
-    linear_key_head_dim: int = 128
-    linear_value_head_dim: int = 128
-    linear_num_key_heads: int = 16
-    linear_num_value_heads: int = 32
-    layer_types: list[str] | None = None
-    pad_token_id: int | None = None
-    bos_token_id: int | None = None
-    eos_token_id: int | list[int] | None = None
-    base_config_key = "text_config"
-    ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
-
-    def __post_init__(self, **kwargs):
-        kwargs.setdefault("partial_rotary_factor", 0.25)
-        if self.layer_types is None:
-            interval_pattern = kwargs.pop("full_attention_interval", 4)
-            self.layer_types = [
-                "linear_attention" if bool((i + 1) % interval_pattern) else "full_attention"
-                for i in range(self.num_hidden_layers)
-            ]
-        super().__post_init__(**kwargs)
+from transformers.models.llava_next.configuration_llava_next import LlavaNextConfig
 
 
-class FoveaVisionConfig(PretrainedConfig):
-    r"""
-    out_hidden_size (`int`, *optional*, defaults to 3584):
-        The output hidden size of the vision model.
-    num_position_embeddings (`int`, *optional*, defaults to 2304):
-        The maximum sequence length that this model might ever be used with.
-    """
-    model_type = "fovea_vision"
-    base_config_key = "vision_config"
+DEFAULT_LLAVA_NEXT_IMAGE_GRID_PINPOINTS = [
+    [336, 672],
+    [672, 336],
+    [672, 672],
+    [1008, 336],
+    [336, 1008],
+]
 
-    depth: int = 27
-    hidden_size: int = 1152
-    hidden_act: str = "gelu_pytorch_tanh"
-    intermediate_size: int = 4304
-    num_heads: int = 16
-    in_channels: int = 3
-    patch_size: int | list[int] | tuple[int, int] = 16
-    spatial_merge_size: int = 2
-    temporal_patch_size: int | list[int] | tuple[int, int] = 2
-    out_hidden_size: int = 3584
-    num_position_embeddings: int = 2304
-    initializer_range: float = 0.02
+EXPANDED_LLAVA_NEXT_IMAGE_GRID_PINPOINTS = [
+    *DEFAULT_LLAVA_NEXT_IMAGE_GRID_PINPOINTS,
+    [672, 1344],
+    [1344, 672],
+    [1344, 1344],
+    [2016, 672],
+    [672, 2016],
+]
 
 
-class FoveaConfig(PretrainedConfig):
+def sync_expanded_image_grid_pinpoints(config, processor=None) -> list[list[int]]:
+    """Use the expanded LLaVA-NeXT anyres candidate set everywhere."""
+
+    pinpoints = [list(item) for item in EXPANDED_LLAVA_NEXT_IMAGE_GRID_PINPOINTS]
+    config.image_grid_pinpoints = pinpoints
+    if processor is not None:
+        processor.image_grid_pinpoints = pinpoints
+        image_processor = getattr(processor, "image_processor", None)
+        if image_processor is not None:
+            image_processor.image_grid_pinpoints = pinpoints
+    return pinpoints
+
+
+class FoveaConfig(LlavaNextConfig):
     model_type = "fovea"
-    sub_configs = {"vision_config": FoveaVisionConfig, "text_config": FoveaTextConfig}
-    keys_to_ignore_at_inference = ["past_key_values"]
 
-    text_config: dict | PretrainedConfig | None = None
-    vision_config: dict | PretrainedConfig | None = None
+    def __init__(
+        self,
+        *args,
+        fovea_num_tokens: int = 64,
+        fovea_lambda_align: float = 0.2,
+        fovea_align_eps: float = 1e-6,
+        fovea_input_base_pool: int = 2,
+        fovea_input_highres_pool: int = 4,
+        fovea_retrieve_pool: int = 2,
+        fovea_token_id: int | None = None,
+        **kwargs,
+    ):
+        kwargs.pop("model_type", None)
+        kwargs.setdefault("image_grid_pinpoints", EXPANDED_LLAVA_NEXT_IMAGE_GRID_PINPOINTS)
+        super().__init__(*args, **kwargs)
+        self.fovea_num_tokens = int(fovea_num_tokens)
+        self.fovea_lambda_align = float(fovea_lambda_align)
+        self.fovea_align_eps = float(fovea_align_eps)
+        self.fovea_input_base_pool = int(fovea_input_base_pool)
+        self.fovea_input_highres_pool = int(fovea_input_highres_pool)
+        self.fovea_retrieve_pool = int(fovea_retrieve_pool)
+        self.fovea_token_id = fovea_token_id
 
-    image_token_id: int = 248056
-    video_token_id: int = 248057
-    vision_start_token_id: int = 248053
-    vision_end_token_id: int = 248054
-    tie_word_embeddings: bool = False
-    visual_codebook_size: int = 16384
-    visual_query_retrieve_tokens: int = 4096
-    visual_query_lambda_align: float = 0.5
-    visual_query_align_eps: float = 1e-6
-    visual_query_generated_replay_prob: float = 0.5
-    visual_query_max_codes: int = 256
-    vq_start_token_id: int | None = None
-    vq_end_token_id: int | None = None
-    mask_vis_token_id: int | None = None
-    replay_token_id: int | None = None
-    vis_token_start_id: int | None = None
-    vis_token_end_id: int | None = None
+    @property
+    def image_token_id(self) -> int:
+        return self.image_token_index
 
-    def __post_init__(self, **kwargs):
-        if isinstance(self.vision_config, dict):
-            self.vision_config = self.sub_configs["vision_config"](**self.vision_config)
-        elif self.vision_config is None:
-            self.vision_config = self.sub_configs["vision_config"]()
+    @image_token_id.setter
+    def image_token_id(self, value: int) -> None:
+        self.image_token_index = value
 
-        if isinstance(self.text_config, dict):
-            self.text_config = self.sub_configs["text_config"](**self.text_config)
-        elif self.text_config is None:
-            self.text_config = self.sub_configs["text_config"]()
-
-        super().__post_init__(**kwargs)
-
-
-Qwen3_5TextConfig = FoveaTextConfig
-Qwen3_5VisionConfig = FoveaVisionConfig
-Qwen3_5Config = FoveaConfig
 
 __all__ = [
+    "DEFAULT_LLAVA_NEXT_IMAGE_GRID_PINPOINTS",
+    "EXPANDED_LLAVA_NEXT_IMAGE_GRID_PINPOINTS",
     "FoveaConfig",
-    "FoveaTextConfig",
-    "FoveaVisionConfig",
-    "Qwen3_5Config",
-    "Qwen3_5TextConfig",
-    "Qwen3_5VisionConfig",
+    "sync_expanded_image_grid_pinpoints",
 ]

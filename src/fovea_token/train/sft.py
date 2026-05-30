@@ -4,26 +4,26 @@ from typing import Optional
 
 import torch
 import transformers
-from transformers import HfArgumentParser, Trainer
+from transformers import AutoProcessor, AutoTokenizer, HfArgumentParser, Trainer
 from transformers.trainer_pt_utils import get_parameter_names
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
-from fovea_token import FoveaForConditionalGeneration, FoveaTokenizer
-from fovea_token.tokenizers.tokenization_visual_query import add_visual_query_tokens, sync_visual_query_token_ids
+from fovea_token import FoveaForConditionalGeneration
+from fovea_token.configuration_fovea import sync_expanded_image_grid_pinpoints
+from fovea_token.tokenizers.tokenization_fovea import add_fovea_tokens, sync_fovea_token_ids
 
-from .data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
+from .data import DataCollatorForLlavaNextSFT, LazySupervisedDataset, VisionPacker
 
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: str = field(default="Qwen/Qwen3.5-9B")
+    model_name_or_path: str = field(default="llava-hf/llava-v1.6-vicuna-7b-hf")
     lora_enable: bool = field(default=True)
     lora_r: int = field(default=64)
     lora_alpha: int = field(default=16)
     lora_dropout: float = field(default=0.05)
     unfreeze_vision: bool = field(default=True)
     freeze_embed_base: bool = field(default=True)
-    visual_query_generated_replay_prob: float = field(default=0.5)
 
 
 @dataclass
@@ -31,7 +31,6 @@ class DataArguments:
     data_path: str = field(default=None)
     image_folder: str = field(default=None)
     max_image_tokens: Optional[int] = field(default=None)
-    retrieve_max_image_tokens: Optional[int] = field(default=4096)
     system_message: str = field(default="You are a helpful assistant.")
 
 
@@ -53,11 +52,11 @@ def freeze_for_vision_plus_lora(model: FoveaForConditionalGeneration, unfreeze_v
     model.requires_grad_(False)
 
 
-def unfreeze_visual_query_parameters(model, lora_enable: bool) -> None:
-    """Keep retrieval modules and new token embeddings trainable."""
+def unfreeze_fovea_parameters(model, lora_enable: bool) -> None:
+    """Keep fovea retrieval modules and the new trigger token row trainable."""
 
     for name, param in model.named_parameters():
-        is_fovea_module = "visual_query_" in name or "embed_tokens" in name or "lm_head" in name
+        is_fovea_module = "fovea_" in name or "embed_tokens" in name or "lm_head" in name
         if not is_fovea_module:
             continue
         if lora_enable and "modules_to_save" not in name:
@@ -67,23 +66,16 @@ def unfreeze_visual_query_parameters(model, lora_enable: bool) -> None:
         param.requires_grad_(True)
 
 
-def get_visual_query_token_ids(config, vocab_size: int | None = None) -> list[int]:
-    token_ids: list[int] = []
-    for attr in ("vq_start_token_id", "vq_end_token_id", "mask_vis_token_id", "replay_token_id"):
-        token_id = getattr(config, attr, None)
-        if token_id is not None:
-            token_ids.append(int(token_id))
-    vis_start = getattr(config, "vis_token_start_id", None)
-    vis_end = getattr(config, "vis_token_end_id", None)
-    if vis_start is not None and vis_end is not None:
-        token_ids.extend(range(int(vis_start), int(vis_end) + 1))
+def get_fovea_token_ids(config, vocab_size: int | None = None) -> list[int]:
+    token_id = getattr(config, "fovea_token_id", None)
+    token_ids = [] if token_id is None else [int(token_id)]
     if vocab_size is None:
         vocab_size = int(getattr(getattr(config, "text_config", config), "vocab_size", 0))
     return sorted({token_id for token_id in token_ids if 0 <= token_id < int(vocab_size)})
 
 
 def freeze_base_embedding_rows(model, config) -> None:
-    """Freeze base vocab rows while allowing visual-query token rows to learn."""
+    """Freeze base vocab rows while allowing the `<fovea>` token row to learn."""
 
     registered_params = set()
     for name, param in model.named_parameters():
@@ -93,7 +85,7 @@ def freeze_base_embedding_rows(model, config) -> None:
             continue
         if param.ndim != 2:
             continue
-        trainable_token_ids = get_visual_query_token_ids(config, vocab_size=param.shape[0])
+        trainable_token_ids = get_fovea_token_ids(config, vocab_size=param.shape[0])
         if not trainable_token_ids:
             continue
         if id(param) in registered_params:
@@ -122,10 +114,16 @@ def get_visual_module(model):
             candidates.append(child)
 
     for candidate in candidates:
+        visual = getattr(candidate, "vision_tower", None)
+        if visual is not None:
+            return visual
         visual = getattr(candidate, "visual", None)
         if visual is not None:
             return visual
         inner_model = getattr(candidate, "model", None)
+        visual = getattr(inner_model, "vision_tower", None) if inner_model is not None else None
+        if visual is not None:
+            return visual
         visual = getattr(inner_model, "visual", None) if inner_model is not None else None
         if visual is not None:
             return visual
@@ -139,13 +137,22 @@ def maybe_enable_lora(model, model_args: ModelArguments):
 
     from peft import LoraConfig, get_peft_model
 
-    visual_query_modules = [
-        "visual_query_q_proj",
-        "visual_query_k_proj",
-        "visual_query_v_proj",
-        "visual_query_o_proj",
-        "visual_query_q_norm",
-        "visual_query_k_norm",
+    fovea_modules = [
+        "fovea_tokens",
+        "fovea_q_proj",
+        "fovea_k_proj",
+        "fovea_v_proj",
+        "fovea_o_proj",
+        "fovea_q_norm",
+        "fovea_k_norm",
+        "fovea_ssm_in_proj_qkv",
+        "fovea_ssm_in_proj_z",
+        "fovea_ssm_in_proj_b",
+        "fovea_ssm_in_proj_a",
+        "fovea_ssm_dt_bias",
+        "fovea_ssm_A_log",
+        "fovea_ssm_out_proj",
+        "fovea_ssm_norm",
         "embed_tokens",
         "lm_head",
     ]
@@ -157,21 +164,15 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         "gate_proj",
         "up_proj",
         "down_proj",
-        "in_proj_qkv",
-        "in_proj_z",
-        "in_proj_b",
-        "in_proj_a",
-        "out_proj",
     ]
     if model_args.unfreeze_vision:
         target_modules.extend(
             [
-                "attn.qkv",
-                "attn.proj",
-                "mlp.linear_fc1",
-                "mlp.linear_fc2",
-                "merger.linear_fc1",
-                "merger.linear_fc2",
+                "out_proj",
+                "fc1",
+                "fc2",
+                "linear_1",
+                "linear_2",
             ]
         )
     lora_config = LoraConfig(
@@ -181,8 +182,8 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=target_modules,
-        exclude_modules=visual_query_modules,
-        modules_to_save=visual_query_modules,
+        exclude_modules=fovea_modules,
+        modules_to_save=fovea_modules,
         ensure_weight_tying=False,
     )
     model = get_peft_model(model, lora_config)
@@ -270,7 +271,7 @@ def print_parameter_summary(model) -> None:
         print(name)
 
 
-def sync_tokenizer_special_tokens_with_model(tokenizer: FoveaTokenizer, model: FoveaForConditionalGeneration) -> None:
+def sync_tokenizer_special_tokens_with_model(tokenizer, model: FoveaForConditionalGeneration) -> None:
     """Keep tokenizer special-token defaults aligned with the checkpoint config."""
 
     text_config = getattr(model.config, "text_config", model.config)
@@ -360,16 +361,35 @@ class StopAtStepCallback(transformers.TrainerCallback):
         return control
 
 
-class VisualQueryMetricsCallback(transformers.TrainerCallback):
-    """Publish visual-query auxiliary metrics into Trainer logs."""
+class FoveaMetricsCallback(transformers.TrainerCallback):
+    """Publish fovea auxiliary metrics into Trainer logs."""
+
+    @staticmethod
+    def _find_fovea_aux(model):
+        seen = set()
+        stack = [model]
+        while stack:
+            current = stack.pop()
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            aux = getattr(current, "_fovea_aux", None)
+            if isinstance(aux, dict):
+                return aux
+            get_base_model = getattr(current, "get_base_model", None)
+            if callable(get_base_model):
+                stack.append(get_base_model())
+            for attr in ("base_model", "model"):
+                stack.append(getattr(current, attr, None))
+        return None
 
     def on_log(self, _args, state, control, model=None, logs=None, **_kwargs):
-        if model is None or logs is None or not hasattr(model, "_visual_query_aux"):
+        if model is None or logs is None:
             return control
-        aux = getattr(model, "_visual_query_aux", None)
-        if not isinstance(aux, dict):
+        aux = self._find_fovea_aux(model)
+        if aux is None:
             return control
-        for key in ("lm_loss", "align_loss", "generated_replay", "num_queries"):
+        for key in ("lm_loss", "align_loss", "num_queries", "tokens_per_query"):
             value = aux.get(key)
             if value is None:
                 continue
@@ -379,7 +399,7 @@ class VisualQueryMetricsCallback(transformers.TrainerCallback):
                 continue
             if hasattr(value, "item"):
                 value = value.item()
-            logs[f"visual_query/{key}"] = value
+            logs[f"fovea/{key}"] = value
         return control
 
 
@@ -388,12 +408,15 @@ def main() -> None:
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    tokenizer = FoveaTokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         model_max_length=training_args.model_max_length,
         padding_side="right",
+        use_fast=True,
     )
-    add_visual_query_tokens(tokenizer)
+    add_fovea_tokens(tokenizer)
+    processor = AutoProcessor.from_pretrained(model_args.model_name_or_path)
+    processor.tokenizer = tokenizer
 
     init_model_path = model_args.model_name_or_path
     loading_source_label = "base_model"
@@ -414,8 +437,13 @@ def main() -> None:
     )
     if len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
         model.resize_token_embeddings(len(tokenizer))
-    model.config.visual_query_generated_replay_prob = float(model_args.visual_query_generated_replay_prob)
-    sync_visual_query_token_ids(model.config, tokenizer)
+    sync_fovea_token_ids(model.config, tokenizer)
+    model.config.image_token_index = tokenizer.convert_tokens_to_ids(getattr(processor, "image_token", "<image>"))
+    pinpoints = sync_expanded_image_grid_pinpoints(model.config, processor)
+    processor.config = model.config
+    processor.patch_size = getattr(model.config.vision_config, "patch_size", processor.patch_size)
+    processor.vision_feature_select_strategy = model.config.vision_feature_select_strategy
+    print(f"Using LLaVA-NeXT image_grid_pinpoints: {pinpoints}")
     print_loading_summary(model, loading_info, source_label=loading_source_label)
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     if tokenizer.pad_token is None:
@@ -430,7 +458,7 @@ def main() -> None:
     freeze_for_vision_plus_lora(model, unfreeze_vision=model_args.unfreeze_vision, lora_enable=model_args.lora_enable)
     model = maybe_enable_lora(model, model_args)
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
-    unfreeze_visual_query_parameters(model, lora_enable=model_args.lora_enable)
+    unfreeze_fovea_parameters(model, lora_enable=model_args.lora_enable)
     if model_args.freeze_embed_base:
         freeze_base_embedding_rows(model, model.config)
     if model_args.lora_enable:
@@ -438,6 +466,7 @@ def main() -> None:
     print_parameter_summary(model)
 
     vision_packer = VisionPacker(
+        processor=processor,
         vision_config=model.config.vision_config,
         max_image_tokens=data_args.max_image_tokens,
     )
@@ -448,10 +477,9 @@ def main() -> None:
         vision_packer=vision_packer,
         image_token_id=model.config.image_token_id,
         system_message=data_args.system_message,
-        retrieve_max_image_tokens=data_args.retrieve_max_image_tokens,
         model_max_length=training_args.model_max_length,
     )
-    data_collator = DataCollatorForQwen3_5SFT(
+    data_collator = DataCollatorForLlavaNextSFT(
         tokenizer=tokenizer,
         model_max_length=training_args.model_max_length,
     )
@@ -461,8 +489,8 @@ def main() -> None:
         args=training_args,
         train_dataset=train_dataset,
         data_collator=data_collator,
-        processing_class=tokenizer,
-        callbacks=[StopAtStepCallback, VisualQueryMetricsCallback],
+        processing_class=processor,
+        callbacks=[StopAtStepCallback, FoveaMetricsCallback],
     )
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_state()

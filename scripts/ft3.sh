@@ -22,10 +22,10 @@ export WORLD_SIZE=$((NNODES * NUM_GPUS))
 export RANK=0
 
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
-RUN_NAME="${FT3_RUN_NAME:-fovea-visual-query-replay}"
+RUN_NAME="${FT3_RUN_NAME:-fovea-fixed-token}"
 DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr/preprocessed}"
 IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/vgr/llava_next_raw_format}"
-CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-9B}"
+CKPT_PATH="${FT3_CKPT_PATH:-llava-hf/llava-v1.6-vicuna-7b-hf}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-100}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
@@ -88,14 +88,12 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --data_path "${DATA_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
     --max_image_tokens 512 \
-    --retrieve_max_image_tokens "${FT3_RETRIEVE_MAX_IMAGE_TOKENS:-4096}" \
     --lora_enable false \
     --lora_r 64 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
     --unfreeze_vision "${UNFREEZE_VISION}" \
     --freeze_embed_base "${FREEZE_EMBED_BASE}" \
-    --visual_query_generated_replay_prob "${FT3_GENERATED_REPLAY_PROB:-0.5}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
     --output_dir "${OUTPUT_DIR}" \

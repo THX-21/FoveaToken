@@ -10,24 +10,9 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
+from transformers.image_processing_utils import select_best_resolution
 
-from ..processing_fovea import (
-    build_mm_token_type_ids,
-    build_visual_placeholder,
-    image_token_count_from_grid,
-)
-from .image_packing import (
-    VisionPackerConfig,
-    default_processor_stats,
-    pack_single_image_with_boxes,
-    pack_single_image,
-)
-from ..tokenizers.tokenization_visual_query import (
-    REPLAY_TOKEN,
-    VQ_END_TOKEN,
-    VQ_START_TOKEN,
-    vis_token,
-)
+from ..tokenizers.tokenization_fovea import FOVEA_TOKEN
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -35,7 +20,6 @@ Image.MAX_IMAGE_PIXELS = None
 IGNORE_INDEX = -100
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
-VISUAL_CODE_LM_TASK = "visual_code_lm"
 SOT_EOT_IMAGE_RE = re.compile(r"<SOT>\s*(\[[^\]]+\])\s*<EOT>\s*<image>")
 ORPHAN_VGR_TAG_RE = re.compile(r"<SOT>|<EOT>")
 
@@ -81,9 +65,9 @@ def replace_vgr_regions_with_visual_queries(
     text: str,
     *,
     image_path: str,
-    visual_codec: Any,
+    visual_codec: Any | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Convert VGR `<SOT>box<EOT><image>` tags to `<vq> codes </vq> replay pads`.
+    """Convert VGR `<SOT>box<EOT><image>` tags to fixed `<fovea>` triggers.
 
     Assistant-side VGR data may also contain orphan `<SOT>/<EOT>` tags or stray
     plain `<image>` markers that do not correspond to a real extra image. Drop
@@ -96,11 +80,8 @@ def replace_vgr_regions_with_visual_queries(
 
     def replace(match: re.Match) -> str:
         box = parse_vgr_box(match.group(1))
-        codes = visual_codec.encode_crop(image_path, box)
-        code_tokens = " ".join(vis_token(code) for code in codes)
-        replay = "".join(REPLAY_TOKEN for _ in codes)
-        queries.append({"box": box, "codes": codes})
-        return f"{VQ_START_TOKEN} {code_tokens} {VQ_END_TOKEN}{replay}"
+        queries.append({"box": box})
+        return FOVEA_TOKEN
 
     cleaned_text = ORPHAN_VGR_TAG_RE.sub("", SOT_EOT_IMAGE_RE.sub(replace, text))
     if saw_vgr_markup:
@@ -126,7 +107,7 @@ def replace_image_tokens_in_conversations(
     ]
     total_placeholders = sum(sentence["value"].count(DEFAULT_IMAGE_TOKEN) for sentence in conversations)
     if total_placeholders == 1 and len(image_token_groups) > 1:
-        joined_placeholder = "\n".join(build_visual_placeholder(count) for group in image_token_groups for count in group)
+        joined_placeholder = "\n".join(DEFAULT_IMAGE_TOKEN * count for group in image_token_groups for count in group)
         for sentence in conversations:
             value = sentence["value"]
             if DEFAULT_IMAGE_TOKEN in value:
@@ -139,7 +120,7 @@ def replace_image_tokens_in_conversations(
         while DEFAULT_IMAGE_TOKEN in value:
             if image_index >= len(image_token_groups):
                 raise ValueError("Conversation references more <image> placeholders than the sample provides.")
-            placeholder = "".join(build_visual_placeholder(count) for count in image_token_groups[image_index])
+            placeholder = "".join(DEFAULT_IMAGE_TOKEN * count for count in image_token_groups[image_index])
             value = value.replace(DEFAULT_IMAGE_TOKEN, placeholder, 1)
             image_index += 1
         sentence["value"] = value
@@ -164,7 +145,7 @@ def encode_chatml_example(
     image_token_counts: Sequence[int | Sequence[int]],
     system_message: str,
 ) -> tuple[torch.LongTensor, torch.LongTensor]:
-    """Encode one conversation into causal-LM inputs and labels.
+    """Encode one conversation using the LLaVA-v1/Vicuna conversation style.
 
     Labeling policy:
     - system turns: ignored
@@ -193,15 +174,14 @@ def encode_chatml_example(
             labels.extend([IGNORE_INDEX] * supervised_prefix_len)
             labels.extend(segment_ids[supervised_prefix_len:])
 
-    system_segment = f"<|im_start|>system\n{system_message}<|im_end|>\n"
-    append_segment(system_segment, supervised_prefix_len=None)
-
     role_prefixes = {
-        "human": "<|im_start|>user\n",
-        "user": "<|im_start|>user\n",
-        "gpt": "<|im_start|>assistant\n",
-        "assistant": "<|im_start|>assistant\n",
+        "human": "USER: ",
+        "user": "USER: ",
+        "gpt": "ASSISTANT: ",
+        "assistant": "ASSISTANT: ",
     }
+    if system_message:
+        append_segment(f"{system_message}\n\n", supervised_prefix_len=None)
 
     for sentence in prompt_conversations:
         role = sentence["from"]
@@ -209,10 +189,11 @@ def encode_chatml_example(
         if prefix is None:
             raise ValueError(f"Unsupported role {role!r}.")
         if role in {"human", "user"}:
-            full_segment = f"{prefix}{sentence['value']}<|im_end|>\n"
+            full_segment = f"{prefix}{sentence['value']}\n"
             prefix_len = len(tokenize_text(tokenizer, prefix))
         else:
-            full_segment = f"{prefix}{sentence['value']}<|im_end|>\n"
+            eos = tokenizer.eos_token or "</s>"
+            full_segment = f"{prefix}{sentence['value']}{eos}\n"
             prefix_len = len(tokenize_text(tokenizer, prefix))
         if role in {"human", "user"}:
             append_segment(full_segment, supervised_prefix_len=None)
@@ -275,122 +256,155 @@ def normalize_supervised_substrings(value: Any) -> list[str]:
     return [str(value)]
 
 
-def build_visual_query_metadata(
+def build_fovea_metadata(
     input_ids: torch.LongTensor,
     labels: torch.LongTensor,
     *,
     tokenizer: PreTrainedTokenizerBase,
     query_boxes: Sequence[Sequence[float]],
 ) -> dict[str, torch.Tensor]:
-    """Locate `<vq> ... </vq> replay` spans after tokenization."""
+    """Locate `<fovea>` trigger tokens after tokenization."""
 
-    vq_start_id = tokenizer.convert_tokens_to_ids(VQ_START_TOKEN)
-    if not query_boxes and vq_start_id not in input_ids.tolist():
+    fovea_id = tokenizer.convert_tokens_to_ids(FOVEA_TOKEN)
+    if not query_boxes and fovea_id not in input_ids.tolist():
         return {
-            "vq_code_positions": torch.empty((0,), dtype=torch.long),
-            "vq_replay_positions": torch.empty((0,), dtype=torch.long),
-            "vq_code_query_indices": torch.empty((0,), dtype=torch.long),
-            "vq_boxes": torch.empty((0, 4), dtype=torch.float32),
-            "vq_code_label_mask": torch.zeros_like(labels, dtype=torch.bool),
+            "fovea_positions": torch.empty((0,), dtype=torch.long),
+            "fovea_box_indices": torch.empty((0,), dtype=torch.long),
+            "fovea_boxes": torch.empty((0, 4), dtype=torch.float32),
         }
-    vq_end_id = tokenizer.convert_tokens_to_ids(VQ_END_TOKEN)
-    replay_id = tokenizer.convert_tokens_to_ids(REPLAY_TOKEN)
-    vis_start_id = tokenizer.convert_tokens_to_ids("<vis_0>")
-    vis_end_id = tokenizer.convert_tokens_to_ids("<vis_16383>")
-    if min(vq_start_id, vq_end_id, replay_id, vis_start_id, vis_end_id) < 0:
-        raise ValueError("Visual query special tokens must be added to the tokenizer before encoding VGR.")
+    if fovea_id < 0:
+        raise ValueError("The <fovea> special token must be added to the tokenizer before encoding VGR.")
 
     ids = input_ids.tolist()
-    code_positions: list[int] = []
-    code_query_indices: list[int] = []
-    replay_positions: list[int] = []
-    code_label_mask = torch.zeros_like(labels, dtype=torch.bool)
-    query_index = 0
-    pos = 0
-    while pos < len(ids):
-        if ids[pos] != vq_start_id:
-            pos += 1
-            continue
-        end = pos + 1
-        while end < len(ids) and ids[end] != vq_end_id:
-            end += 1
-        if end >= len(ids):
-            raise ValueError("Found <vq> without matching </vq>.")
-        codes = [idx for idx in range(pos + 1, end) if vis_start_id <= ids[idx] <= vis_end_id]
-        if not codes:
-            raise ValueError("Found empty visual query.")
-        replay_start = end + 1
-        replay_end = replay_start
-        while replay_end < len(ids) and ids[replay_end] == replay_id:
-            replay_end += 1
-        if replay_end - replay_start != len(codes):
-            raise ValueError("Replay pad count must equal visual code count.")
-        if query_index >= len(query_boxes):
-            raise ValueError("More tokenized visual queries than parsed VGR boxes.")
-        code_positions.extend(codes)
-        replay_positions.extend(range(replay_start, replay_end))
-        code_query_indices.extend([query_index] * len(codes))
-        code_label_mask[codes] = labels[codes].ne(IGNORE_INDEX)
-        labels[replay_start:replay_end] = IGNORE_INDEX
-        query_index += 1
-        pos = replay_end
+    positions = [idx for idx, token_id in enumerate(ids) if token_id == fovea_id]
+    if len(positions) != len(query_boxes):
+        raise ValueError(f"Parsed VGR boxes ({len(query_boxes)}) do not match tokenized <fovea> triggers ({len(positions)}).")
 
-    if query_index != len(query_boxes):
-        raise ValueError("Parsed VGR boxes do not match tokenized visual queries.")
+    box_indices = list(range(len(positions)))
 
     return {
-        "vq_code_positions": torch.tensor(code_positions, dtype=torch.long),
-        "vq_replay_positions": torch.tensor(replay_positions, dtype=torch.long),
-        "vq_code_query_indices": torch.tensor(code_query_indices, dtype=torch.long),
-        "vq_boxes": torch.tensor(query_boxes, dtype=torch.float32),
-        "vq_code_label_mask": code_label_mask,
+        "fovea_positions": torch.tensor(positions, dtype=torch.long),
+        "fovea_box_indices": torch.tensor(box_indices, dtype=torch.long),
+        "fovea_boxes": torch.tensor(query_boxes, dtype=torch.float32),
     }
 
 
-def empty_visual_query_metadata(labels: torch.LongTensor) -> dict[str, torch.Tensor]:
+def empty_fovea_metadata() -> dict[str, torch.Tensor]:
     return {
-        "vq_code_positions": torch.empty((0,), dtype=torch.long),
-        "vq_replay_positions": torch.empty((0,), dtype=torch.long),
-        "vq_code_query_indices": torch.empty((0,), dtype=torch.long),
-        "vq_boxes": torch.empty((0, 4), dtype=torch.float32),
-        "vq_code_label_mask": torch.zeros_like(labels, dtype=torch.bool),
+        "fovea_positions": torch.empty((0,), dtype=torch.long),
+        "fovea_box_indices": torch.empty((0,), dtype=torch.long),
+        "fovea_boxes": torch.empty((0, 4), dtype=torch.float32),
     }
 
 
 class VisionPacker:
-    """Local normal image preprocessing adapter."""
+    """LLaVA-NeXT image preprocessing adapter."""
 
     def __init__(
         self,
-        vision_config,
+        processor,
+        vision_config=None,
         max_image_tokens: int | None = None,
     ) -> None:
+        self.processor = processor
+        self.image_processor = processor.image_processor
+        self.vision_config = vision_config
         self.max_image_tokens = max_image_tokens
-        patch_size = vision_config.patch_size if isinstance(vision_config.patch_size, int) else int(vision_config.patch_size[0])
-        temporal_patch_size = (
-            vision_config.temporal_patch_size
-            if isinstance(vision_config.temporal_patch_size, int)
-            else int(vision_config.temporal_patch_size[0])
-        )
-        image_mean, image_std, rescale_factor = default_processor_stats()
-        self.local_config = VisionPackerConfig(
-            patch_size=patch_size,
-            temporal_patch_size=temporal_patch_size,
-            spatial_merge_size=vision_config.spatial_merge_size,
-            image_mean=image_mean,
-            image_std=image_std,
-            rescale_factor=rescale_factor,
-        )
 
-    def _pack_single_block(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
-        return pack_single_image(image=image, config=self.local_config, max_image_tokens=self.max_image_tokens)
+    def _process(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor, int]:
+        inputs = self.image_processor(images=image, return_tensors="pt")
+        pixel_values = inputs["pixel_values"]
+        image_sizes = inputs["image_sizes"].to(torch.long)
+        count = self.input_feature_count(image_sizes[0])
+        return pixel_values, image_sizes, count
 
-    def pack_retrieve(self, image: Image.Image, max_image_tokens: int | None) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
-        packed = pack_single_image_with_boxes(image=image, config=self.local_config, max_image_tokens=max_image_tokens)
-        return packed.pixel_values, packed.image_grid_thw, packed.patch_boxes
+    def _grid_boxes(self, rows: int, cols: int) -> torch.Tensor:
+        row_starts = torch.arange(rows, dtype=torch.float32)
+        col_starts = torch.arange(cols, dtype=torch.float32)
+        row_grid, col_grid = torch.meshgrid(row_starts, col_starts, indexing="ij")
+        return torch.stack(
+            [
+                col_grid / float(cols),
+                row_grid / float(rows),
+                (col_grid + 1) / float(cols),
+                (row_grid + 1) / float(rows),
+            ],
+            dim=-1,
+        ).reshape(-1, 4)
 
-    def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
-        return self._pack_single_block(image)
+    def _pooled_grid_boxes(self, rows: int, cols: int, pool_size: int) -> torch.Tensor:
+        pool_size = max(1, int(pool_size))
+        pooled_rows = (int(rows) + pool_size - 1) // pool_size
+        pooled_cols = (int(cols) + pool_size - 1) // pool_size
+        row_starts = torch.arange(pooled_rows, dtype=torch.float32)
+        col_starts = torch.arange(pooled_cols, dtype=torch.float32)
+        row_grid, col_grid = torch.meshgrid(row_starts, col_starts, indexing="ij")
+        return torch.stack(
+            [
+                (col_grid * pool_size) / float(cols),
+                (row_grid * pool_size) / float(rows),
+                torch.clamp((col_grid + 1) * pool_size, max=float(cols)) / float(cols),
+                torch.clamp((row_grid + 1) * pool_size, max=float(rows)) / float(rows),
+            ],
+            dim=-1,
+        ).reshape(-1, 4)
+
+    def _highres_unpadded_shape(self, image_size: torch.Tensor) -> tuple[int, int]:
+        orig_height, orig_width = [int(v) for v in image_size.tolist()]
+        image_grid_pinpoints = getattr(self.image_processor, "image_grid_pinpoints", None)
+        if image_grid_pinpoints is None:
+            image_grid_pinpoints = getattr(self.processor, "image_grid_pinpoints", None)
+        if image_grid_pinpoints is None:
+            raise ValueError("LLaVA-NeXT image_grid_pinpoints are required for exact retrieval boxes.")
+
+        vision_image_size = int(getattr(self.vision_config, "image_size", 336) if self.vision_config is not None else 336)
+        vision_patch_size = int(getattr(self.vision_config, "patch_size", getattr(self.processor, "patch_size", 14)))
+        grid_per_tile = vision_image_size // vision_patch_size
+        best_height, best_width = select_best_resolution([orig_height, orig_width], image_grid_pinpoints)
+        grid_height = (int(best_height) // vision_image_size) * grid_per_tile
+        grid_width = (int(best_width) // vision_image_size) * grid_per_tile
+
+        original_aspect_ratio = orig_width / max(orig_height, 1)
+        current_aspect_ratio = grid_width / max(grid_height, 1)
+        if original_aspect_ratio > current_aspect_ratio:
+            new_height = int(round(orig_height * (grid_width / max(orig_width, 1)), 7))
+            padding = max(0, (grid_height - new_height) // 2)
+            grid_height = max(1, grid_height - 2 * padding)
+        else:
+            new_width = int(round(orig_width * (grid_height / max(orig_height, 1)), 7))
+            padding = max(0, (grid_width - new_width) // 2)
+            grid_width = max(1, grid_width - 2 * padding)
+        return int(grid_height), int(grid_width)
+
+    def input_feature_count(self, image_size: torch.Tensor | Sequence[int]) -> int:
+        if not isinstance(image_size, torch.Tensor):
+            image_size = torch.tensor(image_size, dtype=torch.long)
+        vision_image_size = int(getattr(self.vision_config, "image_size", 336) if self.vision_config is not None else 336)
+        vision_patch_size = int(getattr(self.vision_config, "patch_size", getattr(self.processor, "patch_size", 14)))
+        base_grid = vision_image_size // vision_patch_size
+        base_pool = int(getattr(getattr(self.processor, "config", None), "fovea_input_base_pool", 2))
+        highres_pool = int(getattr(getattr(self.processor, "config", None), "fovea_input_highres_pool", 4))
+        base_rows = (base_grid + base_pool - 1) // base_pool
+        base_cols = (base_grid + base_pool - 1) // base_pool
+        highres_rows, highres_cols = self._highres_unpadded_shape(image_size)
+        pooled_rows = (highres_rows + highres_pool - 1) // highres_pool
+        pooled_cols = (highres_cols + highres_pool - 1) // highres_pool
+        return int(base_rows * base_cols + pooled_rows * (pooled_cols + 1))
+
+    def retrieval_feature_boxes(self, image_size: torch.Tensor) -> torch.Tensor:
+        strategy = getattr(self.processor, "vision_feature_select_strategy", "default")
+        if strategy != "default":
+            raise ValueError("Exact LLaVA-NeXT retrieval boxes currently require vision_feature_select_strategy='default'.")
+        highres_rows, highres_cols = self._highres_unpadded_shape(image_size)
+        retrieve_pool = int(getattr(getattr(self.processor, "config", None), "fovea_retrieve_pool", 2))
+        return self._pooled_grid_boxes(highres_rows, highres_cols, retrieve_pool)
+
+    def pack_retrieve(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
+        pixel_values, image_sizes, _count = self._process(image)
+        return pixel_values, image_sizes, self.retrieval_feature_boxes(image_sizes[0])
+
+    def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor, int]:
+        return self._process(image)
 
 
 class LazySupervisedDataset(Dataset):
@@ -408,7 +422,6 @@ class LazySupervisedDataset(Dataset):
         vision_packer: VisionPacker,
         image_token_id: int,
         system_message: str = DEFAULT_SYSTEM_MESSAGE,
-        retrieve_max_image_tokens: int | None = 4096,
         model_max_length: int | None = None,
     ) -> None:
         self.records = load_training_records(data_path)
@@ -417,14 +430,13 @@ class LazySupervisedDataset(Dataset):
         self.vision_packer = vision_packer
         self.image_token_id = image_token_id
         self.system_message = system_message
-        self.retrieve_max_image_tokens = retrieve_max_image_tokens
         self.model_max_length = int(model_max_length or getattr(tokenizer, "model_max_length", 0) or 0)
         self._printed_overlength_indices: set[int] = set()
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def _load_image(self, image_name: str) -> tuple[torch.Tensor, torch.LongTensor]:
+    def _load_image(self, image_name: str) -> tuple[torch.Tensor, torch.LongTensor, int]:
         """Load an image file relative to `image_folder` and pack it."""
 
         image_path = os.path.join(self.image_folder, image_name)
@@ -434,69 +446,59 @@ class LazySupervisedDataset(Dataset):
     def _load_retrieve_image(self, image_name: str) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
         image_path = os.path.join(self.image_folder, image_name)
         image = Image.open(image_path).convert("RGB")
-        return self.vision_packer.pack_retrieve(image, self.retrieve_max_image_tokens)
+        return self.vision_packer.pack_retrieve(image)
 
     def _build_instance(self, index: int) -> dict[str, Any]:
         """Build one training instance.
 
         Output fields:
         - `input_ids`, `labels`: text-side causal-LM training tensors
-        - `mm_token_type_ids`: marks image placeholder token positions
-        - `pixel_values`, `image_grid_thw`: packed image data, or `None`
+        - `pixel_values`, `image_sizes`: LLaVA-NeXT image data, or `None`
         """
 
         record = self.records[index]
         image_field = record.get("image")
         pixel_values = None
-        image_grid_thw = None
+        image_sizes = None
         retrieve_pixel_values = None
-        retrieve_grid_thw = None
+        retrieve_image_sizes = None
         retrieve_patch_boxes = None
         image_token_counts: list[list[int]] = []
         query_boxes: list[tuple[float, float, float, float]] = []
 
-        is_visual_code_lm = record.get("fovea_task") == VISUAL_CODE_LM_TASK
-
         if image_field is not None:
             image_names = image_field if isinstance(image_field, list) else [image_field]
             pixel_values_list = []
-            image_grid_list = []
+            image_size_list = []
             retrieve_pixels_list = []
-            retrieve_grid_list = []
+            retrieve_size_list = []
             retrieve_box_list = []
             for image_name in image_names:
-                packed_pixels, packed_grid = self._load_image(image_name)
-                if not is_visual_code_lm:
-                    retrieve_pixels, retrieve_grid, retrieve_boxes = self._load_retrieve_image(image_name)
-                    retrieve_pixels_list.append(retrieve_pixels)
-                    retrieve_grid_list.append(retrieve_grid)
-                    retrieve_box_list.append(retrieve_boxes)
+                packed_pixels, packed_image_sizes, image_token_count = self._load_image(image_name)
+                retrieve_pixels, retrieve_sizes, retrieve_boxes = self._load_retrieve_image(image_name)
+                retrieve_pixels_list.append(retrieve_pixels)
+                retrieve_size_list.append(retrieve_sizes)
+                retrieve_box_list.append(retrieve_boxes)
                 pixel_values_list.append(packed_pixels)
-                image_grid_list.append(packed_grid)
-                image_token_counts.append([
-                    image_token_count_from_grid(
-                        packed_grid,
-                        self.vision_packer.local_config.spatial_merge_size,
-                    )
-                ])
+                image_size_list.append(packed_image_sizes)
+                image_token_counts.append([image_token_count])
             if pixel_values_list:
                 pixel_values = torch.cat(pixel_values_list, dim=0)
-                image_grid_thw = torch.stack(image_grid_list, dim=0)
+                image_sizes = torch.cat(image_size_list, dim=0)
                 if retrieve_pixels_list:
                     retrieve_pixel_values = torch.cat(retrieve_pixels_list, dim=0)
-                    retrieve_grid_thw = torch.stack(retrieve_grid_list, dim=0)
+                    retrieve_image_sizes = torch.cat(retrieve_size_list, dim=0)
                     retrieve_patch_boxes = torch.cat(retrieve_box_list, dim=0)
 
         conversations = copy.deepcopy(record["conversations"])
-        if not is_visual_code_lm:
-            if image_field is None:
-                raise ValueError("VGR visual-query training requires an image.")
-            image_names = image_field if isinstance(image_field, list) else [image_field]
-            if len(image_names) != 1:
-                raise ValueError("VGR visual-query training expects one image per sample.")
-            if not record.get("fovea_preprocessed", False) or "fovea_query_boxes" not in record:
-                raise ValueError("Training requires offline-preprocessed VGR parquet with fovea_query_boxes.")
-            query_boxes.extend(tuple(float(v) for v in box) for box in record["fovea_query_boxes"])
+        if image_field is None:
+            raise ValueError("Fovea training requires an image.")
+        image_names = image_field if isinstance(image_field, list) else [image_field]
+        if len(image_names) != 1:
+            raise ValueError("Fovea training expects one image per sample.")
+        if not record.get("fovea_preprocessed", False) or "fovea_query_boxes" not in record:
+            raise ValueError("Training requires offline-preprocessed VGR parquet with fovea_query_boxes.")
+        query_boxes.extend(tuple(float(v) for v in box) for box in record["fovea_query_boxes"])
 
         input_ids, labels = encode_chatml_example(
             tokenizer=self.tokenizer,
@@ -510,27 +512,22 @@ class LazySupervisedDataset(Dataset):
             self.tokenizer,
             normalize_supervised_substrings(record.get("fovea_supervised_substrings")),
         )
-        mm_token_type_ids = build_mm_token_type_ids(input_ids=input_ids, image_token_id=self.image_token_id)
-        if is_visual_code_lm:
-            vq_metadata = empty_visual_query_metadata(labels)
-        else:
-            vq_metadata = build_visual_query_metadata(
-                input_ids,
-                labels,
-                tokenizer=self.tokenizer,
-                query_boxes=query_boxes,
-            )
+        fovea_metadata = build_fovea_metadata(
+            input_ids,
+            labels,
+            tokenizer=self.tokenizer,
+            query_boxes=query_boxes,
+        )
 
         return {
             "input_ids": input_ids,
             "labels": labels,
-            "mm_token_type_ids": mm_token_type_ids,
             "pixel_values": pixel_values,
-            "image_grid_thw": image_grid_thw,
+            "image_sizes": image_sizes,
             "retrieve_pixel_values": retrieve_pixel_values,
-            "retrieve_grid_thw": retrieve_grid_thw,
+            "retrieve_image_sizes": retrieve_image_sizes,
             "retrieve_patch_boxes": retrieve_patch_boxes,
-            **vq_metadata,
+            **fovea_metadata,
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -552,7 +549,7 @@ class LazySupervisedDataset(Dataset):
 
 
 @dataclass
-class DataCollatorForQwen3_5SFT:
+class DataCollatorForLlavaNextSFT:
     """Pad text fields and concatenate image fields into a trainer batch."""
 
     tokenizer: PreTrainedTokenizerBase
@@ -564,6 +561,18 @@ class DataCollatorForQwen3_5SFT:
         tensors = [tensor[: self.model_max_length] for tensor in tensors]
         return torch.nn.utils.rnn.pad_sequence(tensors, batch_first=True, padding_value=padding_value)
 
+    def _cat_padded_pixel_values(self, tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+        max_patches = max(int(tensor.shape[1]) for tensor in tensors)
+        padded = []
+        for tensor in tensors:
+            if int(tensor.shape[1]) == max_patches:
+                padded.append(tensor)
+                continue
+            pad_shape = (tensor.shape[0], max_patches - tensor.shape[1], *tensor.shape[2:])
+            pad = tensor.new_zeros(pad_shape)
+            padded.append(torch.cat([tensor, pad], dim=1))
+        return torch.cat(padded, dim=0)
+
     def __call__(self, instances: Sequence[dict[str, Any]]) -> dict[str, Any]:
         """Merge per-sample dicts into the batch schema expected by `Trainer`."""
 
@@ -572,54 +581,50 @@ class DataCollatorForQwen3_5SFT:
 
         input_ids = self._pad([instance["input_ids"] for instance in instances], padding_value=self.tokenizer.pad_token_id)
         labels = self._pad([instance["labels"] for instance in instances], padding_value=IGNORE_INDEX)
-        mm_token_type_ids = self._pad([instance["mm_token_type_ids"] for instance in instances], padding_value=0).int()
-        vq_code_label_mask = self._pad([instance["vq_code_label_mask"] for instance in instances], padding_value=0).bool()
 
         batch = {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
-            "mm_token_type_ids": mm_token_type_ids,
-            "vq_code_label_mask": vq_code_label_mask,
         }
 
         pixel_values = [instance["pixel_values"] for instance in instances if instance["pixel_values"] is not None]
-        image_grid_thw = [instance["image_grid_thw"] for instance in instances if instance["image_grid_thw"] is not None]
+        image_sizes = [instance["image_sizes"] for instance in instances if instance["image_sizes"] is not None]
         if pixel_values:
-            batch["pixel_values"] = torch.cat(pixel_values, dim=0)
-            batch["image_grid_thw"] = torch.cat(image_grid_thw, dim=0)
+            batch["pixel_values"] = self._cat_padded_pixel_values(pixel_values)
+            batch["image_sizes"] = torch.cat(image_sizes, dim=0)
 
         retrieve_pixel_values = [instance["retrieve_pixel_values"] for instance in instances if instance.get("retrieve_pixel_values") is not None]
-        retrieve_grid_thw = [instance["retrieve_grid_thw"] for instance in instances if instance.get("retrieve_grid_thw") is not None]
+        retrieve_image_sizes = [instance["retrieve_image_sizes"] for instance in instances if instance.get("retrieve_image_sizes") is not None]
         retrieve_patch_boxes = [instance["retrieve_patch_boxes"] for instance in instances if instance.get("retrieve_patch_boxes") is not None]
         if retrieve_pixel_values:
-            batch["retrieve_pixel_values"] = torch.cat(retrieve_pixel_values, dim=0)
-            batch["retrieve_grid_thw"] = torch.cat(retrieve_grid_thw, dim=0)
+            batch["retrieve_pixel_values"] = self._cat_padded_pixel_values(retrieve_pixel_values)
+            batch["retrieve_image_sizes"] = torch.cat(retrieve_image_sizes, dim=0)
             batch["retrieve_patch_boxes"] = torch.cat(retrieve_patch_boxes, dim=0)
             batch["retrieve_image_counts"] = torch.tensor(
-                [int(instance["retrieve_grid_thw"].shape[0]) if instance.get("retrieve_grid_thw") is not None else 0 for instance in instances],
+                [int(instance["retrieve_image_sizes"].shape[0]) if instance.get("retrieve_image_sizes") is not None else 0 for instance in instances],
                 dtype=torch.long,
             )
 
-        code_positions = []
-        replay_positions = []
-        code_query_indices = []
+        fovea_positions = []
+        fovea_box_indices = []
         boxes = []
         query_offset = 0
         for batch_idx, instance in enumerate(instances):
-            num_queries = int(instance["vq_boxes"].shape[0])
+            num_queries = int(instance["fovea_boxes"].shape[0])
             if num_queries:
-                boxes.append(instance["vq_boxes"])
-            codes = instance["vq_code_positions"]
-            if codes.numel() > 0:
-                code_positions.append(torch.stack([torch.full_like(codes, batch_idx), codes], dim=1))
-                replay = instance["vq_replay_positions"]
-                replay_positions.append(torch.stack([torch.full_like(replay, batch_idx), replay], dim=1))
-                code_query_indices.append(instance["vq_code_query_indices"] + query_offset)
+                boxes.append(instance["fovea_boxes"])
+            positions = instance["fovea_positions"]
+            if positions.numel() > 0:
+                keep = positions < self.model_max_length
+                positions = positions[keep]
+                indices = instance["fovea_box_indices"][keep]
+                if positions.numel() > 0:
+                    fovea_positions.append(torch.stack([torch.full_like(positions, batch_idx), positions], dim=1))
+                    fovea_box_indices.append(indices + query_offset)
             query_offset += num_queries
-        batch["vq_code_positions"] = torch.cat(code_positions, dim=0) if code_positions else torch.empty((0, 2), dtype=torch.long)
-        batch["vq_replay_positions"] = torch.cat(replay_positions, dim=0) if replay_positions else torch.empty((0, 2), dtype=torch.long)
-        batch["vq_code_query_indices"] = torch.cat(code_query_indices, dim=0) if code_query_indices else torch.empty((0,), dtype=torch.long)
-        batch["vq_boxes"] = torch.cat(boxes, dim=0) if boxes else torch.empty((0, 4), dtype=torch.float32)
+        batch["fovea_positions"] = torch.cat(fovea_positions, dim=0) if fovea_positions else torch.empty((0, 2), dtype=torch.long)
+        batch["fovea_box_indices"] = torch.cat(fovea_box_indices, dim=0) if fovea_box_indices else torch.empty((0,), dtype=torch.long)
+        batch["fovea_boxes"] = torch.cat(boxes, dim=0) if boxes else torch.empty((0, 4), dtype=torch.float32)
 
         return batch
