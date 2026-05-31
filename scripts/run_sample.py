@@ -95,7 +95,6 @@ def _prepare_simple_inputs(model, visuals, question: str):
     processor_kwargs = {
         "text": texts,
         "images": list(visuals),
-        "image_counts_per_sample": [len(visuals)],
         "return_tensors": "pt",
     }
     inputs = model.processor(**processor_kwargs)
@@ -194,7 +193,7 @@ def main() -> None:
         n_tok = int(gen_ids.shape[0])
         hit_limit = n_tok >= args.max_new_tokens
         raw, clean = _decode_raw(model, gen_ids)
-        has_think_end = "</think>" in clean
+        has_think_end = "</think>" in raw
         fovea_count = _count_fovea_tokens(model, gen_ids.tolist())
 
         print(f"\n{'=' * 80}")

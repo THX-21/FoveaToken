@@ -190,6 +190,7 @@ class Fovea(lmms):
     def _apply_chat_template(self, batched_messages):
         texts = []
         for messages in batched_messages:
+            messages = self._normalize_messages_for_template(messages)
             if hasattr(self.processor, "apply_chat_template"):
                 text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 texts.append(self._apply_thinking_prefill(text))
@@ -210,6 +211,17 @@ class Fovea(lmms):
             text = "\n".join(part for part in parts if part) + "\nASSISTANT: "
             texts.append(self._apply_thinking_prefill(text))
         return texts
+
+    @staticmethod
+    def _normalize_messages_for_template(messages):
+        normalized = []
+        for message in messages:
+            item = dict(message)
+            content = item.get("content", "")
+            if isinstance(content, str):
+                item["content"] = [{"type": "text", "text": content}]
+            normalized.append(item)
+        return normalized
 
     def _apply_thinking_prefill(self, text: str) -> str:
         if self.enable_thinking:
@@ -502,3 +514,6 @@ class Fovea(lmms):
         res = re_ords.get_original(res)
         pbar.close()
         return res
+
+    def generate_until_multi_round(self, requests) -> List[str]:
+        raise NotImplementedError("Multi-round generation is not implemented for Fovea")
