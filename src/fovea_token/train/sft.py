@@ -10,7 +10,7 @@ from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
 from fovea_token import FoveaForConditionalGeneration
 from fovea_token.configuration_fovea import sync_expanded_image_grid_pinpoints
-from fovea_token.tokenizers.tokenization_fovea import add_fovea_tokens, sync_fovea_token_ids
+from fovea_token.tokenizers.tokenization_fovea import FOVEA_SPECIAL_TOKENS, add_fovea_tokens, sync_fovea_token_ids
 
 from .data import DataCollatorForLlavaNextSFT, LazySupervisedDataset, VisionPacker
 
@@ -66,16 +66,18 @@ def unfreeze_fovea_parameters(model, lora_enable: bool) -> None:
         param.requires_grad_(True)
 
 
-def get_fovea_token_ids(config, vocab_size: int | None = None) -> list[int]:
+def get_trainable_special_token_ids(config, tokenizer=None, vocab_size: int | None = None) -> list[int]:
     token_id = getattr(config, "fovea_token_id", None)
     token_ids = [] if token_id is None else [int(token_id)]
+    if tokenizer is not None:
+        token_ids.extend(int(tokenizer.convert_tokens_to_ids(token)) for token in FOVEA_SPECIAL_TOKENS)
     if vocab_size is None:
         vocab_size = int(getattr(getattr(config, "text_config", config), "vocab_size", 0))
     return sorted({token_id for token_id in token_ids if 0 <= token_id < int(vocab_size)})
 
 
-def freeze_base_embedding_rows(model, config) -> None:
-    """Freeze base vocab rows while allowing the `<fovea>` token row to learn."""
+def freeze_base_embedding_rows(model, config, tokenizer=None) -> None:
+    """Freeze base vocab rows while allowing newly added text token rows to learn."""
 
     registered_params = set()
     for name, param in model.named_parameters():
@@ -85,7 +87,7 @@ def freeze_base_embedding_rows(model, config) -> None:
             continue
         if param.ndim != 2:
             continue
-        trainable_token_ids = get_fovea_token_ids(config, vocab_size=param.shape[0])
+        trainable_token_ids = get_trainable_special_token_ids(config, tokenizer=tokenizer, vocab_size=param.shape[0])
         if not trainable_token_ids:
             continue
         if id(param) in registered_params:
@@ -460,7 +462,7 @@ def main() -> None:
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     unfreeze_fovea_parameters(model, lora_enable=model_args.lora_enable)
     if model_args.freeze_embed_base:
-        freeze_base_embedding_rows(model, model.config)
+        freeze_base_embedding_rows(model, model.config, tokenizer=tokenizer)
     if model_args.lora_enable:
         configure_vision_trainability_for_lora(model, unfreeze_vision=model_args.unfreeze_vision)
     print_parameter_summary(model)
@@ -473,6 +475,7 @@ def main() -> None:
     train_dataset = LazySupervisedDataset(
         data_path=data_args.data_path,
         image_folder=data_args.image_folder,
+        processor=processor,
         tokenizer=tokenizer,
         vision_packer=vision_packer,
         image_token_id=model.config.image_token_id,

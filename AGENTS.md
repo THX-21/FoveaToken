@@ -51,6 +51,8 @@ VGR 中的：
 
 每个 `<fovea>` 必须绑定一个原图归一化 box，用于 `L_align`。图像路径相对 `image_folder`。assistant 文本里不属于合法 region tag 的残留 `<image>`、孤立 `<SOT>`、孤立 `<EOT>` 会在离线预处理阶段直接清掉，不再参与 placeholder 展开。
 
+训练 prompt 使用 checkpoint 自带的 HF `processor.apply_chat_template()` 渲染，保持和 LLaVA-NeXT 原生推理入口一致。由于本仓库使用自定义 pooled image token 数，`<image>` 占位符仍在模板渲染前由 `src/fovea_token/train/data.py` 按本地 token count 展开；assistant 文本中的 `<think>`/`</think>` 是本仓库新增的 atomic marker tokens。LLaVA-NeXT 原生没有 thinking chat-template 开关；评测时 `enable_thinking=true` 会在 assistant 生成前预填 `<think>`，否则预填 `<think>\n\n</think>`。
+
 训练默认读取离线预处理结果：
 
 ```text
@@ -116,7 +118,7 @@ bash scripts/test_deepspeed_2gpu.sh
 export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 ```
 
-LoRA 训练如果同时开启 `unfreeze_vision=true`，vision tower 只训练 LoRA 参数；`unfreeze_vision=false` 时 vision tower 完全冻结，不额外保存全量 `vision_tower.safetensors`。全参训练（`lora_enable=false`）也遵守 `unfreeze_vision`：`true` 时全量训练 vision tower，`false` 时冻结 vision tower、其余参数继续全参训练。`freeze_embed_base=true` 时 embedding/`lm_head` 的 base vocab rows 冻结，只训练 `<fovea>` 新增 token row；设为 `false` 时不加 row-level gradient mask。
+LoRA 训练如果同时开启 `unfreeze_vision=true`，vision tower 只训练 LoRA 参数；`unfreeze_vision=false` 时 vision tower 完全冻结，不额外保存全量 `vision_tower.safetensors`。全参训练（`lora_enable=false`）也遵守 `unfreeze_vision`：`true` 时全量训练 vision tower，`false` 时冻结 vision tower、其余参数继续全参训练。`freeze_embed_base=true` 时 embedding/`lm_head` 的 base vocab rows 冻结，只训练 `<fovea>`、`<think>`、`</think>` 新增 token rows；设为 `false` 时不加 row-level gradient mask。
 
 ## 修改规则
 

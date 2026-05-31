@@ -12,8 +12,8 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 
 - `src/fovea_token/modeling_fovea.py`：`FoveaForConditionalGeneration` 和固定 64-token fovea retrieval。
 - `src/fovea_token/modeling_llava_next.py`：从 transformers 4.53.0 vendored 的 HF LLaVA-NeXT 源码。
-- `src/fovea_token/train/data.py`：离线预处理后的 VGR parquet 读取、LLaVA/Vicuna prompt 编码、collator 和 LLaVA-NeXT 图像预处理适配。
-- `src/fovea_token/tokenizers/tokenization_fovea.py`：`<fovea>` token helper。
+- `src/fovea_token/train/data.py`：离线预处理后的 VGR parquet 读取、HF LLaVA-NeXT chat template 编码、collator 和 LLaVA-NeXT 图像预处理适配。
+- `src/fovea_token/tokenizers/tokenization_fovea.py`：`<fovea>`、`<think>`、`</think>` token helper。
 - `scripts/preprocess_vgr.py`：把原始 VGR region tag 离线转换成 `<fovea>` 训练 parquet。
 - `scripts/preprocess_pretrain_data.py`：把 Visual Genome regions 转成固定 fovea grounding parquet；旧 Stage A visual-code LM 已移除。
 - `scripts/ft3.sh`：VGR 训练入口。
@@ -72,7 +72,9 @@ bash scripts/ft3_lora.sh
 - `FT3_DATALOADER_NUM_WORKERS`
 - `FT3_REPORT_TO`
 
-`scripts/ft3_lora.sh` 默认启用 LoRA；`FT3_UNFREEZE_VISION=true` 时只训练 vision tower LoRA，设为 `false` 时 vision tower 完全冻结。`FT3_FREEZE_EMBED_BASE=true` 时冻结 embedding/`lm_head` 的 base vocab rows，只训练 `<fovea>` 新增 token row。
+`scripts/ft3_lora.sh` 默认启用 LoRA；`FT3_UNFREEZE_VISION=true` 时只训练 vision tower LoRA，设为 `false` 时 vision tower 完全冻结。`FT3_FREEZE_EMBED_BASE=true` 时冻结 embedding/`lm_head` 的 base vocab rows，只训练 `<fovea>`、`<think>`、`</think>` 新增 token rows。
+
+训练 prompt 使用 checkpoint 自带的 HF `processor.apply_chat_template()` 渲染，和原生 LLaVA-NeXT 推理入口保持一致。图像 `<image>` 占位符仍由本仓库按 pooled image token 数提前展开，避免和默认 processor 图像展开逻辑混用；assistant 内容中的 `<think>`/`</think>` 是本仓库新增的 atomic marker tokens。LLaVA-NeXT 原生没有 thinking chat-template 开关；评测时 `enable_thinking=true` 会在 assistant 生成前预填 `<think>`，否则预填 `<think>\n\n</think>`。
 
 ## 离线预处理
 

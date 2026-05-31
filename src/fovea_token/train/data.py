@@ -136,75 +136,113 @@ def replace_image_tokens_in_conversations(
 
 
 def tokenize_text(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
-    """Tokenize without adding tokenizer-managed special tokens.
-
-    ChatML tags are inserted manually in this file, so auto-added BOS/EOS would
-    shift label positions and break the handcrafted prompt template.
-    """
+    """Tokenize without adding tokenizer-managed special tokens."""
 
     return tokenizer(text, add_special_tokens=False).input_ids
 
 
-def encode_chatml_example(
+def _hf_role(role: str) -> str:
+    role_map = {
+        "human": "user",
+        "user": "user",
+        "gpt": "assistant",
+        "assistant": "assistant",
+        "system": "system",
+    }
+    mapped = role_map.get(role)
+    if mapped is None:
+        raise ValueError(f"Unsupported role {role!r}.")
+    return mapped
+
+
+def _content_from_text(text: str) -> list[dict[str, str]]:
+    return [{"type": "text", "text": text}]
+
+
+def _render_chat_template(processor: Any, tokenizer: PreTrainedTokenizerBase, messages: Sequence[dict[str, Any]]) -> str:
+    renderer = processor if processor is not None and hasattr(processor, "apply_chat_template") else tokenizer
+    if not hasattr(renderer, "apply_chat_template"):
+        raise ValueError("The processor/tokenizer does not provide apply_chat_template().")
+    try:
+        return renderer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    except ValueError as exc:
+        chat_template = getattr(renderer, "chat_template", None)
+        if chat_template is not None:
+            raise
+        raise ValueError(
+            "HF-native prompt formatting requires a tokenizer or processor chat_template. "
+            "Use a LLaVA-NeXT checkpoint with chat_template.json/tokenizer_config.json."
+        ) from exc
+
+
+def _build_hf_messages(
+    conversations: Sequence[dict[str, Any]],
+    system_message: str,
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    if system_message:
+        messages.append({"role": "system", "content": _content_from_text(system_message)})
+    for sentence in conversations:
+        role = _hf_role(sentence["from"])
+        messages.append({"role": role, "content": _content_from_text(str(sentence["value"]))})
+    return messages
+
+
+def _matching_prefix_len(left: Sequence[int], right: Sequence[int]) -> int:
+    limit = min(len(left), len(right))
+    for idx in range(limit):
+        if left[idx] != right[idx]:
+            return idx
+    return limit
+
+
+def encode_hf_chat_template_example(
+    processor: Any,
     tokenizer: PreTrainedTokenizerBase,
     conversations: Sequence[dict[str, Any]],
     image_token_counts: Sequence[int | Sequence[int]],
     system_message: str,
 ) -> tuple[torch.LongTensor, torch.LongTensor]:
-    """Encode one conversation using the LLaVA-v1/Vicuna conversation style.
+    """Encode one conversation using the checkpoint's HF chat template.
 
     Labeling policy:
     - system turns: ignored
     - user turns: ignored
-    - assistant turns: supervise the sample-provided assistant content and turn
-      end marker, not the role prefix
+    - assistant turns: supervise the sample-provided assistant content and any
+      template-provided turn end marker, not the role prefix
 
-    This is the standard SFT setup where the model learns to continue the prompt
-    as the assistant.
+    Image placeholders are expanded before rendering so the local pooled-token
+    counts remain the source of truth instead of the processor's default image
+    expansion.
     """
 
     prompt_conversations = replace_image_tokens_in_conversations(list(conversations), image_token_counts)
+    messages = _build_hf_messages(prompt_conversations, system_message)
+    rendered = _render_chat_template(processor, tokenizer, messages)
+    input_ids = tokenize_text(tokenizer, rendered)
+    labels = [IGNORE_INDEX] * len(input_ids)
 
-    input_ids: list[int] = []
-    labels: list[int] = []
+    for msg_idx, message in enumerate(messages):
+        if message["role"] != "assistant":
+            continue
+        rendered_with_turn = _render_chat_template(processor, tokenizer, messages[: msg_idx + 1])
+        marker = f"<|fovea_label_start_{msg_idx}|>"
+        marked_messages = copy.deepcopy(messages[: msg_idx + 1])
+        for content in marked_messages[-1]["content"]:
+            if content.get("type") == "text":
+                content["text"] = marker + str(content.get("text", ""))
+                break
+        marked_rendered = _render_chat_template(processor, tokenizer, marked_messages)
+        marker_pos = marked_rendered.find(marker)
+        if marker_pos < 0:
+            raise ValueError("Could not locate assistant label marker after chat-template rendering.")
 
-    def append_segment(text: str, supervised_prefix_len: int | None) -> None:
-        # `supervised_prefix_len=None` means the entire segment is context only.
-        # Otherwise we mask the prefix tokens and train on the remainder.
-        segment_ids = tokenize_text(tokenizer, text)
-        input_ids.extend(segment_ids)
-        if supervised_prefix_len is None:
-            labels.extend([IGNORE_INDEX] * len(segment_ids))
-        else:
-            supervised_prefix_len = min(supervised_prefix_len, len(segment_ids))
-            labels.extend([IGNORE_INDEX] * supervised_prefix_len)
-            labels.extend(segment_ids[supervised_prefix_len:])
-
-    role_prefixes = {
-        "human": "USER: ",
-        "user": "USER: ",
-        "gpt": "ASSISTANT: ",
-        "assistant": "ASSISTANT: ",
-    }
-    if system_message:
-        append_segment(f"{system_message}\n\n", supervised_prefix_len=None)
-
-    for sentence in prompt_conversations:
-        role = sentence["from"]
-        prefix = role_prefixes.get(role)
-        if prefix is None:
-            raise ValueError(f"Unsupported role {role!r}.")
-        if role in {"human", "user"}:
-            full_segment = f"{prefix}{sentence['value']}\n"
-            prefix_len = len(tokenize_text(tokenizer, prefix))
-        else:
-            eos = tokenizer.eos_token or "</s>"
-            full_segment = f"{prefix}{sentence['value']}{eos}\n"
-            prefix_len = len(tokenize_text(tokenizer, prefix))
-        if role in {"human", "user"}:
-            append_segment(full_segment, supervised_prefix_len=None)
-        else:
-            append_segment(full_segment, supervised_prefix_len=prefix_len)
+        turn_ids = tokenize_text(tokenizer, rendered_with_turn)
+        start = len(tokenize_text(tokenizer, marked_rendered[:marker_pos]))
+        end = _matching_prefix_len(turn_ids, input_ids)
+        if end <= start:
+            continue
+        labels[start:end] = input_ids[start:end]
 
     return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
@@ -424,6 +462,7 @@ class LazySupervisedDataset(Dataset):
         self,
         data_path: str,
         image_folder: str,
+        processor: Any,
         tokenizer: PreTrainedTokenizerBase,
         vision_packer: VisionPacker,
         image_token_id: int,
@@ -432,6 +471,7 @@ class LazySupervisedDataset(Dataset):
     ) -> None:
         self.records = load_training_records(data_path)
         self.image_folder = image_folder
+        self.processor = processor
         self.tokenizer = tokenizer
         self.vision_packer = vision_packer
         self.image_token_id = image_token_id
@@ -506,7 +546,8 @@ class LazySupervisedDataset(Dataset):
             raise ValueError("Training requires offline-preprocessed VGR parquet with fovea_query_boxes.")
         query_boxes.extend(tuple(float(v) for v in box) for box in record["fovea_query_boxes"])
 
-        input_ids, labels = encode_chatml_example(
+        input_ids, labels = encode_hf_chat_template_example(
+            processor=self.processor,
             tokenizer=self.tokenizer,
             conversations=conversations,
             image_token_counts=image_token_counts,

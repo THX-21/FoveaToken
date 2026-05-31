@@ -191,7 +191,8 @@ class Fovea(lmms):
         texts = []
         for messages in batched_messages:
             if hasattr(self.processor, "apply_chat_template"):
-                texts.append(self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+                text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                texts.append(self._apply_thinking_prefill(text))
                 continue
             parts = []
             for message in messages:
@@ -206,8 +207,14 @@ class Fovea(lmms):
                 else:
                     text = str(content)
                 parts.append(f"{prefix}{text}")
-            texts.append("\n".join(part for part in parts if part) + "\nASSISTANT: ")
+            text = "\n".join(part for part in parts if part) + "\nASSISTANT: "
+            texts.append(self._apply_thinking_prefill(text))
         return texts
+
+    def _apply_thinking_prefill(self, text: str) -> str:
+        if self.enable_thinking:
+            return text + "<think>"
+        return text + "<think>\n\n</think>"
 
     @property
     def config(self):
