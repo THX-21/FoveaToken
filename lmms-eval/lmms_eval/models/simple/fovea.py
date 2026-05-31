@@ -91,8 +91,9 @@ class Fovea(lmms):
         attn_implementation: Optional[str] = "sdpa",
         system_prompt: Optional[str] = "You are a helpful assistant.",
         interleave_visuals: Optional[bool] = False,
-        enable_thinking: Optional[bool] = False,
+        enable_thinking: Optional[bool] = True,
         reasoning_prompt: Optional[str] = None,
+        disable_fovea_retrieval: Optional[bool] = False,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -153,6 +154,7 @@ class Fovea(lmms):
         self.processor._get_number_of_features = self._get_pooled_number_of_features
 
         self.enable_thinking = enable_thinking
+        self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
         if reasoning_prompt:
             self.reasoning_prompt = reasoning_prompt.replace("\\n", "\n")
         else:
@@ -223,7 +225,8 @@ class Fovea(lmms):
     def _apply_thinking_prefill(self, text: str) -> str:
         if self.enable_thinking:
             return text + "<think>"
-        return text + "<think>\n\n</think>"
+        # return text + "<think>\n\n</think>"
+        return text
 
     @property
     def config(self):
@@ -440,24 +443,25 @@ class Fovea(lmms):
         if self.batch_size > 1:
             processor_kwargs.update({"padding": True, "padding_side": "left"})
         inputs = self.processor(**processor_kwargs)
-        retrieve_pixels = []
-        retrieve_sizes = []
-        retrieve_boxes = []
-        retrieve_counts = []
-        image_cursor = 0
-        for count in image_counts_per_sample:
-            retrieve_counts.append(count)
-            for image in image_inputs[image_cursor : image_cursor + count]:
-                pixels, image_sizes, boxes = self.vision_packer.pack_retrieve(image)
-                retrieve_pixels.append(pixels)
-                retrieve_sizes.append(image_sizes)
-                retrieve_boxes.append(boxes)
-            image_cursor += count
-        if retrieve_pixels:
-            inputs["retrieve_pixel_values"] = torch.cat(retrieve_pixels, dim=0)
-            inputs["retrieve_image_sizes"] = torch.cat(retrieve_sizes, dim=0)
-            inputs["retrieve_patch_boxes"] = torch.cat(retrieve_boxes, dim=0)
-            inputs["retrieve_image_counts"] = torch.tensor(retrieve_counts, dtype=torch.long)
+        if not self.disable_fovea_retrieval:
+            retrieve_pixels = []
+            retrieve_sizes = []
+            retrieve_boxes = []
+            retrieve_counts = []
+            image_cursor = 0
+            for count in image_counts_per_sample:
+                retrieve_counts.append(count)
+                for image in image_inputs[image_cursor : image_cursor + count]:
+                    pixels, image_sizes, boxes = self.vision_packer.pack_retrieve(image)
+                    retrieve_pixels.append(pixels)
+                    retrieve_sizes.append(image_sizes)
+                    retrieve_boxes.append(boxes)
+                image_cursor += count
+            if retrieve_pixels:
+                inputs["retrieve_pixel_values"] = torch.cat(retrieve_pixels, dim=0)
+                inputs["retrieve_image_sizes"] = torch.cat(retrieve_sizes, dim=0)
+                inputs["retrieve_patch_boxes"] = torch.cat(retrieve_boxes, dim=0)
+                inputs["retrieve_image_counts"] = torch.tensor(retrieve_counts, dtype=torch.long)
 
         return inputs, contexts, gen_kwargs, until
 

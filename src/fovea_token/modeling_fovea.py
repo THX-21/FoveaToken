@@ -248,6 +248,15 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model.get_decoder()
 
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, LlavaNextModel)):
+            params = list(module.parameters(recurse=False))
+            buffers = list(module.buffers(recurse=False))
+            if params or buffers:
+                if all(getattr(t, "_is_hf_initialized", False) for t in params + buffers):
+                    return
+        super()._init_weights(module)
+
     @torch.no_grad()
     def _init_fovea_modules(self) -> None:
         std = float(getattr(self.config.text_config, "initializer_range", 0.02))
@@ -695,6 +704,36 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
     def _cached_decode_position_ids(self, attention_mask):
         return attention_mask.long().cumsum(-1)[:, -1:] - 1
 
+    def _sample_next_token(self, logits, *, do_sample: bool, temperature=None, top_p=None, top_k=None):
+        if not do_sample:
+            return logits.argmax(dim=-1, keepdim=True)
+
+        scaled_logits = logits
+        temp = None if temperature is None else float(temperature)
+        if temp is not None and temp > 0:
+            scaled_logits = scaled_logits / temp
+
+        if top_k is not None:
+            k = min(int(top_k), int(scaled_logits.shape[-1]))
+            if k > 0:
+                threshold = torch.topk(scaled_logits, k=k, dim=-1).values[..., -1, None]
+                scaled_logits = scaled_logits.masked_fill(scaled_logits < threshold, torch.finfo(scaled_logits.dtype).min)
+
+        if top_p is not None:
+            p = float(top_p)
+            if 0.0 < p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(scaled_logits, dim=-1, descending=True)
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                cumulative_probs = sorted_probs.cumsum(dim=-1)
+                sorted_remove = cumulative_probs > p
+                sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+                sorted_remove[..., 0] = False
+                remove_mask = torch.zeros_like(sorted_remove, dtype=torch.bool).scatter(-1, sorted_indices, sorted_remove)
+                scaled_logits = scaled_logits.masked_fill(remove_mask, torch.finfo(scaled_logits.dtype).min)
+
+        probs = torch.softmax(scaled_logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
     @torch.no_grad()
     def fovea_generate(
         self,
@@ -712,12 +751,15 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         use_cache=True,
         do_sample=False,
         num_beams=1,
+        temperature=None,
+        top_p=None,
+        top_k=None,
         **kwargs,
     ):
         if input_ids.shape[0] != 1:
             raise ValueError("Fovea generation currently expects batch_size=1.")
-        if do_sample or int(num_beams) != 1:
-            raise ValueError("Fovea generation supports greedy decoding only.")
+        if int(num_beams) != 1:
+            raise ValueError("Fovea generation currently supports num_beams=1 only.")
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
 
@@ -774,7 +816,13 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         eos_ids = {int(eos_token_id)} if isinstance(eos_token_id, int) else {int(item) for item in (eos_token_id or [])}
 
         for _ in range(int(max_new_tokens)):
-            next_token = logits.argmax(dim=-1, keepdim=True)
+            next_token = self._sample_next_token(
+                logits,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
             next_embed = self.get_input_embeddings()(next_token).to(inputs_embeds.dtype)
             input_ids = torch.cat([input_ids, next_token], dim=1)
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones((1, 1))], dim=1)

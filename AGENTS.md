@@ -125,6 +125,7 @@ LoRA 训练如果同时开启 `unfreeze_vision=true`，vision tower 只训练 Lo
 - 不要恢复旧 visual-query replay 路径。
 - 不要恢复旧视觉 slot 路径。
 - 不要添加 JSON SFT 兼容读取。
+- 禁止写兼容性代码和兜底代码。
 - 不要在 `modeling_llava_next.py` 里加入 Fovea retrieval 逻辑；该文件应保持为 HF LLaVA-NeXT 源码搬运版本，Fovea retrieval 只放在 `modeling_fovea.py`。
 - `FoveaForConditionalGeneration` 的 `fovea_*` 是 base checkpoint 中不存在的新参数；`__init__()` 里的显式初始化不够，`from_pretrained()` 返回前还需要再次检查这些新增权重是否变成全 0 或非 finite，并只修复异常权重。
 - 修改 token、训练脚本、保存模块或数据字段时，同步更新 `README.md` 和本文件。

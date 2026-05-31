@@ -106,7 +106,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --save_total_limit 2 \
     --learning_rate 2e-5 \
     --vision_tower_lr 2e-6 \
-    --max_grad_norm 5.0 \
+    --max_grad_norm 1.0 \
     --weight_decay 0.0 \
     --warmup_ratio 0.03 \
     --attn_implementation "${ATTN_IMPLEMENTATION}" \
