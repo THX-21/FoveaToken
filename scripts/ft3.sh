@@ -87,7 +87,6 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --model_name_or_path "${CKPT_PATH}" \
     --data_path "${DATA_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
-    --max_image_tokens 512 \
     --lora_enable false \
     --lora_r 64 \
     --lora_alpha 16 \

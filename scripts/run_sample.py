@@ -115,7 +115,10 @@ def _prepare_simple_inputs(model, visuals, question: str):
 
 
 def _prepare_chat_inputs(model, task, doc):
-    raise RuntimeError("scripts/run_sample.py currently supports the simple lmms-eval path for Fovea/LLaVA-NeXT.")
+    raise RuntimeError(
+        "scripts/run_sample.py currently supports only the simple lmms-eval path. "
+        "For models that have both chat and simple adapters, such as llava_hf, rerun with --force_simple."
+    )
 
 
 def _decode_raw(model, gen_ids):

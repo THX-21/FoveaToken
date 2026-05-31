@@ -348,12 +348,10 @@ class VisionPacker:
         self,
         processor,
         vision_config=None,
-        max_image_tokens: int | None = None,
     ) -> None:
         self.processor = processor
         self.image_processor = processor.image_processor
         self.vision_config = vision_config
-        self.max_image_tokens = max_image_tokens
 
     def _process(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor, int]:
         inputs = self.image_processor(images=image, return_tensors="pt")

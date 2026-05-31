@@ -93,8 +93,6 @@ class Fovea(lmms):
         interleave_visuals: Optional[bool] = False,
         enable_thinking: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
-        max_image_tokens: int | None = 512,
-        use_fovea: Optional[bool] = False,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -150,18 +148,15 @@ class Fovea(lmms):
         vision_packer = VisionPacker(
             processor=self.processor,
             vision_config=self._model.config.vision_config,
-            max_image_tokens=max_image_tokens,
         )
         self.vision_packer = vision_packer
         self.processor._get_number_of_features = self._get_pooled_number_of_features
-        self.use_fovea = use_fovea
 
         self.enable_thinking = enable_thinking
         if reasoning_prompt:
             self.reasoning_prompt = reasoning_prompt.replace("\\n", "\n")
         else:
             self.reasoning_prompt = None
-
         self.system_prompt = system_prompt
         self.interleave_visuals = interleave_visuals
         self._config = self.model.config
@@ -198,16 +193,12 @@ class Fovea(lmms):
             parts = []
             for message in messages:
                 role = message.get("role")
-                content = message.get("content", "")
+                content = self._message_text(message.get("content", ""))
                 if role == "system":
-                    parts.append(str(content).strip())
+                    parts.append(content.strip())
                     continue
                 prefix = "USER: " if role == "user" else "ASSISTANT: "
-                if isinstance(content, list):
-                    text = "".join("<image>\n" if item.get("type") == "image" else str(item.get("text", "")) for item in content)
-                else:
-                    text = str(content)
-                parts.append(f"{prefix}{text}")
+                parts.append(f"{prefix}{content}")
             text = "\n".join(part for part in parts if part) + "\nASSISTANT: "
             texts.append(self._apply_thinking_prefill(text))
         return texts
@@ -222,6 +213,12 @@ class Fovea(lmms):
                 item["content"] = [{"type": "text", "text": content}]
             normalized.append(item)
         return normalized
+
+    @staticmethod
+    def _message_text(content):
+        if isinstance(content, list):
+            return "".join("<image>\n" if item.get("type") == "image" else str(item.get("text", "")) for item in content)
+        return str(content)
 
     def _apply_thinking_prefill(self, text: str) -> str:
         if self.enable_thinking:
@@ -305,9 +302,6 @@ class Fovea(lmms):
             if val is not None:
                 generate_kwargs[key] = val
         return generate_kwargs
-
-    def _strip_thinking(self, answer):
-        return answer
 
     def _load_deepspeed_trainables(self, checkpoint_path: str) -> None:
         """Load legacy non-LoRA vision trainables saved alongside a LoRA checkpoint."""
@@ -506,7 +500,6 @@ class Fovea(lmms):
                     answers[i] = ans
 
                 for ans, context in zip(answers, contexts):
-                    ans = self._strip_thinking(ans)
                     res.append(ans)
                     self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
                     pbar.update(1)

@@ -30,7 +30,6 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default=None)
     image_folder: str = field(default=None)
-    max_image_tokens: Optional[int] = field(default=None)
     system_message: str = field(default="You are a helpful assistant.")
 
 
@@ -470,7 +469,6 @@ def main() -> None:
     vision_packer = VisionPacker(
         processor=processor,
         vision_config=model.config.vision_config,
-        max_image_tokens=data_args.max_image_tokens,
     )
     train_dataset = LazySupervisedDataset(
         data_path=data_args.data_path,
