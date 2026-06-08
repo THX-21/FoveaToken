@@ -1,30 +1,24 @@
-"""Fixed-token Fovea model on top of HF LLaVA-NeXT."""
+"""Fixed-token Fovea model on top of the transformers Qwen3.5 multimodal model."""
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import init
-from typing import TypedDict
 
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
-from transformers.models.llama.modeling_llama import LlamaRMSNorm
-from transformers.models.llava_next.configuration_llava_next import LlavaNextConfig
-from transformers.models.llava_next.modeling_llava_next import (
-    LlavaNextCausalLMOutputWithPast,
-    LlavaNextModel,
-    LlavaNextPreTrainedModel,
-    get_anyres_image_grid_shape,
-    image_size_to_num_patches,
-    unpad_image,
+from transformers import Qwen3_5Model, Qwen3_5PreTrainedModel
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5CausalLMOutputWithPast,
+    Qwen3_5RMSNorm,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import can_return_tuple
+from transformers.utils import TransformersKwargs, can_return_tuple
 
 from .configuration_fovea import FoveaConfig
 
 
-class KwargsForCausalLM(TypedDict, total=False):
+class KwargsForCausalLM(TransformersKwargs, total=False):
     pass
 
 
@@ -127,42 +121,17 @@ def _torch_chunk_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
-class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
-    """LLaVA-NeXT LM with 64 fixed fovea query tokens inserted after `<fovea>`."""
+class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
+    """Qwen3.5 multimodal LM with 64 fixed fovea vectors inserted after `<fovea>`."""
 
     config_class = FoveaConfig
-    _checkpoint_conversion_mapping = {
-        "^language_model.model": "model.language_model",
-        "^vision_tower": "model.vision_tower",
-        "^multi_modal_projector": "model.multi_modal_projector",
-        "^image_newline": "model.image_newline",
-        "^language_model.lm_head": "lm_head",
-    }
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     accepts_loss_kwargs = False
     config: FoveaConfig
 
     def __init__(self, config):
         super().__init__(config)
-        llava_config_dict = config.to_dict()
-        for key in (
-            "fovea_num_tokens",
-            "fovea_lambda_align",
-            "fovea_align_eps",
-            "fovea_align_alpha",
-            "fovea_align_beta",
-            "fovea_input_base_pool",
-            "fovea_input_highres_pool",
-            "fovea_retrieve_pool",
-            "fovea_auto_retrieve_on_answer_start",
-            "fovea_token_id",
-        ):
-            llava_config_dict.pop(key, None)
-        llava_config_dict["model_type"] = "llava_next"
-        llava_config = LlavaNextConfig(**llava_config_dict)
-        for attr in ("bos_token_id", "eos_token_id", "pad_token_id"):
-            setattr(llava_config, attr, getattr(config, attr, getattr(config.text_config, attr, None)))
-        self.model = LlavaNextModel(llava_config)
+        self.model = Qwen3_5Model(config)
         hidden_size = config.text_config.hidden_size
         self.lm_head = nn.Linear(hidden_size, config.text_config.vocab_size, bias=False)
 
@@ -177,8 +146,8 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         self.fovea_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.fovea_v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.fovea_o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.fovea_q_norm = LlamaRMSNorm(self.fovea_head_dim, eps=eps)
-        self.fovea_k_norm = LlamaRMSNorm(self.fovea_head_dim, eps=eps)
+        self.fovea_q_norm = Qwen3_5RMSNorm(self.fovea_head_dim, eps=eps)
+        self.fovea_k_norm = Qwen3_5RMSNorm(self.fovea_head_dim, eps=eps)
         self.fovea_ssm_in_proj_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=False)
         self.fovea_ssm_in_proj_z = nn.Linear(hidden_size, hidden_size, bias=False)
         self.fovea_ssm_in_proj_b = nn.Linear(hidden_size, self.fovea_num_heads, bias=False)
@@ -220,15 +189,6 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model.get_decoder()
-
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, LlavaNextModel)):
-            params = list(module.parameters(recurse=False))
-            buffers = list(module.buffers(recurse=False))
-            if params or buffers:
-                if all(getattr(t, "_is_hf_initialized", False) for t in params + buffers):
-                    return
-        super()._init_weights(module)
 
     @torch.no_grad()
     def _init_fovea_modules(self) -> None:
@@ -313,231 +273,73 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             self.fovea_ssm_out_proj.weight,
             self.fovea_ssm_norm.weight,
         )
-        vision_tensors = (
-            self.model.multi_modal_projector.linear_1.weight,
-            self.model.multi_modal_projector.linear_1.bias,
-            self.model.multi_modal_projector.linear_2.weight,
-            self.model.multi_modal_projector.linear_2.bias,
-        )
-        for tensor in fovea_tensors + vision_tensors:
+        for tensor in fovea_tensors:
             anchor = anchor + tensor.float().sum().to(device=reference.device) * 0.0
-        vision_module = self.model.vision_tower
-        for param in vision_module.parameters():
+        for param in self.model.visual.parameters():
             anchor = anchor + param.float().sum().to(device=reference.device) * 0.0
         return anchor.to(dtype=reference.dtype)
 
-    def _pool_spatial_feature_grid(self, feature_grid: torch.Tensor, pool_size: int) -> torch.Tensor:
-        pool_size = int(pool_size)
-        if pool_size <= 1:
-            return feature_grid
-        channels, height, width = feature_grid.shape
-        pad_h = (pool_size - height % pool_size) % pool_size
-        pad_w = (pool_size - width % pool_size) % pool_size
-        feature = F.pad(feature_grid.unsqueeze(0), (0, pad_w, 0, pad_h))
-        mask = feature_grid.new_ones((1, 1, height, width))
-        mask = F.pad(mask, (0, pad_w, 0, pad_h))
-        pooled = F.avg_pool2d(feature, kernel_size=pool_size, stride=pool_size)
-        pooled_mask = F.avg_pool2d(mask, kernel_size=pool_size, stride=pool_size).clamp_min(1e-6)
-        return (pooled / pooled_mask).squeeze(0)
+    def get_video_features(self, pixel_values_videos: torch.FloatTensor, video_grid_thw: torch.LongTensor | None = None, **kwargs: Unpack[KwargsForCausalLM]):
+        return self.model.get_video_features(pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thw, **kwargs)
 
-    def _pool_flat_square_features(self, features: torch.Tensor, grid_size: int, pool_size: int) -> torch.Tensor:
-        if int(pool_size) <= 1:
-            return features
-        grid = features.view(grid_size, grid_size, -1).permute(2, 0, 1).contiguous()
-        pooled = self._pool_spatial_feature_grid(grid, pool_size)
-        return pooled.flatten(1, 2).transpose(0, 1).contiguous()
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None, **kwargs: Unpack[KwargsForCausalLM]):
+        return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
-    def _pack_image_features_pooled(
-        self,
-        image_features,
-        image_sizes,
-        *,
-        base_pool: int,
-        highres_pool: int,
-        include_base: bool,
-        include_newline: bool,
-    ):
-        new_image_features = []
-        feature_lens = []
-        grid_size = self.config.vision_config.image_size // self.config.vision_config.patch_size
-        for image_idx, image_feature in enumerate(image_features):
-            if image_feature.shape[0] > 1:
-                base_image_feature = self._pool_flat_square_features(image_feature[0], grid_size, base_pool)
-                highres_feature = image_feature[1:]
-                num_patch_height, num_patch_width = get_anyres_image_grid_shape(
-                    image_sizes[image_idx],
-                    self.config.image_grid_pinpoints,
-                    self.config.vision_config.image_size,
-                )
-                highres_feature = highres_feature.view(num_patch_height, num_patch_width, grid_size, grid_size, -1)
-                highres_feature = highres_feature.permute(4, 0, 2, 1, 3).contiguous()
-                highres_feature = highres_feature.flatten(1, 2).flatten(2, 3)
-                highres_feature = unpad_image(highres_feature, image_sizes[image_idx])
-                highres_feature = self._pool_spatial_feature_grid(highres_feature, highres_pool)
-                if include_newline:
-                    highres_feature = torch.cat(
-                        (
-                            highres_feature,
-                            self.model.image_newline[:, None, None]
-                            .expand(*highres_feature.shape[:-1], 1)
-                            .to(highres_feature.device, highres_feature.dtype),
-                        ),
-                        dim=-1,
-                    )
-                highres_feature = highres_feature.flatten(1, 2).transpose(0, 1).contiguous()
-                if include_base:
-                    image_feature = torch.cat((base_image_feature, highres_feature), dim=0)
-                else:
-                    image_feature = highres_feature
-            else:
-                image_feature = self._pool_flat_square_features(image_feature[0], grid_size, base_pool)
-                if include_newline:
-                    image_feature = torch.cat((image_feature, self.model.image_newline[None].to(image_feature)), dim=0)
-                if not include_base:
-                    image_feature = image_feature[:0]
-            new_image_features.append(image_feature)
-            feature_lens.append(image_feature.size(0))
-        feature_lens = torch.tensor(feature_lens, dtype=torch.long, device=image_features[0].device)
-        return new_image_features, feature_lens
-
-    def get_image_features(
-        self,
-        pixel_values: torch.FloatTensor,
-        image_sizes: torch.Tensor,
-        vision_feature_layer=None,
-        vision_feature_select_strategy=None,
-        base_pool: int | None = None,
-        highres_pool: int | None = None,
-        include_base: bool = True,
-        include_newline: bool = True,
-    ):
-        return self._get_pooled_image_features(
-            pixel_values=pixel_values,
-            image_sizes=image_sizes,
-            vision_feature_layer=vision_feature_layer,
-            vision_feature_select_strategy=vision_feature_select_strategy,
-            base_pool=base_pool,
-            highres_pool=highres_pool,
-            include_base=include_base,
-            include_newline=include_newline,
-        )
-
-    def _get_main_image_features(
-        self,
-        pixel_values: torch.FloatTensor,
-        image_sizes: torch.Tensor,
-        vision_feature_layer=None,
-        vision_feature_select_strategy=None,
-    ):
-        # Main-image features match original LLaVA-NeXT packing by default.
-        return self._get_pooled_image_features(
-            pixel_values=pixel_values,
-            image_sizes=image_sizes,
-            vision_feature_layer=vision_feature_layer,
-            vision_feature_select_strategy=vision_feature_select_strategy,
-            base_pool=self.config.fovea_input_base_pool,
-            highres_pool=self.config.fovea_input_highres_pool,
-            include_base=True,
-            include_newline=True,
-        )
-
-    def _get_retrieve_image_features(
-        self,
-        retrieve_pixel_values: torch.FloatTensor,
-        retrieve_image_sizes: torch.Tensor,
-    ):
-        # Retrieval memory keeps original tile resolution by default.
-        return self._get_pooled_image_features(
-            pixel_values=retrieve_pixel_values,
-            image_sizes=retrieve_image_sizes,
-            base_pool=self.config.fovea_retrieve_pool,
-            highres_pool=self.config.fovea_retrieve_pool,
-            include_base=False,
-            include_newline=False,
-        )
-
-    def _get_pooled_image_features(
-        self,
-        pixel_values: torch.FloatTensor,
-        image_sizes: torch.Tensor,
-        vision_feature_layer=None,
-        vision_feature_select_strategy=None,
-        base_pool: int | None = None,
-        highres_pool: int | None = None,
-        include_base: bool = True,
-        include_newline: bool = True,
-    ):
-        vision_feature_layer = (
-            vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
-        )
-        vision_feature_select_strategy = (
-            vision_feature_select_strategy
-            if vision_feature_select_strategy is not None
-            else self.config.vision_feature_select_strategy
-        )
-        if vision_feature_select_strategy != "default":
-            raise ValueError("Fovea pooled image features require vision_feature_select_strategy='default'.")
-        base_pool = int(base_pool if base_pool is not None else self.config.fovea_input_base_pool)
-        highres_pool = int(highres_pool if highres_pool is not None else self.config.fovea_input_highres_pool)
-
-        image_num_patches = [
-            image_size_to_num_patches(
-                image_size=imsize,
-                grid_pinpoints=self.config.image_grid_pinpoints,
-                patch_size=self.config.vision_config.image_size,
-            )
-            for imsize in image_sizes
-        ]
-        if pixel_values.dim() == 5:
-            pixel_values = torch.cat([pix_val[:num_patch] for pix_val, num_patch in zip(pixel_values, image_num_patches)], dim=0)
-        elif pixel_values.dim() != 4:
-            raise ValueError(f"pixel_values of shape {pixel_values.shape}, expect to be of 4 or 5 dimensions")
-
-        image_features = self.model.vision_tower(pixel_values, output_hidden_states=True)
-        if isinstance(vision_feature_layer, int):
-            selected_image_feature = image_features.hidden_states[vision_feature_layer]
-        else:
-            selected_image_feature = torch.cat([image_features.hidden_states[layer_idx] for layer_idx in vision_feature_layer], dim=-1)
-        selected_image_feature = selected_image_feature[:, 1:]
-        image_features = self.model.multi_modal_projector(selected_image_feature)
-        image_features = torch.split(image_features, image_num_patches, dim=0)
-        image_features, _ = self._pack_image_features_pooled(
-            image_features,
-            image_sizes,
-            base_pool=base_pool,
-            highres_pool=highres_pool,
-            include_base=include_base,
-            include_newline=include_newline,
-        )
-        return image_features
-
-    def _build_multimodal_embeddings(
+    def _build_multimodal_embeddings_and_positions(
         self,
         input_ids,
+        attention_mask,
         pixel_values,
-        image_sizes,
+        image_grid_thw,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
         input_embeds_override=None,
-        vision_feature_layer=None,
-        vision_feature_select_strategy=None,
     ):
         inputs_embeds = self.get_input_embeddings()(input_ids) if input_embeds_override is None else input_embeds_override
-        image_features = None
-        if pixel_values is not None and pixel_values.size(0) > 0:
-            image_features = self._get_main_image_features(
-                pixel_values=pixel_values,
-                image_sizes=image_sizes,
-                vision_feature_layer=vision_feature_layer,
-                vision_feature_select_strategy=vision_feature_select_strategy,
-            )
-            image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask = input_ids.eq(int(self.config.image_token_index)).unsqueeze(-1).expand_as(inputs_embeds)
-            if inputs_embeds[image_mask].numel() != image_features.numel():
-                raise ValueError(
-                    "Image features and image tokens do not match: "
-                    f"tokens={int(input_ids.eq(int(self.config.image_token_index)).sum())}, features={image_features.shape[0]}"
-                )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
-        return inputs_embeds, image_features
+        image_hidden_states = None
+        if pixel_values is not None:
+            image_outputs = self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, return_dict=True)
+            image_hidden_states = image_outputs.pooler_output
+            image_embeds = torch.cat(image_hidden_states, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.model.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        if pixel_values_videos is not None:
+            video_outputs = self.model.get_video_features(pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thw, return_dict=True)
+            video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = self.model.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+        self.model.rope_deltas = None
+        position_ids = self.model.compute_3d_position_ids(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+        return inputs_embeds, position_ids, image_hidden_states
+
+    def _position_ids_from_embeds(
+        self,
+        input_ids,
+        attention_mask,
+        inputs_embeds,
+        image_grid_thw,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
+    ):
+        self.model.rope_deltas = None
+        return self.model.compute_3d_position_ids(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            mm_token_type_ids=mm_token_type_ids,
+        )
 
     def _language_forward_from_embeds(self, inputs_embeds, attention_mask=None, position_ids=None, **kwargs):
         return self.model.language_model(
@@ -548,10 +350,9 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             **kwargs,
         )
 
-    def _split_retrieve_features_by_sample(self, retrieve_pixel_values, retrieve_image_sizes, retrieve_image_counts):
-        features = self._get_retrieve_image_features(retrieve_pixel_values, retrieve_image_sizes)
-        if hasattr(features, "pooler_output"):
-            features = features.pooler_output
+    def _split_retrieve_features_by_sample(self, retrieve_pixel_values, retrieve_grid_thw, retrieve_image_counts):
+        outputs = self.model.get_image_features(pixel_values=retrieve_pixel_values, image_grid_thw=retrieve_grid_thw, return_dict=True)
+        features = list(outputs.pooler_output)
         counts = retrieve_image_counts.to(device="cpu", dtype=torch.long).tolist()
         per_sample, start = [], 0
         for count in counts:
@@ -580,16 +381,16 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
     def _build_retrieve_memory(
         self,
         retrieve_pixel_values,
-        retrieve_image_sizes,
+        retrieve_grid_thw,
         retrieve_patch_boxes,
         retrieve_image_counts,
         batch_size,
         device=None,
         dtype=None,
     ):
-        if retrieve_pixel_values is None or retrieve_image_sizes is None or retrieve_patch_boxes is None or retrieve_image_counts is None:
-            raise ValueError("Fovea retrieval requires retrieve_pixel_values, retrieve_image_sizes, retrieve_patch_boxes, and retrieve_image_counts.")
-        memories = self._split_retrieve_features_by_sample(retrieve_pixel_values, retrieve_image_sizes, retrieve_image_counts)
+        if retrieve_pixel_values is None or retrieve_grid_thw is None or retrieve_patch_boxes is None or retrieve_image_counts is None:
+            raise ValueError("Fovea retrieval requires retrieve_pixel_values, retrieve_grid_thw, retrieve_patch_boxes, and retrieve_image_counts.")
+        memories = self._split_retrieve_features_by_sample(retrieve_pixel_values, retrieve_grid_thw, retrieve_image_counts)
         if len(memories) != batch_size:
             raise ValueError("retrieve_image_counts must contain one entry per batch sample.")
         return self._pad_sample_memory(
@@ -614,7 +415,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                 mask[batch_idx, :count] = True
             if box_start + count > patch_boxes.shape[0]:
                 raise ValueError(
-                    "retrieve_patch_boxes is shorter than the LLaVA-NeXT retrieval memory: "
+                    "retrieve_patch_boxes is shorter than the Qwen3.5 retrieval memory: "
                     f"need {box_start + count}, got {patch_boxes.shape[0]}."
                 )
             if count > 0:
@@ -622,7 +423,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             box_start += count
         if box_start != patch_boxes.shape[0]:
             raise ValueError(
-                "retrieve_patch_boxes must match the LLaVA-NeXT retrieval memory length exactly: "
+                "retrieve_patch_boxes must match the Qwen3.5 retrieval memory length exactly: "
                 f"used {box_start}, got {patch_boxes.shape[0]}."
             )
         return memory, mask, boxes
@@ -635,7 +436,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         if attention_mask is not None:
             text_mask &= attention_mask.to(device=device).bool()
         if input_ids is not None:
-            text_mask &= input_ids.to(device=device).ne(int(self.config.image_token_index))
+            text_mask &= input_ids.to(device=device).ne(int(self.config.image_token_id))
         if fovea_positions.numel() == 0:
             return hidden_states.new_empty((0, num_fovea, hidden_states.shape[-1]))
 
@@ -800,8 +601,49 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                     new_labels[batch_idx, dst_cursor : dst_cursor + tail_len] = labels[batch_idx, src_cursor:]
         return new_embeds, new_attention, new_labels
 
+    def _expand_position_ids_with_fovea(self, position_ids, attention_mask, fovea_positions):
+        if position_ids is None:
+            return None
+        streams, batch_size, seq_len = position_ids.shape
+        num_fovea = int(self.config.fovea_num_tokens)
+        by_batch: list[list[int]] = [[] for _ in range(batch_size)]
+        for batch_idx, token_pos in fovea_positions.to(device="cpu", dtype=torch.long).tolist():
+            if 0 <= batch_idx < batch_size and 0 <= token_pos < seq_len:
+                by_batch[batch_idx].append(token_pos)
+        for items in by_batch:
+            items.sort()
+        lengths = [seq_len + len(items) * num_fovea for items in by_batch]
+        max_len = max(lengths)
+        expanded = position_ids.new_zeros((streams, batch_size, max_len))
+        for batch_idx, items in enumerate(by_batch):
+            src_cursor = 0
+            dst_cursor = 0
+            offset = 0
+            for token_pos in items:
+                copy_len = token_pos - src_cursor + 1
+                if copy_len > 0:
+                    expanded[:, batch_idx, dst_cursor : dst_cursor + copy_len] = position_ids[
+                        :, batch_idx, src_cursor : token_pos + 1
+                    ] + offset
+                    dst_cursor += copy_len
+                base = expanded[:, batch_idx, dst_cursor - 1 : dst_cursor]
+                delta = torch.arange(1, num_fovea + 1, device=position_ids.device, dtype=position_ids.dtype).view(1, -1)
+                expanded[:, batch_idx, dst_cursor : dst_cursor + num_fovea] = base + delta
+                dst_cursor += num_fovea
+                offset += num_fovea
+                src_cursor = token_pos + 1
+            tail_len = seq_len - src_cursor
+            if tail_len > 0:
+                expanded[:, batch_idx, dst_cursor : dst_cursor + tail_len] = position_ids[:, batch_idx, src_cursor:] + offset
+        return expanded
+
     def _cached_decode_position_ids(self, attention_mask, num_new_tokens: int = 1):
-        return attention_mask.long().cumsum(-1)[:, -int(num_new_tokens) :] - 1
+        num_new_tokens = int(num_new_tokens)
+        position_ids = attention_mask.long().cumsum(-1)[:, -num_new_tokens:] - 1
+        position_ids = position_ids.clamp_min(0).view(1, attention_mask.shape[0], num_new_tokens).repeat(3, 1, 1)
+        if self.model.rope_deltas is not None:
+            position_ids = position_ids + self.model.rope_deltas.to(position_ids.device).view(1, -1, 1)
+        return position_ids
 
     def _sample_next_token(self, logits, *, do_sample: bool, temperature=None, top_p=None, top_k=None):
         if not do_sample:
@@ -839,9 +681,12 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         input_ids,
         attention_mask=None,
         pixel_values=None,
-        image_sizes=None,
+        image_grid_thw=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
         retrieve_pixel_values=None,
-        retrieve_image_sizes=None,
+        retrieve_grid_thw=None,
         retrieve_patch_boxes=None,
         retrieve_image_counts=None,
         max_new_tokens=128,
@@ -872,12 +717,20 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
 
         output_input_ids = input_ids
         model_input_ids = input_ids
-        inputs_embeds, _ = self._build_multimodal_embeddings(model_input_ids, pixel_values, image_sizes)
+        inputs_embeds, position_ids, _ = self._build_multimodal_embeddings_and_positions(
+            model_input_ids,
+            attention_mask,
+            pixel_values,
+            image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
+        )
         retrieve_memory_cache = None
         if retrieve_pixel_values is not None:
             retrieve_memory_cache = self._build_retrieve_memory(
                 retrieve_pixel_values,
-                retrieve_image_sizes,
+                retrieve_grid_thw,
                 retrieve_patch_boxes,
                 retrieve_image_counts,
                 input_ids.shape[0],
@@ -893,7 +746,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         if fovea_id is not None and retrieve_memory_cache is not None:
             prompt_positions = torch.nonzero(model_input_ids.eq(int(fovea_id)), as_tuple=False)
             if prompt_positions.numel() > 0:
-                prompt_outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask=attention_mask, **model_kwargs)
+                prompt_outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask=attention_mask, position_ids=position_ids, **model_kwargs)
                 prompt_hidden = prompt_outputs[0]
                 text_hidden_history = prompt_hidden
                 trigger_batch = prompt_positions[:, 0].to(device=prompt_hidden.device, dtype=torch.long)
@@ -915,7 +768,12 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                     prompt_positions.to(device=prompt_hidden.device, dtype=torch.long),
                     fovea_vectors,
                 )
-        outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask=attention_mask, **model_kwargs)
+                position_ids = self._expand_position_ids_with_fovea(
+                    position_ids,
+                    attention_mask,
+                    prompt_positions.to(device=prompt_hidden.device, dtype=torch.long),
+                )
+        outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask=attention_mask, position_ids=position_ids, **model_kwargs)
         if text_hidden_history is None:
             text_hidden_history = outputs[0]
         logits = self.lm_head(outputs[0][:, -1:, :]).squeeze(1)
@@ -935,7 +793,6 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                 attention_mask=attention_mask,
                 position_ids=self._cached_decode_position_ids(attention_mask),
                 past_key_values=past_key_values,
-                **model_kwargs,
             )
             auto_hidden = outputs[0][:, -1, :]
             past_key_values = outputs.past_key_values
@@ -1019,7 +876,10 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         past_key_values=None,
         inputs_embeds=None,
         pixel_values=None,
-        image_sizes=None,
+        image_grid_thw=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
         attention_mask=None,
         cache_position=None,
         logits_to_keep=None,
@@ -1036,7 +896,10 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         )
         if cache_position is not None and cache_position[0] == 0:
             model_inputs["pixel_values"] = pixel_values
-            model_inputs["image_sizes"] = image_sizes
+            model_inputs["image_grid_thw"] = image_grid_thw
+            model_inputs["pixel_values_videos"] = pixel_values_videos
+            model_inputs["video_grid_thw"] = video_grid_thw
+            model_inputs["mm_token_type_ids"] = mm_token_type_ids
         return model_inputs
 
     def _fovea_forward(
@@ -1045,9 +908,12 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         attention_mask,
         labels,
         pixel_values,
-        image_sizes,
+        image_grid_thw,
+        pixel_values_videos,
+        video_grid_thw,
+        mm_token_type_ids,
         retrieve_pixel_values,
-        retrieve_image_sizes,
+        retrieve_grid_thw,
         retrieve_patch_boxes,
         retrieve_image_counts,
         fovea_positions,
@@ -1058,16 +924,16 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
     ):
         self._fovea_aux = {}
         self._fovea_aux_history = []
-        vision_feature_layer = kwargs.pop("vision_feature_layer", None)
-        vision_feature_select_strategy = kwargs.pop("vision_feature_select_strategy", None)
-        embeds_a, _ = self._build_multimodal_embeddings(
+        embeds_a, position_ids_a, image_hidden_states = self._build_multimodal_embeddings_and_positions(
             input_ids,
+            attention_mask,
             pixel_values,
-            image_sizes,
-            vision_feature_layer=vision_feature_layer,
-            vision_feature_select_strategy=vision_feature_select_strategy,
+            image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
         )
-        outputs_a = self._language_forward_from_embeds(embeds_a, attention_mask=attention_mask, **kwargs)
+        outputs_a = self._language_forward_from_embeds(embeds_a, attention_mask=attention_mask, position_ids=position_ids_a, **kwargs)
         hidden_a = outputs_a[0]
         fovea_positions = fovea_positions.to(device=hidden_a.device, dtype=torch.long)
         trigger_batch = fovea_positions[:, 0]
@@ -1080,7 +946,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
 
         memory = self._build_retrieve_memory(
             retrieve_pixel_values,
-            retrieve_image_sizes,
+            retrieve_grid_thw,
             retrieve_patch_boxes,
             retrieve_image_counts,
             hidden_a.shape[0],
@@ -1095,7 +961,8 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             fovea_boxes=fovea_boxes,
         )
         embeds_b, attention_b, labels_b = self._expand_with_fovea_tokens(embeds_a, attention_mask, labels, fovea_positions, fovea_vectors)
-        outputs_b = self._language_forward_from_embeds(embeds_b, attention_mask=attention_b, **kwargs)
+        position_ids_b = self._expand_position_ids_with_fovea(position_ids_a, attention_b, fovea_positions)
+        outputs_b = self._language_forward_from_embeds(embeds_b, attention_mask=attention_b, position_ids=position_ids_b, **kwargs)
         hidden_b = outputs_b[0]
         full_logits_b = self.lm_head(hidden_b)
         lm_loss = self.loss_function(logits=full_logits_b, labels=labels_b, vocab_size=full_logits_b.shape[-1])
@@ -1109,13 +976,13 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             "fovea_attn_mean": self._fovea_aux.get("fovea_attn_mean"),
         }
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        return LlavaNextCausalLMOutputWithPast(
+        return Qwen3_5CausalLMOutputWithPast(
             loss=loss,
             logits=full_logits_b[:, slice_indices, :],
             past_key_values=outputs_b.past_key_values,
             hidden_states=outputs_b.hidden_states,
             attentions=outputs_b.attentions,
-            image_hidden_states=None,
+            image_hidden_states=image_hidden_states,
         )
 
     @can_return_tuple
@@ -1123,7 +990,10 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         self,
         input_ids: torch.LongTensor = None,
         pixel_values: torch.FloatTensor = None,
-        image_sizes: torch.LongTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
@@ -1134,7 +1004,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         output_hidden_states: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         retrieve_pixel_values: torch.Tensor | None = None,
-        retrieve_image_sizes: torch.LongTensor | None = None,
+        retrieve_grid_thw: torch.LongTensor | None = None,
         retrieve_patch_boxes: torch.Tensor | None = None,
         retrieve_image_counts: torch.Tensor | None = None,
         fovea_positions: torch.LongTensor | None = None,
@@ -1142,37 +1012,23 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         fovea_boxes: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[KwargsForCausalLM],
-    ) -> tuple | LlavaNextCausalLMOutputWithPast:
+    ) -> tuple | Qwen3_5CausalLMOutputWithPast:
         if (
             retrieve_pixel_values is None
-            and retrieve_image_sizes is None
+            and retrieve_grid_thw is None
             and retrieve_patch_boxes is None
             and retrieve_image_counts is None
             and fovea_positions is None
             and fovea_box_indices is None
             and fovea_boxes is None
         ):
-            output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-            output_hidden_states = (
-                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-            )
-            vision_feature_layer = kwargs.pop("vision_feature_layer", None)
-            vision_feature_select_strategy = kwargs.pop("vision_feature_select_strategy", None)
-            vision_feature_layer = (
-                vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
-            )
-            vision_feature_select_strategy = (
-                vision_feature_select_strategy
-                if vision_feature_select_strategy is not None
-                else self.config.vision_feature_select_strategy
-            )
-
             outputs = self.model(
                 input_ids,
                 pixel_values=pixel_values,
-                image_sizes=image_sizes,
-                vision_feature_layer=vision_feature_layer,
-                vision_feature_select_strategy=vision_feature_select_strategy,
+                image_grid_thw=image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -1195,7 +1051,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                 )
                 loss = loss + self._unused_param_zero_anchor(loss)
 
-            return LlavaNextCausalLMOutputWithPast(
+            return Qwen3_5CausalLMOutputWithPast(
                 loss=loss,
                 logits=logits,
                 past_key_values=outputs.past_key_values,
@@ -1218,9 +1074,12 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                 attention_mask=attention_mask,
                 labels=labels,
                 pixel_values=pixel_values,
-                image_sizes=image_sizes,
+                image_grid_thw=image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
                 retrieve_pixel_values=retrieve_pixel_values,
-                retrieve_image_sizes=retrieve_image_sizes,
+                retrieve_grid_thw=retrieve_grid_thw,
                 retrieve_patch_boxes=retrieve_patch_boxes,
                 retrieve_image_counts=retrieve_image_counts,
                 fovea_positions=fovea_positions,
@@ -1230,15 +1089,15 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                 **model_kwargs,
             )
 
-        vision_feature_layer = model_kwargs.pop("vision_feature_layer", None)
-        vision_feature_select_strategy = model_kwargs.pop("vision_feature_select_strategy", None)
         if inputs_embeds is None:
-            inputs_embeds, image_hidden_states = self._build_multimodal_embeddings(
+            inputs_embeds, position_ids, image_hidden_states = self._build_multimodal_embeddings_and_positions(
                 input_ids,
+                attention_mask,
                 pixel_values,
-                image_sizes,
-                vision_feature_layer=vision_feature_layer,
-                vision_feature_select_strategy=vision_feature_select_strategy,
+                image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
             )
         else:
             image_hidden_states = None
@@ -1256,7 +1115,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
             loss = loss + self._unused_param_zero_anchor(loss)
-        return LlavaNextCausalLMOutputWithPast(
+        return Qwen3_5CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,

@@ -142,19 +142,20 @@ def _prepare_simple_inputs(model, visuals, question: str):
     inputs = model.processor(
         text=texts,
         images=list(visuals),
+        return_mm_token_type_ids=True,
         return_tensors="pt",
     )
     if getattr(model, "vision_packer", None) is not None and visuals and not getattr(model, "disable_fovea_retrieval", False):
         retrieve_pixels = []
-        retrieve_sizes = []
+        retrieve_grids = []
         retrieve_boxes = []
         for visual in visuals:
-            pixels, image_sizes, boxes = model.vision_packer.pack_retrieve(visual)
+            pixels, grid, boxes = model.vision_packer.pack_retrieve(visual, getattr(model, "retrieve_max_image_tokens", None))
             retrieve_pixels.append(pixels)
-            retrieve_sizes.append(image_sizes)
+            retrieve_grids.append(grid)
             retrieve_boxes.append(boxes)
         inputs["retrieve_pixel_values"] = torch.cat(retrieve_pixels, dim=0)
-        inputs["retrieve_image_sizes"] = torch.cat(retrieve_sizes, dim=0)
+        inputs["retrieve_grid_thw"] = torch.stack(retrieve_grids, dim=0)
         inputs["retrieve_patch_boxes"] = torch.cat(retrieve_boxes, dim=0)
         inputs["retrieve_image_counts"] = torch.tensor([len(visuals)], dtype=torch.long)
     return {
@@ -174,9 +175,8 @@ def _decode_generated_text(model, full_ids: torch.Tensor, prompt_len: int) -> st
 
 def load_train_sample(args):
     from fovea_token import FoveaForConditionalGeneration
-    from fovea_token.configuration_fovea import sync_expanded_image_grid_pinpoints
     from fovea_token.tokenizers.tokenization_fovea import add_fovea_tokens, sync_fovea_token_ids
-    from fovea_token.train.data import DataCollatorForLlavaNextSFT, LazySupervisedDataset, VisionPacker
+    from fovea_token.train.data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
     from transformers import AutoProcessor, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
@@ -192,11 +192,10 @@ def load_train_sample(args):
     if len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
         model.resize_token_embeddings(len(tokenizer))
     sync_fovea_token_ids(model.config, tokenizer)
-    sync_expanded_image_grid_pinpoints(model.config, processor)
-    processor.config = model.config
-    processor.patch_size = getattr(model.config.vision_config, "patch_size", processor.patch_size)
-    processor.vision_feature_select_strategy = model.config.vision_feature_select_strategy
-    model.config.image_token_index = tokenizer.convert_tokens_to_ids(getattr(processor, "image_token", "<image>"))
+    model.config.image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
+    model.config.vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    model.config.vision_end_token_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
     model.eval()
 
     packer = VisionPacker(processor=processor, vision_config=model.config.vision_config)
@@ -209,7 +208,7 @@ def load_train_sample(args):
         image_token_id=model.config.image_token_id,
     )
     item = dataset[args.index]
-    batch = DataCollatorForLlavaNextSFT(tokenizer=tokenizer, model_max_length=32768)([item])
+    batch = DataCollatorForQwen3_5SFT(tokenizer=tokenizer, model_max_length=32768)([item])
     batch = {k: v.to(args.device) if hasattr(v, "to") else v for k, v in batch.items()}
     with torch.no_grad():
         model(**{k: v for k, v in batch.items() if v is not None})

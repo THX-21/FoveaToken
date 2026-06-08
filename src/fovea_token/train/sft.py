@@ -9,15 +9,14 @@ from transformers.trainer_pt_utils import get_parameter_names
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
 from fovea_token import FoveaForConditionalGeneration
-from fovea_token.configuration_fovea import sync_expanded_image_grid_pinpoints
 from fovea_token.tokenizers.tokenization_fovea import FOVEA_SPECIAL_TOKENS, add_fovea_tokens, sync_fovea_token_ids
 
-from .data import DataCollatorForLlavaNextSFT, LazySupervisedDataset, VisionPacker
+from .data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
 
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: str = field(default="llava-hf/llava-v1.6-vicuna-7b-hf")
+    model_name_or_path: str = field(default="Qwen/Qwen3.5-4B")
     lora_enable: bool = field(default=True)
     lora_r: int = field(default=64)
     lora_alpha: int = field(default=16)
@@ -439,12 +438,10 @@ def main() -> None:
     if len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
         model.resize_token_embeddings(len(tokenizer))
     sync_fovea_token_ids(model.config, tokenizer)
-    model.config.image_token_index = tokenizer.convert_tokens_to_ids(getattr(processor, "image_token", "<image>"))
-    pinpoints = sync_expanded_image_grid_pinpoints(model.config, processor)
-    processor.config = model.config
-    processor.patch_size = getattr(model.config.vision_config, "patch_size", processor.patch_size)
-    processor.vision_feature_select_strategy = model.config.vision_feature_select_strategy
-    print(f"Using LLaVA-NeXT image_grid_pinpoints: {pinpoints}")
+    model.config.image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
+    model.config.vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    model.config.vision_end_token_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
     print_loading_summary(model, loading_info, source_label=loading_source_label)
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     if tokenizer.pad_token is None:
@@ -480,7 +477,7 @@ def main() -> None:
         system_message=data_args.system_message,
         model_max_length=training_args.model_max_length,
     )
-    data_collator = DataCollatorForLlavaNextSFT(
+    data_collator = DataCollatorForQwen3_5SFT(
         tokenizer=tokenizer,
         model_max_length=training_args.model_max_length,
     )

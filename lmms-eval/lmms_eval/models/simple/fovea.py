@@ -1,7 +1,7 @@
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import torch
 from accelerate import Accelerator, DistributedType
@@ -15,9 +15,9 @@ from lmms_eval import utils
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
+from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
 
 from fovea_token import FoveaForConditionalGeneration
-from fovea_token.configuration_fovea import sync_expanded_image_grid_pinpoints
 from fovea_token.train.data import VisionPacker
 from fovea_token.train.sft import get_visual_module
 from fovea_token.tokenizers.tokenization_fovea import add_fovea_tokens, sync_fovea_token_ids
@@ -33,15 +33,8 @@ MODEL_WEIGHT_FILENAMES = {
 
 
 @register_model("fovea")
-class Fovea(lmms):
+class Fovea(Qwen3_VL):
     """lmms-eval adapter for the local Fovea implementation."""
-
-    DEFAULT_GEN_KWARGS = {
-        "max_new_tokens": 1024,
-        "temperature": 0.4,
-        "top_p": None,
-        "num_beams": 1,
-    }
 
     @staticmethod
     def _pick_torch_dtype():
@@ -82,7 +75,7 @@ class Fovea(lmms):
 
     def __init__(
         self,
-        pretrained: str = "llava-hf/llava-v1.6-vicuna-7b-hf",
+        pretrained: str = "Qwen/Qwen3.5-4B",
         peft: Optional[str] = None,
         device: Optional[str] = "cuda",
         device_map: Optional[str] = "auto",
@@ -91,8 +84,10 @@ class Fovea(lmms):
         attn_implementation: Optional[str] = "sdpa",
         system_prompt: Optional[str] = "You are a helpful assistant.",
         interleave_visuals: Optional[bool] = False,
-        enable_thinking: Optional[bool] = True,
+        enable_thinking: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
+        max_image_tokens: int | None = 512,
+        retrieve_max_image_tokens: int | None = 4096,
         disable_fovea_retrieval: Optional[bool] = False,
         fovea_auto_retrieve_on_answer_start: Optional[bool] = True,
         **kwargs,
@@ -123,14 +118,17 @@ class Fovea(lmms):
         }
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
-        tokenizer_source = load_pretrained
-        self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
         self._model = FoveaForConditionalGeneration.from_pretrained(load_pretrained, **model_kwargs)
+        tokenizer_source = load_pretrained
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
         add_fovea_tokens(self._tokenizer)
         if len(self._tokenizer) != self._model.get_input_embeddings().weight.shape[0]:
             self._model.resize_token_embeddings(len(self._tokenizer))
         sync_fovea_token_ids(self._model.config, self._tokenizer)
+        self._model.config.image_token_id = self._tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        self._model.config.video_token_id = self._tokenizer.convert_tokens_to_ids("<|video_pad|>")
+        self._model.config.vision_start_token_id = self._tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        self._model.config.vision_end_token_id = self._tokenizer.convert_tokens_to_ids("<|vision_end|>")
         if load_peft is not None:
             from peft import PeftModel
 
@@ -143,24 +141,22 @@ class Fovea(lmms):
         self._model = self._model.eval()
         self.processor = AutoProcessor.from_pretrained(tokenizer_source)
         self.processor.tokenizer = self._tokenizer
-        sync_expanded_image_grid_pinpoints(self._model.config, self.processor)
-        self.processor.config = self._model.config
-        self.processor.patch_size = getattr(self._model.config.vision_config, "patch_size", self.processor.patch_size)
-        self.processor.vision_feature_select_strategy = self._model.config.vision_feature_select_strategy
-        self._model.config.image_token_index = self._tokenizer.convert_tokens_to_ids(getattr(self.processor, "image_token", "<image>"))
         vision_packer = VisionPacker(
             processor=self.processor,
             vision_config=self._model.config.vision_config,
+            max_image_tokens=max_image_tokens,
         )
         self.vision_packer = vision_packer
-        self.processor._get_number_of_features = self._get_pooled_number_of_features
+        self.retrieve_max_image_tokens = retrieve_max_image_tokens
+        self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
+        self.fovea_auto_retrieve_on_answer_start = bool(fovea_auto_retrieve_on_answer_start)
 
         self.enable_thinking = enable_thinking
-        self.fovea_auto_retrieve_on_answer_start = bool(fovea_auto_retrieve_on_answer_start)
         if reasoning_prompt:
             self.reasoning_prompt = reasoning_prompt.replace("\\n", "\n")
         else:
             self.reasoning_prompt = None
+
         self.system_prompt = system_prompt
         self.interleave_visuals = interleave_visuals
         self._config = self.model.config
@@ -185,130 +181,6 @@ class Fovea(lmms):
         else:
             self._rank = 0
             self._world_size = 1
-
-    def _apply_chat_template(self, batched_messages):
-        texts = []
-        for messages in batched_messages:
-            messages = self._normalize_messages_for_template(messages)
-            if hasattr(self.processor, "apply_chat_template"):
-                text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                texts.append(self._apply_thinking_prefill(text))
-                continue
-            parts = []
-            for message in messages:
-                role = message.get("role")
-                content = self._message_text(message.get("content", ""))
-                if role == "system":
-                    parts.append(content.strip())
-                    continue
-                prefix = "USER: " if role == "user" else "ASSISTANT: "
-                parts.append(f"{prefix}{content}")
-            text = "\n".join(part for part in parts if part) + "\nASSISTANT: "
-            texts.append(self._apply_thinking_prefill(text))
-        return texts
-
-    @staticmethod
-    def _normalize_messages_for_template(messages):
-        normalized = []
-        for message in messages:
-            item = dict(message)
-            content = item.get("content", "")
-            if isinstance(content, str):
-                item["content"] = [{"type": "text", "text": content}]
-            normalized.append(item)
-        return normalized
-
-    @staticmethod
-    def _message_text(content):
-        if isinstance(content, list):
-            return "".join("<image>\n" if item.get("type") == "image" else str(item.get("text", "")) for item in content)
-        return str(content)
-
-    def _apply_thinking_prefill(self, text: str) -> str:
-        if self.enable_thinking:
-            return text + "<think>"
-        # return text + "<think>\n\n</think>"
-        return text
-
-    @property
-    def config(self):
-        return self._config
-
-    @property
-    def tokenizer(self):
-        return self._tokenizer
-
-    @property
-    def model(self):
-        if hasattr(self, "accelerator"):
-            return self.accelerator.unwrap_model(self._model)
-        return self._model
-
-    @property
-    def eot_token_id(self):
-        return self.tokenizer.eos_token_id
-
-    @property
-    def max_length(self):
-        return self._max_length
-
-    @property
-    def batch_size(self):
-        return self.batch_size_per_gpu
-
-    @property
-    def device(self):
-        return self._device
-
-    @property
-    def rank(self):
-        return self._rank
-
-    @property
-    def world_size(self):
-        return self._world_size
-
-    def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
-        raise NotImplementedError("Loglikelihood is not implemented for Fovea")
-
-    def _build_eos_token_ids(self):
-        eos_token_ids = []
-        for token_id in (self.tokenizer.eos_token_id,):
-            if token_id is None or token_id < 0 or token_id in eos_token_ids:
-                continue
-            eos_token_ids.append(int(token_id))
-        return eos_token_ids[0] if len(eos_token_ids) == 1 else eos_token_ids
-
-    def _get_pooled_number_of_features(self, orig_height: int, orig_width: int, _height: int, _width: int) -> int:
-        count = self.vision_packer.input_feature_count((orig_height, orig_width))
-        if getattr(self.processor, "vision_feature_select_strategy", "default") == "default":
-            count += 1
-        return count
-
-    def _build_generate_kwargs(self, gen_kwargs):
-        current = {**self.DEFAULT_GEN_KWARGS, **gen_kwargs}
-        pad_token_id = self.tokenizer.pad_token_id
-        if current.get("temperature", 0) > 0:
-            current["do_sample"] = True
-        else:
-            current["do_sample"] = False
-            current["temperature"] = None
-            current["top_p"] = None
-            current.pop("top_k", None)
-        generate_kwargs = {
-            "eos_token_id": self._build_eos_token_ids(),
-            "pad_token_id": pad_token_id,
-            "max_new_tokens": current["max_new_tokens"],
-            "use_cache": self.use_cache,
-            "do_sample": current["do_sample"],
-        }
-        for key in ("temperature", "top_p", "top_k", "num_beams"):
-            val = current.get(key)
-            if val is not None:
-                generate_kwargs[key] = val
-        if not self.disable_fovea_retrieval:
-            generate_kwargs["fovea_auto_retrieve_on_answer_start"] = self.fovea_auto_retrieve_on_answer_start
-        return generate_kwargs
 
     def _load_deepspeed_trainables(self, checkpoint_path: str) -> None:
         """Load legacy non-LoRA vision trainables saved alongside a LoRA checkpoint."""
@@ -362,6 +234,12 @@ class Fovea(lmms):
             eval_logger.warning(f"Unexpected non-LoRA trainable keys while loading {state_path}: {unexpected[:20]}")
         eval_logger.info(f"Loaded {len(trainable_state) - len(unexpected)} vision tensors from Deepspeed checkpoint")
 
+    def _build_generate_kwargs(self, gen_kwargs):
+        generate_kwargs = super()._build_generate_kwargs(gen_kwargs)
+        if not self.disable_fovea_retrieval:
+            generate_kwargs["fovea_auto_retrieve_on_answer_start"] = self.fovea_auto_retrieve_on_answer_start
+        return generate_kwargs
+
     def _preprocess_chunk(self, chunk):
         """Build prompts and local processor inputs without HF image processing."""
 
@@ -386,6 +264,8 @@ class Fovea(lmms):
             if "<image>" in context:
                 context = context.replace("<image>", "")
 
+            message = [{"role": "system", "content": self.system_prompt}]
+
             if self.reasoning_prompt:
                 context = context.strip() + self.reasoning_prompt
                 contexts[i] = context
@@ -400,7 +280,12 @@ class Fovea(lmms):
                         processed_visuals.append({"type": "image", "image": visual})
 
             if self.interleave_visuals is False:
-                message = [{"role": "user", "content": processed_visuals + [{"type": "text", "text": context}]}]
+                message.append(
+                    {
+                        "role": "user",
+                        "content": processed_visuals + [{"type": "text", "text": context}],
+                    }
+                )
                 image_inputs.extend(part["image"] for part in processed_visuals)
                 image_counts_per_sample.append(len(processed_visuals))
             else:
@@ -421,7 +306,12 @@ class Fovea(lmms):
                     if placeholder_idx + 1 < len(text_parts) and text_parts[placeholder_idx + 1]:
                         content_parts.append({"type": "text", "text": text_parts[placeholder_idx + 1]})
 
-                message = [{"role": "user", "content": content_parts}]
+                message.append(
+                    {
+                        "role": "user",
+                        "content": content_parts,
+                    }
+                )
                 image_counts_per_sample.append(sample_image_count)
 
             batched_messages.append(message)
@@ -430,6 +320,7 @@ class Fovea(lmms):
         processor_kwargs = {
             "text": texts,
             "images": image_inputs or None,
+            "return_mm_token_type_ids": True,
             "return_tensors": "pt",
         }
         if self.batch_size > 1:
@@ -437,21 +328,21 @@ class Fovea(lmms):
         inputs = self.processor(**processor_kwargs)
         if not self.disable_fovea_retrieval:
             retrieve_pixels = []
-            retrieve_sizes = []
+            retrieve_grids = []
             retrieve_boxes = []
             retrieve_counts = []
             image_cursor = 0
             for count in image_counts_per_sample:
                 retrieve_counts.append(count)
                 for image in image_inputs[image_cursor : image_cursor + count]:
-                    pixels, image_sizes, boxes = self.vision_packer.pack_retrieve(image)
+                    pixels, grid, boxes = self.vision_packer.pack_retrieve(image, self.retrieve_max_image_tokens)
                     retrieve_pixels.append(pixels)
-                    retrieve_sizes.append(image_sizes)
+                    retrieve_grids.append(grid)
                     retrieve_boxes.append(boxes)
                 image_cursor += count
             if retrieve_pixels:
                 inputs["retrieve_pixel_values"] = torch.cat(retrieve_pixels, dim=0)
-                inputs["retrieve_image_sizes"] = torch.cat(retrieve_sizes, dim=0)
+                inputs["retrieve_grid_thw"] = torch.stack(retrieve_grids, dim=0)
                 inputs["retrieve_patch_boxes"] = torch.cat(retrieve_boxes, dim=0)
                 inputs["retrieve_image_counts"] = torch.tensor(retrieve_counts, dtype=torch.long)
 
@@ -496,6 +387,7 @@ class Fovea(lmms):
                     answers[i] = ans
 
                 for ans, context in zip(answers, contexts):
+                    ans = self._strip_thinking(ans)
                     res.append(ans)
                     self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
                     pbar.update(1)
@@ -503,6 +395,3 @@ class Fovea(lmms):
         res = re_ords.get_original(res)
         pbar.close()
         return res
-
-    def generate_until_multi_round(self, requests) -> List[str]:
-        raise NotImplementedError("Multi-round generation is not implemented for Fovea")

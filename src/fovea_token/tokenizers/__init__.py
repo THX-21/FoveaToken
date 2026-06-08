@@ -1,4 +1,11 @@
-from .tokenization_fovea import FOVEA_SPECIAL_TOKENS, FOVEA_TOKEN, THINK_END_TOKEN, THINK_START_TOKEN, add_fovea_tokens, sync_fovea_token_ids
+from .tokenization_fovea import (
+    FOVEA_SPECIAL_TOKENS,
+    FOVEA_TOKEN,
+    THINK_END_TOKEN,
+    THINK_START_TOKEN,
+    add_fovea_tokens,
+    sync_fovea_token_ids,
+)
 
 __all__ = [
     "FOVEA_TOKEN",

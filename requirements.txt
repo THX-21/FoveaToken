@@ -139,7 +139,7 @@ tokenizers
 tomli
 tqdm
 tqdm-multiprocess
-transformers
+transformers>=5.5.0
 transformers-stream-generator
 triton
 typepy

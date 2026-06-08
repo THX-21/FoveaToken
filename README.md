@@ -1,6 +1,6 @@
 # FoveaToken
 
-FoveaToken 是一个基于 `llava-hf/llava-v1.6-vicuna-7b-hf` 的本地多模态实验仓库。当前机制是固定 fovea token 检索：64 个内置 fovea latent 会按 Qwen3.5 GatedDeltaNet 的 q/k/v/beta/g/z 线性 SSM 规则，随普通文本 token hidden states 做 chunk-parallel recurrent 更新；模型生成或读到 `<fovea>` 后，取当前位置对应的 64 个 latent，再用 q/k/v/o 多头注意力从 pooled high-resolution visual memory 聚合出 64 个连续视觉 embedding，并把它们作为虚拟 token 插到 `<fovea>` 后继续推理。
+FoveaToken 是一个基于 transformers 官方 Qwen3.5 多模态模型的本地实验仓库。当前机制是固定 fovea token 检索：64 个内置 fovea latent 会按 Qwen3.5 GatedDeltaNet 的 q/k/v/beta/g/z 线性 SSM 规则，随普通文本 token hidden states 做 chunk-parallel recurrent 更新；模型生成或读到 `<fovea>` 后，取当前位置对应的 64 个 latent，再用 q/k/v/o 多头注意力从 Qwen 图像 token memory 聚合出 64 个连续视觉 embedding，并把它们作为虚拟 token 插到 `<fovea>` 后继续推理。
 
 运行训练和评测时设置：
 
@@ -11,11 +11,9 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 ## 代码结构
 
 - `src/fovea_token/modeling_fovea.py`：`FoveaForConditionalGeneration` 和固定 64-token fovea retrieval。
-- `src/fovea_token/modeling_llava_next.py`：从 transformers 4.53.0 vendored 的 HF LLaVA-NeXT 源码。
-- `src/fovea_token/train/data.py`：训练 parquet 读取、HF LLaVA-NeXT chat template 编码、collator 和 LLaVA-NeXT 图像预处理适配；同时支持本地图片路径和官方 parquet 内嵌图片字节。
+- `src/fovea_token/train/data.py`：训练 parquet 读取、Qwen3.5 chat template 编码、collator 和官方 processor 图像预处理适配；同时支持本地图片路径和 parquet 内嵌图片字节。
 - `src/fovea_token/tokenizers/tokenization_fovea.py`：`<fovea>`、`<think>`、`</think>` token helper。
 - `scripts/preprocess_vgr.py`：把原始 VGR region tag 离线转换成 `<fovea>` 训练 parquet。
-- `scripts/preprocess_llava_next_data.py`：把官方 `lmms-lab/LLaVA-NeXT-Data` 的 `data/train-*.parquet` 转成当前仓库可训练的本地 parquet。
 - `scripts/preprocess_pretrain_data.py`：把 Visual Genome regions 转成固定 fovea grounding parquet；旧 Stage A visual-code LM 已移除。
 - `scripts/visualize_fovea.py`：把 64 个 fovea token 的检索注意力画到原图上；`--task train` 读取训练 parquet，其他任务名直接读取 `lmms-eval` 样本。
 - `scripts/ft3.sh`：VGR 训练入口。
@@ -24,7 +22,9 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 
 ## 本地依赖
 
-模型权重默认入口为 `llava-hf/llava-v1.6-vicuna-7b-hf`，如需完全离线请通过 `FT3_CKPT_PATH` 指到本地 checkpoint 目录。图像数据不会自动下载，`image_folder` 必须包含 VGR `image` 字段对应的相对路径，例如 `ai2d/abc_images/311.png`。
+运行环境需要 `transformers>=5.5.0`，以提供官方 `Qwen3_5Config` / `Qwen3_5Model` / `Qwen3_5ForConditionalGeneration` 和对应 processor。
+
+模型权重默认入口为 `Qwen/Qwen3.5-4B`，如需完全离线请通过 `FT3_CKPT_PATH` 指到本地 checkpoint 目录。当前代码直接从 transformers 导入 Qwen3.5 基模类，不保留本地 Qwen3.5 modeling/processor 实现。图像数据不会自动下载，`image_folder` 必须包含 VGR `image` 字段对应的相对路径，例如 `ai2d/abc_images/311.png`。
 
 默认图像目录：
 
@@ -34,21 +34,10 @@ data/vgr/llava_next_raw_format
 
 ## 训练
 
-默认 LLaVA-NeXT anyres 候选分辨率与原始 LLaVA-NeXT 保持一致，训练和评测会同步写入 model config 与 processor：
+视觉 token 默认策略：
 
-```python
-[
-    [336, 672], [672, 336], [672, 672], [1008, 336], [336, 1008],
-    [1008, 672], [672, 1008], [1344, 672], [672, 1344], [1008, 1008],
-    [1344, 1008], [1008, 1344], [1344, 1344], [1680, 1344], [1344, 1680],
-]
-```
-
-视觉 token 默认压缩策略：
-
-- 初始 LLM 图像上下文：与原始 LLaVA-NeXT 一致，不做额外 pooling。
-- Fovea 视觉池：默认也不做额外 pooling，保持原始 tile 分辨率。
-- Retrieval 仍然只使用 high-res unpadded 特征，不使用 base image tokens 和 newline tokens。
+- 初始 LLM 图像上下文：与 transformers Qwen3.5 processor/model 保持一致。
+- Fovea 视觉池：复用 processor 生成的 Qwen 图像 token，并按 `image_grid_thw` 生成归一化 patch boxes。
 - 推理时默认会在 assistant 开始回答处自动触发一次内部 `<fovea>` 检索；若开启 `enable_thinking=true`，触发位置是 `<think>` 之后而不是之前。可用 `fovea_auto_retrieve_on_answer_start=false` 关闭。
 
 默认训练：
@@ -63,7 +52,7 @@ bash scripts/ft3.sh
 bash scripts/ft3_lora.sh
 ```
 
-训练默认读取离线预处理后的 `data/vgr/preprocessed`，目录模式会读取该目录下全部 parquet。也支持直接读取官方 `LLaVA-NeXT-Data` 的 `data/train-*.parquet`：如果 `image` 列里是内嵌图片对象就直接解码；如果是字符串路径就按 `image_folder` 读取。没有 `fovea_query_boxes` 的样本会按普通图文 SFT 处理。常用环境变量：
+训练默认读取离线预处理后的 `data/vgr/preprocessed`，目录模式会读取该目录下全部 parquet。如果 `image` 列里是内嵌图片对象就直接解码；如果是字符串路径就按 `image_folder` 读取。没有 `fovea_query_boxes` 的样本会按普通图文 SFT 处理。常用环境变量：
 
 - `FT3_DATA_PATH`
 - `FT3_IMAGE_FOLDER`
@@ -78,7 +67,7 @@ bash scripts/ft3_lora.sh
 
 `scripts/ft3_lora.sh` 默认启用 LoRA；`FT3_UNFREEZE_VISION=true` 时只训练 vision tower LoRA，设为 `false` 时 vision tower 完全冻结。`FT3_FREEZE_EMBED_BASE=true` 时冻结 embedding/`lm_head` 的 base vocab rows，只训练 `<fovea>`、`<think>`、`</think>` 新增 token rows。
 
-训练 prompt 使用 checkpoint 自带的 HF `processor.apply_chat_template()` 渲染，和原生 LLaVA-NeXT 推理入口保持一致。图像 `<image>` 占位符仍由本仓库按 pooled image token 数提前展开，避免和默认 processor 图像展开逻辑混用；assistant 内容中的 `<think>`/`</think>` 是本仓库新增的 atomic marker tokens。LLaVA-NeXT 原生没有 thinking chat-template 开关；评测时 `enable_thinking=true` 会在 assistant 生成前预填 `<think>`，否则预填 `<think>\n\n</think>`。
+训练 prompt 使用 checkpoint 自带的 HF `processor.apply_chat_template()` 渲染，和 Qwen3.5 原生推理入口保持一致。图像 `<image>` 占位符仍由本仓库按 `image_grid_thw` 对应 token count 提前展开；assistant 内容中的 `<think>`/`</think>` 是本仓库新增的 atomic marker tokens。
 训练编码阶段如果 chat template 本身没有在 assistant 结尾给出 `eos`，会额外补一个 `eos_token_id`，并把它纳入 LM 监督。
 
 ## 离线预处理
@@ -115,24 +104,7 @@ PYTHONPATH="$PWD/src" python scripts/preprocess_pretrain_data.py \
   --max_samples 8
 ```
 
-把官方 `LLaVA-NeXT-Data` 约 `779k` 的 `data/train-*.parquet` 转成本仓库训练格式：
-
-```bash
-python scripts/preprocess_llava_next_data.py \
-  --input lmms-lab/LLaVA-NeXT-Data \
-  --output data/llava_next/preprocessed \
-  --image_folder data/vgr/llava_next_raw_format \
-  --processed_json data/vgr/llava_next_raw_format/llava_next_raw_format_processed.json
-```
-
-说明：
-
-- 官方 `data/train-*.parquet` 里的 `image` 是内嵌图片对象，不是本仓库训练时直接读取的相对路径。
-- 本脚本会优先用 `llava_next_raw_format_processed.json` 的 `id -> image` 映射恢复相对路径；缺失时再按图片 basename 在 `image_folder` 里回查。
-- 转换后的样本会写成 `fovea_preprocessed=true`、`fovea_query_boxes=[]` 的普通图文 SFT 样本，不包含 `<fovea>` 框监督。
-- 如果只想做冒烟测试，可以加 `--limit_shards 1`。
-
-如果不想转换，也可以直接把官方 `data/train-*.parquet` 传给 `data_path`。当前训练读取逻辑已经支持 parquet 内嵌图片字节。
+当前训练读取逻辑支持 parquet 内嵌图片字节，也支持相对 `image_folder` 的字符串路径。
 
 ## 训练目标
 

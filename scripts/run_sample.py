@@ -98,16 +98,20 @@ def _prepare_simple_inputs(model, visuals, question: str):
     processor_kwargs = {
         "text": texts,
         "images": list(visuals),
+        "return_mm_token_type_ids": True,
         "return_tensors": "pt",
     }
     inputs = model.processor(**processor_kwargs)
 
     if getattr(model, "vision_packer", None) is not None and visuals and not getattr(model, "disable_fovea_retrieval", False):
-        retrieve_pixels, retrieve_sizes, retrieve_boxes = model.vision_packer.pack_retrieve(visuals[0])
+        retrieve_pixels, retrieve_grid, retrieve_boxes = model.vision_packer.pack_retrieve(
+            visuals[0],
+            getattr(model, "retrieve_max_image_tokens", None),
+        )
         import torch
 
         inputs["retrieve_pixel_values"] = retrieve_pixels
-        inputs["retrieve_image_sizes"] = retrieve_sizes
+        inputs["retrieve_grid_thw"] = retrieve_grid.unsqueeze(0)
         inputs["retrieve_patch_boxes"] = retrieve_boxes
         inputs["retrieve_image_counts"] = torch.tensor([1], dtype=torch.long)
 

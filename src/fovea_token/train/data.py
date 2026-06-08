@@ -1,9 +1,7 @@
 import copy
-import io
 import json
 import os
 import re
-from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -12,7 +10,6 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
-from transformers.image_processing_utils import select_best_resolution
 
 from ..tokenizers.tokenization_fovea import FOVEA_TOKEN
 
@@ -22,11 +19,41 @@ Image.MAX_IMAGE_PIXELS = None
 IGNORE_INDEX = -100
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
+DEFAULT_IMAGE_PAD = "<|image_pad|>"
+DEFAULT_VISION_START = "<|vision_start|>"
+DEFAULT_VISION_END = "<|vision_end|>"
 SOT_EOT_IMAGE_RE = re.compile(r"<SOT>\s*(\[[^\]]+\])\s*<EOT>\s*<image>")
 ORPHAN_VGR_TAG_RE = re.compile(r"<SOT>|<EOT>")
 
 
-def training_parquet_paths(data_path: str) -> list[Path]:
+def image_token_count_from_grid(image_grid_thw, merge_size: int) -> int:
+    merge_length = max(int(merge_size), 1) ** 2
+    grid_prod = image_grid_thw.prod()
+    if hasattr(grid_prod, "item"):
+        grid_prod = grid_prod.item()
+    return int(grid_prod // merge_length)
+
+
+def build_visual_placeholder(
+    num_image_tokens: int,
+    image_token: str = DEFAULT_IMAGE_PAD,
+    vision_start_token: str = DEFAULT_VISION_START,
+    vision_end_token: str = DEFAULT_VISION_END,
+) -> str:
+    return f"{vision_start_token}{image_token * int(num_image_tokens)}{vision_end_token}"
+
+
+def build_mm_token_type_ids(input_ids, image_token_id: int, video_token_id: int | None = None):
+    mm_token_type_ids = input_ids.new_zeros(input_ids.shape)
+    mm_token_type_ids[input_ids == image_token_id] = 1
+    if video_token_id is not None:
+        mm_token_type_ids[input_ids == video_token_id] = 2
+    return mm_token_type_ids
+
+
+def load_training_records(data_path: str) -> list[dict[str, Any]]:
+    """Load VGR parquet records from a file or `data/vgr` directory."""
+
     path = Path(data_path)
     if path.is_dir():
         paths = sorted(path.glob("*.parquet"))
@@ -34,36 +61,19 @@ def training_parquet_paths(data_path: str) -> list[Path]:
             raise FileNotFoundError(f"No parquet training files found under {path}.")
     else:
         paths = [path]
+
+    records: list[dict[str, Any]] = []
     for item in paths:
-        if item.suffix != ".parquet":
-            raise ValueError(f"Only parquet training files are supported: {item}")
-    return paths
-
-
-@dataclass(frozen=True)
-class ParquetShard:
-    path: Path
-    start: int
-    stop: int
-
-
-def build_training_shards(data_path: str) -> list[ParquetShard]:
-    try:
-        import pyarrow.parquet as pq
-    except ImportError as exc:
-        raise ImportError("Reading parquet training data requires pandas and pyarrow.") from exc
-
-    shards: list[ParquetShard] = []
-    offset = 0
-    for path in training_parquet_paths(data_path):
-        row_count = int(pq.ParquetFile(path).metadata.num_rows)
-        if row_count <= 0:
-            continue
-        shards.append(ParquetShard(path=path, start=offset, stop=offset + row_count))
-        offset += row_count
-    if not shards:
-        raise FileNotFoundError(f"No non-empty parquet training files found under {data_path}.")
-    return shards
+        if item.suffix == ".parquet":
+            try:
+                import pandas as pd
+            except ImportError as exc:
+                raise ImportError("Reading VGR parquet requires pandas and pyarrow.") from exc
+            frame = pd.read_parquet(item)
+            records.extend(frame.to_dict("records"))
+        else:
+            raise ValueError(f"Only VGR parquet training files are supported: {item}")
+    return records
 
 
 def parse_vgr_box(box_text: str) -> tuple[float, float, float, float]:
@@ -124,149 +134,121 @@ def replace_image_tokens_in_conversations(
     ]
     total_placeholders = sum(sentence["value"].count(DEFAULT_IMAGE_TOKEN) for sentence in conversations)
     if total_placeholders == 1 and len(image_token_groups) > 1:
-        joined_placeholder = "\n".join(DEFAULT_IMAGE_TOKEN * count for group in image_token_groups for count in group)
+        joined_placeholder = "\n".join(build_visual_placeholder(count) for group in image_token_groups for count in group)
         for sentence in conversations:
             value = sentence["value"]
             if DEFAULT_IMAGE_TOKEN in value:
                 sentence["value"] = value.replace(DEFAULT_IMAGE_TOKEN, joined_placeholder, 1)
                 return conversations
 
+    image_index = 0
     for sentence in conversations:
         value = sentence["value"]
-        if DEFAULT_IMAGE_TOKEN not in value:
-            continue
-        pieces = value.split(DEFAULT_IMAGE_TOKEN)
-        if len(pieces) - 1 > len(image_token_groups):
-            raise ValueError("Conversation references more <image> placeholders than the sample provides.")
-        rebuilt = [pieces[0]]
-        for idx, piece in enumerate(pieces[1:]):
-            if idx >= len(image_token_groups):
+        while DEFAULT_IMAGE_TOKEN in value:
+            if image_index >= len(image_token_groups):
                 raise ValueError("Conversation references more <image> placeholders than the sample provides.")
-            placeholder = "".join(DEFAULT_IMAGE_TOKEN * count for count in image_token_groups[idx])
-            rebuilt.append(placeholder)
-            rebuilt.append(piece)
-        sentence["value"] = "".join(rebuilt)
-        image_token_groups = image_token_groups[len(pieces) - 1 :]
-    if image_token_groups:
+            placeholder = "".join(build_visual_placeholder(count) for count in image_token_groups[image_index])
+            value = value.replace(DEFAULT_IMAGE_TOKEN, placeholder, 1)
+            image_index += 1
+        sentence["value"] = value
+    if image_index != len(image_token_groups):
         raise ValueError("Sample provides more images than there are <image> placeholders in the conversation.")
     return conversations
 
 
 def tokenize_text(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
-    """Tokenize without adding tokenizer-managed special tokens."""
+    """Tokenize without adding tokenizer-managed special tokens.
+
+    Chat-template text is rendered by the checkpoint processor, so auto-added
+    BOS/EOS would shift label positions.
+    """
 
     return tokenizer(text, add_special_tokens=False).input_ids
 
 
-def _hf_role(role: str) -> str:
-    role_map = {
-        "human": "user",
-        "user": "user",
-        "gpt": "assistant",
-        "assistant": "assistant",
-        "system": "system",
-    }
-    mapped = role_map.get(role)
-    if mapped is None:
-        raise ValueError(f"Unsupported role {role!r}.")
-    return mapped
+def _conversation_role(role: str) -> str:
+    if role in {"human", "user"}:
+        return "user"
+    if role in {"gpt", "assistant"}:
+        return "assistant"
+    if role == "system":
+        return "system"
+    raise ValueError(f"Unsupported role {role!r}.")
 
 
-def _content_from_text(text: str) -> list[dict[str, str]]:
-    return [{"type": "text", "text": text}]
+def _render_chat_template(processor, messages: Sequence[dict[str, Any]]) -> str:
+    rendered = processor.apply_chat_template(
+        list(messages),
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    if not isinstance(rendered, str):
+        raise TypeError(f"Expected processor.apply_chat_template(..., tokenize=False) to return str, got {type(rendered)!r}.")
+    return rendered
 
 
-def _render_chat_template(processor: Any, tokenizer: PreTrainedTokenizerBase, messages: Sequence[dict[str, Any]]) -> str:
-    renderer = processor if processor is not None and hasattr(processor, "apply_chat_template") else tokenizer
-    if not hasattr(renderer, "apply_chat_template"):
-        raise ValueError("The processor/tokenizer does not provide apply_chat_template().")
-    try:
-        return renderer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    except ValueError as exc:
-        chat_template = getattr(renderer, "chat_template", None)
-        if chat_template is not None:
-            raise
-        raise ValueError(
-            "HF-native prompt formatting requires a tokenizer or processor chat_template. "
-            "Use a LLaVA-NeXT checkpoint with chat_template.json/tokenizer_config.json."
-        ) from exc
-
-
-def _build_hf_messages(
-    conversations: Sequence[dict[str, Any]],
-    system_message: str,
-) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
-    if system_message:
-        messages.append({"role": "system", "content": _content_from_text(system_message)})
-    for sentence in conversations:
-        role = _hf_role(sentence["from"])
-        messages.append({"role": role, "content": _content_from_text(str(sentence["value"]))})
-    return messages
-
-
-def _matching_prefix_len(left: Sequence[int], right: Sequence[int]) -> int:
-    limit = min(len(left), len(right))
-    for idx in range(limit):
-        if left[idx] != right[idx]:
-            return idx
-    return limit
-
-
-def encode_hf_chat_template_example(
-    processor: Any,
+def encode_chat_template_example(
+    processor,
     tokenizer: PreTrainedTokenizerBase,
     conversations: Sequence[dict[str, Any]],
     image_token_counts: Sequence[int | Sequence[int]],
     system_message: str,
 ) -> tuple[torch.LongTensor, torch.LongTensor]:
-    """Encode one conversation using the checkpoint's HF chat template.
+    """Encode one conversation into causal-LM inputs and labels.
 
     Labeling policy:
     - system turns: ignored
     - user turns: ignored
-    - assistant turns: supervise the sample-provided assistant content and any
-      template-provided turn end marker, not the role prefix
+    - assistant turns: supervise the sample-provided assistant content and turn
+      end marker, not the role prefix
 
-    Image placeholders are expanded before rendering so the local pooled-token
-    counts remain the source of truth instead of the processor's default image
-    expansion.
+    This is the standard SFT setup where the model learns to continue the prompt
+    as the assistant.
     """
 
     prompt_conversations = replace_image_tokens_in_conversations(list(conversations), image_token_counts)
-    messages = _build_hf_messages(prompt_conversations, system_message)
-    rendered = _render_chat_template(processor, tokenizer, messages)
-    input_ids = tokenize_text(tokenizer, rendered)
-    labels = [IGNORE_INDEX] * len(input_ids)
-    last_assistant_end = None
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_message}]
+    messages.extend(
+        {"role": _conversation_role(sentence["from"]), "content": str(sentence["value"])}
+        for sentence in prompt_conversations
+    )
 
-    for msg_idx, message in enumerate(messages):
+    input_ids: list[int] = []
+    labels: list[int] = []
+
+    def append_segment(text: str, supervised_prefix_len: int | None) -> None:
+        # `supervised_prefix_len=None` means the entire segment is context only.
+        # Otherwise we mask the prefix tokens and train on the remainder.
+        segment_ids = tokenize_text(tokenizer, text)
+        input_ids.extend(segment_ids)
+        if supervised_prefix_len is None:
+            labels.extend([IGNORE_INDEX] * len(segment_ids))
+        else:
+            supervised_prefix_len = min(supervised_prefix_len, len(segment_ids))
+            labels.extend([IGNORE_INDEX] * supervised_prefix_len)
+            labels.extend(segment_ids[supervised_prefix_len:])
+
+    rendered_prefix = ""
+    for message_index, message in enumerate(messages):
+        rendered_current = _render_chat_template(processor, messages[: message_index + 1])
+        if not rendered_current.startswith(rendered_prefix):
+            raise ValueError("Chat template rendering is not prefix-stable; cannot build assistant-only labels.")
+        segment = rendered_current[len(rendered_prefix) :]
+        rendered_prefix = rendered_current
         if message["role"] != "assistant":
+            append_segment(segment, supervised_prefix_len=None)
             continue
-        rendered_with_turn = _render_chat_template(processor, tokenizer, messages[: msg_idx + 1])
-        marker = f"<|fovea_label_start_{msg_idx}|>"
-        marked_messages = copy.deepcopy(messages[: msg_idx + 1])
-        for content in marked_messages[-1]["content"]:
-            if content.get("type") == "text":
-                content["text"] = marker + str(content.get("text", ""))
-                break
-        marked_rendered = _render_chat_template(processor, tokenizer, marked_messages)
-        marker_pos = marked_rendered.find(marker)
-        if marker_pos < 0:
-            raise ValueError("Could not locate assistant label marker after chat-template rendering.")
-
-        turn_ids = tokenize_text(tokenizer, rendered_with_turn)
-        start = len(tokenize_text(tokenizer, marked_rendered[:marker_pos]))
-        end = _matching_prefix_len(turn_ids, input_ids)
-        if end <= start:
-            continue
-        labels[start:end] = input_ids[start:end]
-        last_assistant_end = end
+        content = str(message["content"])
+        content_offset = segment.find(content)
+        if content_offset < 0:
+            raise ValueError("Could not locate assistant content inside rendered chat template segment.")
+        prefix_len = len(tokenize_text(tokenizer, segment[:content_offset]))
+        append_segment(segment, supervised_prefix_len=prefix_len)
 
     eos_token_id = tokenizer.eos_token_id
-    if eos_token_id is not None and (not input_ids or input_ids[-1] != eos_token_id):
-        input_ids.append(eos_token_id)
-        labels.append(eos_token_id if last_assistant_end is not None else IGNORE_INDEX)
+    if messages[-1]["role"] == "assistant" and eos_token_id is not None and (not input_ids or input_ids[-1] != eos_token_id):
+        input_ids.append(int(eos_token_id))
+        labels.append(int(eos_token_id))
 
     return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
@@ -348,11 +330,9 @@ def build_fovea_metadata(
     if len(positions) != len(query_boxes):
         raise ValueError(f"Parsed VGR boxes ({len(query_boxes)}) do not match tokenized <fovea> triggers ({len(positions)}).")
 
-    box_indices = list(range(len(positions)))
-
     return {
         "fovea_positions": torch.tensor(positions, dtype=torch.long),
-        "fovea_box_indices": torch.tensor(box_indices, dtype=torch.long),
+        "fovea_box_indices": torch.arange(len(positions), dtype=torch.long),
         "fovea_boxes": torch.tensor(query_boxes, dtype=torch.float32),
     }
 
@@ -366,111 +346,63 @@ def empty_fovea_metadata() -> dict[str, torch.Tensor]:
 
 
 class VisionPacker:
-    """LLaVA-NeXT image preprocessing adapter."""
+    """Official processor-backed image preprocessing adapter."""
 
     def __init__(
         self,
         processor,
         vision_config=None,
+        max_image_tokens: int | None = None,
     ) -> None:
         self.processor = processor
         self.image_processor = processor.image_processor
         self.vision_config = vision_config
+        self.max_image_tokens = max_image_tokens
+        self.spatial_merge_size = int(
+            getattr(self.image_processor, "merge_size", getattr(vision_config, "spatial_merge_size", 2))
+        )
+        patch_size = getattr(self.image_processor, "patch_size", getattr(vision_config, "patch_size", 16))
+        if isinstance(patch_size, (list, tuple)):
+            patch_size = patch_size[-1]
+        self.patch_size = int(patch_size)
 
-    def _process(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor, int]:
-        inputs = self.image_processor(images=image, return_tensors="pt")
+    def _process(self, image: Image.Image, max_image_tokens: int | None = None) -> tuple[torch.Tensor, torch.LongTensor]:
+        kwargs = {}
+        if max_image_tokens is not None:
+            kwargs["max_pixels"] = (
+                int(max_image_tokens)
+                * self.spatial_merge_size
+                * self.spatial_merge_size
+                * self.patch_size
+                * self.patch_size
+            )
+        inputs = self.image_processor(images=image, return_tensors="pt", **kwargs)
         pixel_values = inputs["pixel_values"]
-        image_sizes = inputs["image_sizes"].to(torch.long)
-        count = self.input_feature_count(image_sizes[0])
-        return pixel_values, image_sizes, count
+        image_grid_thw = inputs["image_grid_thw"].to(torch.long)
+        return pixel_values, image_grid_thw[0]
 
-    def _grid_boxes(self, rows: int, cols: int) -> torch.Tensor:
-        row_starts = torch.arange(rows, dtype=torch.float32)
-        col_starts = torch.arange(cols, dtype=torch.float32)
-        row_grid, col_grid = torch.meshgrid(row_starts, col_starts, indexing="ij")
+    def _grid_boxes(self, grid_thw: torch.LongTensor) -> torch.Tensor:
+        _t, grid_h, grid_w = [int(v) for v in grid_thw.tolist()]
+        merge = max(int(self.spatial_merge_size), 1)
+        rows = torch.arange(0, grid_h, merge, dtype=torch.float32)
+        cols = torch.arange(0, grid_w, merge, dtype=torch.float32)
+        row_grid, col_grid = torch.meshgrid(rows, cols, indexing="ij")
         return torch.stack(
             [
-                col_grid / float(cols),
-                row_grid / float(rows),
-                (col_grid + 1) / float(cols),
-                (row_grid + 1) / float(rows),
+                col_grid / float(grid_w),
+                row_grid / float(grid_h),
+                (col_grid + merge).clamp_max(float(grid_w)) / float(grid_w),
+                (row_grid + merge).clamp_max(float(grid_h)) / float(grid_h),
             ],
             dim=-1,
         ).reshape(-1, 4)
 
-    def _pooled_grid_boxes(self, rows: int, cols: int, pool_size: int) -> torch.Tensor:
-        pool_size = max(1, int(pool_size))
-        pooled_rows = (int(rows) + pool_size - 1) // pool_size
-        pooled_cols = (int(cols) + pool_size - 1) // pool_size
-        row_starts = torch.arange(pooled_rows, dtype=torch.float32)
-        col_starts = torch.arange(pooled_cols, dtype=torch.float32)
-        row_grid, col_grid = torch.meshgrid(row_starts, col_starts, indexing="ij")
-        return torch.stack(
-            [
-                (col_grid * pool_size) / float(cols),
-                (row_grid * pool_size) / float(rows),
-                torch.clamp((col_grid + 1) * pool_size, max=float(cols)) / float(cols),
-                torch.clamp((row_grid + 1) * pool_size, max=float(rows)) / float(rows),
-            ],
-            dim=-1,
-        ).reshape(-1, 4)
+    def pack_retrieve(self, image: Image.Image, max_image_tokens: int | None = None) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
+        pixel_values, grid_thw = self._process(image, max_image_tokens=max_image_tokens)
+        return pixel_values, grid_thw, self._grid_boxes(grid_thw)
 
-    def _highres_unpadded_shape(self, image_size: torch.Tensor) -> tuple[int, int]:
-        orig_height, orig_width = [int(v) for v in image_size.tolist()]
-        image_grid_pinpoints = getattr(self.image_processor, "image_grid_pinpoints", None)
-        if image_grid_pinpoints is None:
-            image_grid_pinpoints = getattr(self.processor, "image_grid_pinpoints", None)
-        if image_grid_pinpoints is None:
-            raise ValueError("LLaVA-NeXT image_grid_pinpoints are required for exact retrieval boxes.")
-
-        vision_image_size = int(getattr(self.vision_config, "image_size", 336) if self.vision_config is not None else 336)
-        vision_patch_size = int(getattr(self.vision_config, "patch_size", getattr(self.processor, "patch_size", 14)))
-        grid_per_tile = vision_image_size // vision_patch_size
-        best_height, best_width = select_best_resolution([orig_height, orig_width], image_grid_pinpoints)
-        grid_height = (int(best_height) // vision_image_size) * grid_per_tile
-        grid_width = (int(best_width) // vision_image_size) * grid_per_tile
-
-        original_aspect_ratio = orig_width / max(orig_height, 1)
-        current_aspect_ratio = grid_width / max(grid_height, 1)
-        if original_aspect_ratio > current_aspect_ratio:
-            new_height = int(round(orig_height * (grid_width / max(orig_width, 1)), 7))
-            padding = max(0, (grid_height - new_height) // 2)
-            grid_height = max(1, grid_height - 2 * padding)
-        else:
-            new_width = int(round(orig_width * (grid_height / max(orig_height, 1)), 7))
-            padding = max(0, (grid_width - new_width) // 2)
-            grid_width = max(1, grid_width - 2 * padding)
-        return int(grid_height), int(grid_width)
-
-    def input_feature_count(self, image_size: torch.Tensor | Sequence[int]) -> int:
-        if not isinstance(image_size, torch.Tensor):
-            image_size = torch.tensor(image_size, dtype=torch.long)
-        vision_image_size = int(getattr(self.vision_config, "image_size", 336) if self.vision_config is not None else 336)
-        vision_patch_size = int(getattr(self.vision_config, "patch_size", getattr(self.processor, "patch_size", 14)))
-        base_grid = vision_image_size // vision_patch_size
-        base_pool = int(getattr(getattr(self.processor, "config", None), "fovea_input_base_pool", 2))
-        highres_pool = int(getattr(getattr(self.processor, "config", None), "fovea_input_highres_pool", 4))
-        base_rows = (base_grid + base_pool - 1) // base_pool
-        base_cols = (base_grid + base_pool - 1) // base_pool
-        highres_rows, highres_cols = self._highres_unpadded_shape(image_size)
-        pooled_rows = (highres_rows + highres_pool - 1) // highres_pool
-        pooled_cols = (highres_cols + highres_pool - 1) // highres_pool
-        return int(base_rows * base_cols + pooled_rows * (pooled_cols + 1))
-
-    def retrieval_feature_boxes(self, image_size: torch.Tensor) -> torch.Tensor:
-        strategy = getattr(self.processor, "vision_feature_select_strategy", "default")
-        if strategy != "default":
-            raise ValueError("Exact LLaVA-NeXT retrieval boxes currently require vision_feature_select_strategy='default'.")
-        highres_rows, highres_cols = self._highres_unpadded_shape(image_size)
-        retrieve_pool = int(getattr(getattr(self.processor, "config", None), "fovea_retrieve_pool", 2))
-        return self._pooled_grid_boxes(highres_rows, highres_cols, retrieve_pool)
-
-    def pack_retrieve(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
-        pixel_values, image_sizes, _count = self._process(image)
-        return pixel_values, image_sizes, self.retrieval_feature_boxes(image_sizes[0])
-
-    def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor, int]:
-        return self._process(image)
+    def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
+        return self._process(image, max_image_tokens=self.max_image_tokens)
 
 
 class LazySupervisedDataset(Dataset):
@@ -484,59 +416,34 @@ class LazySupervisedDataset(Dataset):
         self,
         data_path: str,
         image_folder: str,
-        processor: Any,
+        processor,
         tokenizer: PreTrainedTokenizerBase,
         vision_packer: VisionPacker,
         image_token_id: int,
         system_message: str = DEFAULT_SYSTEM_MESSAGE,
+        retrieve_max_image_tokens: int | None = 4096,
         model_max_length: int | None = None,
     ) -> None:
-        self.shards = build_training_shards(data_path)
-        self.shard_stops = [shard.stop for shard in self.shards]
-        self.total_records = int(self.shards[-1].stop)
+        self.records = load_training_records(data_path)
         self.image_folder = image_folder
         self.processor = processor
         self.tokenizer = tokenizer
         self.vision_packer = vision_packer
         self.image_token_id = image_token_id
         self.system_message = system_message
+        self.retrieve_max_image_tokens = retrieve_max_image_tokens
         self.model_max_length = int(model_max_length or getattr(tokenizer, "model_max_length", 0) or 0)
         self._printed_overlength_indices: set[int] = set()
-        self._cached_shard_path: Path | None = None
-        self._cached_shard_records: list[dict[str, Any]] | None = None
 
     def __len__(self) -> int:
-        return self.total_records
-
-    def _resolve_shard_index(self, index: int) -> tuple[ParquetShard, int]:
-        if not (0 <= index < self.total_records):
-            raise IndexError(f"index out of range: {index}, total={self.total_records}")
-        shard_idx = bisect_right(self.shard_stops, index)
-        shard = self.shards[shard_idx]
-        return shard, index - shard.start
-
-    def _load_shard_records(self, shard: ParquetShard) -> list[dict[str, Any]]:
-        if self._cached_shard_path == shard.path and self._cached_shard_records is not None:
-            return self._cached_shard_records
-        try:
-            import pandas as pd
-        except ImportError as exc:
-            raise ImportError("Reading parquet training data requires pandas and pyarrow.") from exc
-        frame = pd.read_parquet(shard.path)
-        records = frame.to_dict("records")
-        self._cached_shard_path = shard.path
-        self._cached_shard_records = records
-        return records
-
-    def _record_at(self, index: int) -> dict[str, Any]:
-        shard, row_index = self._resolve_shard_index(index)
-        records = self._load_shard_records(shard)
-        return records[row_index]
+        return len(self.records)
 
     def _open_image(self, image_value: Any) -> Image.Image:
         if isinstance(image_value, dict):
             image_bytes = image_value.get("bytes")
             if image_bytes is not None:
+                import io
+
                 return Image.open(io.BytesIO(image_bytes)).convert("RGB")
             image_path = image_value.get("path")
             if image_path:
@@ -546,66 +453,74 @@ class LazySupervisedDataset(Dataset):
             raise ValueError(f"Unsupported image value type: {type(image_value)!r}")
         return Image.open(os.path.join(self.image_folder, image_value)).convert("RGB")
 
-    def _load_image(self, image_value: Any) -> tuple[torch.Tensor, torch.LongTensor, int]:
-        """Load one image from inline bytes or from `image_folder`."""
+    def _load_image(self, image_value: Any) -> tuple[torch.Tensor, torch.LongTensor]:
+        """Load one image from inline bytes or from `image_folder` and pack it."""
 
         image = self._open_image(image_value)
         return self.vision_packer.pack(image)
 
     def _load_retrieve_image(self, image_value: Any) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
         image = self._open_image(image_value)
-        return self.vision_packer.pack_retrieve(image)
+        return self.vision_packer.pack_retrieve(image, self.retrieve_max_image_tokens)
 
     def _build_instance(self, index: int) -> dict[str, Any]:
         """Build one training instance.
 
         Output fields:
         - `input_ids`, `labels`: text-side causal-LM training tensors
-        - `pixel_values`, `image_sizes`: LLaVA-NeXT image data, or `None`
+        - `mm_token_type_ids`: marks image placeholder token positions
+        - `pixel_values`, `image_grid_thw`: packed image data, or `None`
         """
 
-        record = self._record_at(index)
+        record = self.records[index]
         image_field = record.get("image")
         pixel_values = None
-        image_sizes = None
+        image_grid_thw = None
         retrieve_pixel_values = None
-        retrieve_image_sizes = None
+        retrieve_grid_thw = None
         retrieve_patch_boxes = None
         image_token_counts: list[list[int]] = []
         query_boxes: list[tuple[float, float, float, float]] = []
 
         if image_field is not None:
-            image_names = image_field if isinstance(image_field, list) else [image_field]
+            image_values = image_field if isinstance(image_field, list) else [image_field]
             pixel_values_list = []
-            image_size_list = []
+            image_grid_list = []
             retrieve_pixels_list = []
-            retrieve_size_list = []
+            retrieve_grid_list = []
             retrieve_box_list = []
-            for image_value in image_names:
-                packed_pixels, packed_image_sizes, image_token_count = self._load_image(image_value)
-                retrieve_pixels, retrieve_sizes, retrieve_boxes = self._load_retrieve_image(image_value)
+            for image_value in image_values:
+                packed_pixels, packed_grid = self._load_image(image_value)
+                retrieve_pixels, retrieve_grid, retrieve_boxes = self._load_retrieve_image(image_value)
                 retrieve_pixels_list.append(retrieve_pixels)
-                retrieve_size_list.append(retrieve_sizes)
+                retrieve_grid_list.append(retrieve_grid)
                 retrieve_box_list.append(retrieve_boxes)
                 pixel_values_list.append(packed_pixels)
-                image_size_list.append(packed_image_sizes)
-                image_token_counts.append([image_token_count])
+                image_grid_list.append(packed_grid)
+                image_token_counts.append([
+                    image_token_count_from_grid(
+                        packed_grid,
+                        self.vision_packer.spatial_merge_size,
+                    )
+                ])
             if pixel_values_list:
                 pixel_values = torch.cat(pixel_values_list, dim=0)
-                image_sizes = torch.cat(image_size_list, dim=0)
+                image_grid_thw = torch.stack(image_grid_list, dim=0)
                 if retrieve_pixels_list:
                     retrieve_pixel_values = torch.cat(retrieve_pixels_list, dim=0)
-                    retrieve_image_sizes = torch.cat(retrieve_size_list, dim=0)
+                    retrieve_grid_thw = torch.stack(retrieve_grid_list, dim=0)
                     retrieve_patch_boxes = torch.cat(retrieve_box_list, dim=0)
 
         conversations = copy.deepcopy(record["conversations"])
-        if image_field is not None:
-            image_names = image_field if isinstance(image_field, list) else [image_field]
-            if len(image_names) != 1:
-                raise ValueError("Fovea training expects one image per sample.")
         query_boxes.extend(tuple(float(v) for v in box) for box in record.get("fovea_query_boxes", []))
+        if query_boxes:
+            if image_field is None:
+                raise ValueError("Fovea training samples with fovea_query_boxes require an image.")
+            image_values = image_field if isinstance(image_field, list) else [image_field]
+            if len(image_values) != 1:
+                raise ValueError("Fovea training expects one image per sample when fovea_query_boxes are present.")
 
-        input_ids, labels = encode_hf_chat_template_example(
+        input_ids, labels = encode_chat_template_example(
             processor=self.processor,
             tokenizer=self.tokenizer,
             conversations=conversations,
@@ -618,6 +533,7 @@ class LazySupervisedDataset(Dataset):
             self.tokenizer,
             normalize_supervised_substrings(record.get("fovea_supervised_substrings")),
         )
+        mm_token_type_ids = build_mm_token_type_ids(input_ids=input_ids, image_token_id=self.image_token_id)
         fovea_metadata = build_fovea_metadata(
             input_ids,
             labels,
@@ -628,34 +544,35 @@ class LazySupervisedDataset(Dataset):
         return {
             "input_ids": input_ids,
             "labels": labels,
+            "mm_token_type_ids": mm_token_type_ids,
             "pixel_values": pixel_values,
-            "image_sizes": image_sizes,
+            "image_grid_thw": image_grid_thw,
             "retrieve_pixel_values": retrieve_pixel_values,
-            "retrieve_image_sizes": retrieve_image_sizes,
+            "retrieve_grid_thw": retrieve_grid_thw,
             "retrieve_patch_boxes": retrieve_patch_boxes,
             **fovea_metadata,
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        for offset in range(self.total_records):
-            current_index = (index + offset) % self.total_records
+        for offset in range(len(self.records)):
+            current_index = (index + offset) % len(self.records)
             instance = self._build_instance(current_index)
             if self.model_max_length <= 0 or instance["input_ids"].numel() <= self.model_max_length:
                 return instance
             if current_index not in self._printed_overlength_indices:
                 self._printed_overlength_indices.add(current_index)
-                image_name = self._record_at(current_index).get("image", "<no-image>")
+                image_name = self.records[current_index].get("image", "<no-image>")
                 print(
                     "[data] skip overlength sample "
                     f"index={current_index} image={image_name} "
                     f"tokens={instance['input_ids'].numel()} model_max_length={self.model_max_length}",
                     flush=True,
                 )
-        raise RuntimeError(f"All {self.total_records} training samples exceed model_max_length={self.model_max_length}.")
+        raise RuntimeError(f"All {len(self.records)} training samples exceed model_max_length={self.model_max_length}.")
 
 
 @dataclass
-class DataCollatorForLlavaNextSFT:
+class DataCollatorForQwen3_5SFT:
     """Pad text fields and concatenate image fields into a trainer batch."""
 
     tokenizer: PreTrainedTokenizerBase
@@ -667,18 +584,6 @@ class DataCollatorForLlavaNextSFT:
         tensors = [tensor[: self.model_max_length] for tensor in tensors]
         return torch.nn.utils.rnn.pad_sequence(tensors, batch_first=True, padding_value=padding_value)
 
-    def _cat_padded_pixel_values(self, tensors: Sequence[torch.Tensor]) -> torch.Tensor:
-        max_patches = max(int(tensor.shape[1]) for tensor in tensors)
-        padded = []
-        for tensor in tensors:
-            if int(tensor.shape[1]) == max_patches:
-                padded.append(tensor)
-                continue
-            pad_shape = (tensor.shape[0], max_patches - tensor.shape[1], *tensor.shape[2:])
-            pad = tensor.new_zeros(pad_shape)
-            padded.append(torch.cat([tensor, pad], dim=1))
-        return torch.cat(padded, dim=0)
-
     def __call__(self, instances: Sequence[dict[str, Any]]) -> dict[str, Any]:
         """Merge per-sample dicts into the batch schema expected by `Trainer`."""
 
@@ -687,28 +592,30 @@ class DataCollatorForLlavaNextSFT:
 
         input_ids = self._pad([instance["input_ids"] for instance in instances], padding_value=self.tokenizer.pad_token_id)
         labels = self._pad([instance["labels"] for instance in instances], padding_value=IGNORE_INDEX)
+        mm_token_type_ids = self._pad([instance["mm_token_type_ids"] for instance in instances], padding_value=0).int()
 
         batch = {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
+            "mm_token_type_ids": mm_token_type_ids,
         }
 
         pixel_values = [instance["pixel_values"] for instance in instances if instance["pixel_values"] is not None]
-        image_sizes = [instance["image_sizes"] for instance in instances if instance["image_sizes"] is not None]
+        image_grid_thw = [instance["image_grid_thw"] for instance in instances if instance["image_grid_thw"] is not None]
         if pixel_values:
-            batch["pixel_values"] = self._cat_padded_pixel_values(pixel_values)
-            batch["image_sizes"] = torch.cat(image_sizes, dim=0)
+            batch["pixel_values"] = torch.cat(pixel_values, dim=0)
+            batch["image_grid_thw"] = torch.cat(image_grid_thw, dim=0)
 
         retrieve_pixel_values = [instance["retrieve_pixel_values"] for instance in instances if instance.get("retrieve_pixel_values") is not None]
-        retrieve_image_sizes = [instance["retrieve_image_sizes"] for instance in instances if instance.get("retrieve_image_sizes") is not None]
+        retrieve_grid_thw = [instance["retrieve_grid_thw"] for instance in instances if instance.get("retrieve_grid_thw") is not None]
         retrieve_patch_boxes = [instance["retrieve_patch_boxes"] for instance in instances if instance.get("retrieve_patch_boxes") is not None]
         if retrieve_pixel_values:
-            batch["retrieve_pixel_values"] = self._cat_padded_pixel_values(retrieve_pixel_values)
-            batch["retrieve_image_sizes"] = torch.cat(retrieve_image_sizes, dim=0)
+            batch["retrieve_pixel_values"] = torch.cat(retrieve_pixel_values, dim=0)
+            batch["retrieve_grid_thw"] = torch.cat(retrieve_grid_thw, dim=0)
             batch["retrieve_patch_boxes"] = torch.cat(retrieve_patch_boxes, dim=0)
             batch["retrieve_image_counts"] = torch.tensor(
-                [int(instance["retrieve_image_sizes"].shape[0]) if instance.get("retrieve_image_sizes") is not None else 0 for instance in instances],
+                [int(instance["retrieve_grid_thw"].shape[0]) if instance.get("retrieve_grid_thw") is not None else 0 for instance in instances],
                 dtype=torch.long,
             )
 
