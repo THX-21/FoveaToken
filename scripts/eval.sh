@@ -7,16 +7,18 @@ export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 
 BASE_MODEL="${EVAL_BASE_MODEL:-llava-hf/llava-v1.6-vicuna-7b-hf}"
 CHECKPOINT_MODE="${EVAL_CHECKPOINT_MODE:-full}"
-LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr-ft/checkpoint-200}"
-FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr-ft/checkpoint-200}"
-TASKS="${EVAL_TASKS:-mmstar}"
+# LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr/checkpoint-200}"
+# LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-llava-hf/llava-v1.6-vicuna-7b-hf}"
+# FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr-ft/checkpoint-6250}"
+FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-llava-hf/llava-v1.6-vicuna-7b-hf}"
+TASKS="${EVAL_TASKS:-chartqa}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 ATTN_IMPLEMENTATION="${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
-DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:2}"
+DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:0}"
 DEVICE="${EVAL_DEVICE:-${DEVICE_MAP}}"
 BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 
-COMMON_MODEL_ARGS="device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION}"
+COMMON_MODEL_ARGS="device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=false,fovea_auto_retrieve_on_answer_start=false"
 case "${CHECKPOINT_MODE}" in
   full)
     RESOLVED_CHECKPOINT="${FULL_CHECKPOINT}"
@@ -65,4 +67,5 @@ echo "[eval] MODEL_ARGS=${MODEL_ARGS}"
   --batch_size "${BATCH_SIZE}" \
   --log_samples \
   --log_samples_suffix "${LOG_SUFFIX}" \
-  --output_path "${OUTPUT_PATH}"
+  --output_path "${OUTPUT_PATH}" \
+  --limit 500

@@ -4,61 +4,30 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import init
+from typing import TypedDict
 
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.models.llava_next.configuration_llava_next import LlavaNextConfig
+from transformers.models.llava_next.modeling_llava_next import (
+    LlavaNextCausalLMOutputWithPast,
+    LlavaNextModel,
+    LlavaNextPreTrainedModel,
+    get_anyres_image_grid_shape,
+    image_size_to_num_patches,
+    unpad_image,
+)
 from transformers.processing_utils import Unpack
 from transformers.utils import can_return_tuple
 
 from .configuration_fovea import FoveaConfig
-from .modeling_llava_next import (
-    get_anyres_image_grid_shape,
-    image_size_to_num_patches,
-    KwargsForCausalLM,
-    LlavaNextCausalLMOutputWithPast,
-    LlavaNextModel,
-    LlavaNextPreTrainedModel,
-    unpad_image,
-)
 
 
-def _box_giou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
-    """Compute GIoU between two sets of boxes in [x1, y1, x2, y2] format.
+class KwargsForCausalLM(TypedDict, total=False):
+    pass
 
-    Args:
-        boxes1: (N, 4)
-        boxes2: (N, M, 4)
 
-    Returns:
-        giou: (N, M) in [-1, 1]
-    """
-    a = boxes1.unsqueeze(1)  # (N, 1, 4)
-    b = boxes2               # (N, M, 4)
-
-    # Intersection
-    inter_x1 = torch.max(a[..., 0], b[..., 0])
-    inter_y1 = torch.max(a[..., 1], b[..., 1])
-    inter_x2 = torch.min(a[..., 2], b[..., 2])
-    inter_y2 = torch.min(a[..., 3], b[..., 3])
-    inter_area = (inter_x2 - inter_x1).clamp_min(0) * (inter_y2 - inter_y1).clamp_min(0)
-
-    # Areas
-    area1 = (a[..., 2] - a[..., 0]) * (a[..., 3] - a[..., 1])
-    area2 = (b[..., 2] - b[..., 0]) * (b[..., 3] - b[..., 1])
-
-    union = area1 + area2 - inter_area
-    iou = inter_area / union.clamp_min(1e-6)
-
-    # Enclosing box
-    c_x1 = torch.min(a[..., 0], b[..., 0])
-    c_y1 = torch.min(a[..., 1], b[..., 1])
-    c_x2 = torch.max(a[..., 2], b[..., 2])
-    c_y2 = torch.max(a[..., 3], b[..., 3])
-    c_area = ((c_x2 - c_x1) * (c_y2 - c_y1)).clamp_min(1e-6)
-
-    return iou - (c_area - union) / c_area
 from .train.data import IGNORE_INDEX
 
 
@@ -180,9 +149,12 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             "fovea_num_tokens",
             "fovea_lambda_align",
             "fovea_align_eps",
+            "fovea_align_alpha",
+            "fovea_align_beta",
             "fovea_input_base_pool",
             "fovea_input_highres_pool",
             "fovea_retrieve_pool",
+            "fovea_auto_retrieve_on_answer_start",
             "fovea_token_id",
         ):
             llava_config_dict.pop(key, None)
@@ -216,6 +188,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         self.fovea_ssm_out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.fovea_ssm_norm = FoveaRMSNormGated(self.fovea_head_dim, eps=eps)
         self._fovea_aux: dict[str, torch.Tensor] = {}
+        self._fovea_aux_history: list[dict[str, torch.Tensor]] = []
         self.post_init()
         self._init_fovea_modules()
 
@@ -319,6 +292,40 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             if not torch.isfinite(module.weight).all() or module.weight.float().abs().sum() == 0:
                 init.ones_(module.weight)
 
+    def _unused_param_zero_anchor(self, reference: torch.Tensor) -> torch.Tensor:
+        """Attach zero-valued uses of conditional params for DDP consistency."""
+
+        anchor = reference.new_zeros(())
+        fovea_tensors = (
+            self.fovea_tokens.weight,
+            self.fovea_q_proj.weight,
+            self.fovea_k_proj.weight,
+            self.fovea_v_proj.weight,
+            self.fovea_o_proj.weight,
+            self.fovea_q_norm.weight,
+            self.fovea_k_norm.weight,
+            self.fovea_ssm_in_proj_qkv.weight,
+            self.fovea_ssm_in_proj_z.weight,
+            self.fovea_ssm_in_proj_b.weight,
+            self.fovea_ssm_in_proj_a.weight,
+            self.fovea_ssm_dt_bias.weight,
+            self.fovea_ssm_A_log.weight,
+            self.fovea_ssm_out_proj.weight,
+            self.fovea_ssm_norm.weight,
+        )
+        vision_tensors = (
+            self.model.multi_modal_projector.linear_1.weight,
+            self.model.multi_modal_projector.linear_1.bias,
+            self.model.multi_modal_projector.linear_2.weight,
+            self.model.multi_modal_projector.linear_2.bias,
+        )
+        for tensor in fovea_tensors + vision_tensors:
+            anchor = anchor + tensor.float().sum().to(device=reference.device) * 0.0
+        vision_module = self.model.vision_tower
+        for param in vision_module.parameters():
+            anchor = anchor + param.float().sum().to(device=reference.device) * 0.0
+        return anchor.to(dtype=reference.dtype)
+
     def _pool_spatial_feature_grid(self, feature_grid: torch.Tensor, pool_size: int) -> torch.Tensor:
         pool_size = int(pool_size)
         if pool_size <= 1:
@@ -404,6 +411,62 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         include_base: bool = True,
         include_newline: bool = True,
     ):
+        return self._get_pooled_image_features(
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            vision_feature_layer=vision_feature_layer,
+            vision_feature_select_strategy=vision_feature_select_strategy,
+            base_pool=base_pool,
+            highres_pool=highres_pool,
+            include_base=include_base,
+            include_newline=include_newline,
+        )
+
+    def _get_main_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_sizes: torch.Tensor,
+        vision_feature_layer=None,
+        vision_feature_select_strategy=None,
+    ):
+        # Main-image features match original LLaVA-NeXT packing by default.
+        return self._get_pooled_image_features(
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            vision_feature_layer=vision_feature_layer,
+            vision_feature_select_strategy=vision_feature_select_strategy,
+            base_pool=self.config.fovea_input_base_pool,
+            highres_pool=self.config.fovea_input_highres_pool,
+            include_base=True,
+            include_newline=True,
+        )
+
+    def _get_retrieve_image_features(
+        self,
+        retrieve_pixel_values: torch.FloatTensor,
+        retrieve_image_sizes: torch.Tensor,
+    ):
+        # Retrieval memory keeps original tile resolution by default.
+        return self._get_pooled_image_features(
+            pixel_values=retrieve_pixel_values,
+            image_sizes=retrieve_image_sizes,
+            base_pool=self.config.fovea_retrieve_pool,
+            highres_pool=self.config.fovea_retrieve_pool,
+            include_base=False,
+            include_newline=False,
+        )
+
+    def _get_pooled_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_sizes: torch.Tensor,
+        vision_feature_layer=None,
+        vision_feature_select_strategy=None,
+        base_pool: int | None = None,
+        highres_pool: int | None = None,
+        include_base: bool = True,
+        include_newline: bool = True,
+    ):
         vision_feature_layer = (
             vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
         )
@@ -460,7 +523,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         inputs_embeds = self.get_input_embeddings()(input_ids) if input_embeds_override is None else input_embeds_override
         image_features = None
         if pixel_values is not None and pixel_values.size(0) > 0:
-            image_features = self.get_image_features(
+            image_features = self._get_main_image_features(
                 pixel_values=pixel_values,
                 image_sizes=image_sizes,
                 vision_feature_layer=vision_feature_layer,
@@ -486,14 +549,9 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         )
 
     def _split_retrieve_features_by_sample(self, retrieve_pixel_values, retrieve_image_sizes, retrieve_image_counts):
-        features = self.get_image_features(
-            pixel_values=retrieve_pixel_values,
-            image_sizes=retrieve_image_sizes,
-            base_pool=self.config.fovea_retrieve_pool,
-            highres_pool=self.config.fovea_retrieve_pool,
-            include_base=False,
-            include_newline=False,
-        )
+        features = self._get_retrieve_image_features(retrieve_pixel_values, retrieve_image_sizes)
+        if hasattr(features, "pooler_output"):
+            features = features.pooler_output
         counts = retrieve_image_counts.to(device="cpu", dtype=torch.long).tolist()
         per_sample, start = [], 0
         for count in counts:
@@ -505,6 +563,19 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                 per_sample.append(retrieve_pixel_values.new_zeros((0, hidden_size)))
             start += count
         return per_sample
+
+    def _retrieve_runtime_fovea_vectors(self, text_hidden_history, text_input_id_history, retrieve_memory_cache):
+        last_pos = text_hidden_history.shape[1] - 1
+        history_attention = text_input_id_history.new_ones(text_input_id_history.shape)
+        history_position = torch.tensor([[0, last_pos]], device=text_hidden_history.device, dtype=torch.long)
+        fovea_queries = self._condition_fovea_queries_from_text(
+            text_hidden_history,
+            history_attention,
+            text_input_id_history,
+            history_position,
+        )
+        trigger_batch = torch.zeros((1,), device=text_hidden_history.device, dtype=torch.long)
+        return self._retrieve_fovea_from_memory(fovea_queries, trigger_batch, *retrieve_memory_cache)
 
     def _build_retrieve_memory(
         self,
@@ -649,14 +720,42 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             boxes_for_memory = patch_boxes.index_select(0, trigger_batch).to(device=device, dtype=torch.float32)
             mask_for_trigger = memory_mask.index_select(0, trigger_batch)
             valid_boxes = boxes_for_memory.ge(0).all(dim=-1)
+            eps = float(self.config.fovea_align_eps)
+            alpha = float(self.config.fovea_align_alpha)
+            beta = float(self.config.fovea_align_beta)
 
-            # GIoU soft weight instead of hard center-in-box
-            giou = _box_giou(boxes_for_trigger, boxes_for_memory)  # (N_q, N_patch)
-            giou = giou * mask_for_trigger.to(giou.dtype) * valid_boxes.to(giou.dtype)
-            giou_weight = giou.clamp_min(0)
+            target_boxes = boxes_for_trigger.unsqueeze(1)
+            inter_x1 = torch.max(target_boxes[..., 0], boxes_for_memory[..., 0])
+            inter_y1 = torch.max(target_boxes[..., 1], boxes_for_memory[..., 1])
+            inter_x2 = torch.min(target_boxes[..., 2], boxes_for_memory[..., 2])
+            inter_y2 = torch.min(target_boxes[..., 3], boxes_for_memory[..., 3])
+            inter_area = (inter_x2 - inter_x1).clamp_min(0) * (inter_y2 - inter_y1).clamp_min(0)
 
-            prob = (attn_mean * giou_weight[:, None, :].to(attn_mean.dtype)).sum(dim=-1)
-            align_loss = -(prob.clamp_min(float(self.config.fovea_align_eps)).log()).mean()
+            box_area = (
+                (boxes_for_trigger[:, 2] - boxes_for_trigger[:, 0]).clamp_min(0)
+                * (boxes_for_trigger[:, 3] - boxes_for_trigger[:, 1]).clamp_min(0)
+            )
+            q = inter_area / box_area[:, None].clamp_min(eps)
+            q = q * mask_for_trigger.to(q.dtype) * valid_boxes.to(q.dtype)
+            q = q / q.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+            a_mean = attn_mean.mean(dim=1)
+            a_max = attn_mean.max(dim=1).values
+            l_main = -(q * a_mean.clamp_min(eps).log()).sum(dim=-1)
+            l_cover = -(q * a_max.clamp_min(eps).log()).sum(dim=-1)
+
+            attn_flat = F.normalize(attn_mean, p=2, dim=-1, eps=eps)
+            cosine = torch.matmul(attn_flat, attn_flat.transpose(-1, -2))
+            div_mask = 1.0 - torch.eye(num_fovea, device=device, dtype=cosine.dtype)
+            l_div = (cosine * div_mask.unsqueeze(0)).sum(dim=(-1, -2)) / max(num_fovea * (num_fovea - 1), 1)
+
+            align_loss = (l_main + alpha * l_cover + beta * l_div).mean()
+        entry = {
+            "fovea_attn_mean": attn_mean.detach(),
+            "trigger_batch": trigger_batch.detach(),
+        }
+        self._fovea_aux = entry
+        self._fovea_aux_history.append(entry)
         return vectors, align_loss
 
     def _expand_with_fovea_tokens(self, base_embeds, attention_mask, labels, fovea_positions, fovea_vectors):
@@ -701,8 +800,8 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                     new_labels[batch_idx, dst_cursor : dst_cursor + tail_len] = labels[batch_idx, src_cursor:]
         return new_embeds, new_attention, new_labels
 
-    def _cached_decode_position_ids(self, attention_mask):
-        return attention_mask.long().cumsum(-1)[:, -1:] - 1
+    def _cached_decode_position_ids(self, attention_mask, num_new_tokens: int = 1):
+        return attention_mask.long().cumsum(-1)[:, -int(num_new_tokens) :] - 1
 
     def _sample_next_token(self, logits, *, do_sample: bool, temperature=None, top_p=None, top_k=None):
         if not do_sample:
@@ -754,8 +853,11 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         temperature=None,
         top_p=None,
         top_k=None,
+        fovea_auto_retrieve_on_answer_start=None,
         **kwargs,
     ):
+        self._fovea_aux = {}
+        self._fovea_aux_history = []
         if input_ids.shape[0] != 1:
             raise ValueError("Fovea generation currently expects batch_size=1.")
         if int(num_beams) != 1:
@@ -768,7 +870,9 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             if key in kwargs:
                 model_kwargs[key] = kwargs[key]
 
-        inputs_embeds, _ = self._build_multimodal_embeddings(input_ids, pixel_values, image_sizes)
+        output_input_ids = input_ids
+        model_input_ids = input_ids
+        inputs_embeds, _ = self._build_multimodal_embeddings(model_input_ids, pixel_values, image_sizes)
         retrieve_memory_cache = None
         if retrieve_pixel_values is not None:
             retrieve_memory_cache = self._build_retrieve_memory(
@@ -781,10 +885,13 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                 inputs_embeds.dtype,
             )
         fovea_id = getattr(self.config, "fovea_token_id", None)
+        if fovea_auto_retrieve_on_answer_start is None:
+            fovea_auto_retrieve_on_answer_start = getattr(self.config, "fovea_auto_retrieve_on_answer_start", True)
+        fovea_auto_retrieve_on_answer_start = bool(fovea_auto_retrieve_on_answer_start)
         text_hidden_history = None
-        text_input_id_history = input_ids
+        text_input_id_history = model_input_ids
         if fovea_id is not None and retrieve_memory_cache is not None:
-            prompt_positions = torch.nonzero(input_ids.eq(int(fovea_id)), as_tuple=False)
+            prompt_positions = torch.nonzero(model_input_ids.eq(int(fovea_id)), as_tuple=False)
             if prompt_positions.numel() > 0:
                 prompt_outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask=attention_mask, **model_kwargs)
                 prompt_hidden = prompt_outputs[0]
@@ -813,6 +920,45 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             text_hidden_history = outputs[0]
         logits = self.lm_head(outputs[0][:, -1:, :]).squeeze(1)
         past_key_values = outputs.past_key_values
+        if (
+            fovea_id is not None
+            and retrieve_memory_cache is not None
+            and fovea_auto_retrieve_on_answer_start
+            and (model_input_ids.shape[1] == 0 or int(model_input_ids[0, -1].item()) != int(fovea_id))
+        ):
+            auto_fovea = model_input_ids.new_full((model_input_ids.shape[0], 1), int(fovea_id))
+            auto_fovea_embed = self.get_input_embeddings()(auto_fovea).to(inputs_embeds.dtype)
+            model_input_ids = torch.cat([model_input_ids, auto_fovea], dim=1)
+            attention_mask = torch.cat([attention_mask, attention_mask.new_ones((1, 1))], dim=1)
+            outputs = self._language_forward_from_embeds(
+                auto_fovea_embed,
+                attention_mask=attention_mask,
+                position_ids=self._cached_decode_position_ids(attention_mask),
+                past_key_values=past_key_values,
+                **model_kwargs,
+            )
+            auto_hidden = outputs[0][:, -1, :]
+            past_key_values = outputs.past_key_values
+            text_hidden_history = torch.cat([text_hidden_history, auto_hidden.unsqueeze(1)], dim=1)
+            text_input_id_history = torch.cat([text_input_id_history, auto_fovea], dim=1)
+            fovea_vectors, _ = self._retrieve_runtime_fovea_vectors(
+                text_hidden_history,
+                text_input_id_history,
+                retrieve_memory_cache,
+            )
+            fovea_embeds = fovea_vectors.squeeze(0).unsqueeze(0).to(device=auto_hidden.device, dtype=inputs_embeds.dtype)
+            attention_mask = torch.cat([attention_mask, attention_mask.new_ones((1, fovea_embeds.shape[1]))], dim=1)
+            outputs = self._language_forward_from_embeds(
+                fovea_embeds,
+                attention_mask=attention_mask,
+                position_ids=self._cached_decode_position_ids(attention_mask, fovea_embeds.shape[1]),
+                past_key_values=past_key_values,
+                **model_kwargs,
+            )
+            logits = self.lm_head(outputs[0][:, -1, :])
+            past_key_values = outputs.past_key_values
+        if eos_token_id is None:
+            eos_token_id = self.config.eos_token_id
         eos_ids = {int(eos_token_id)} if isinstance(eos_token_id, int) else {int(item) for item in (eos_token_id or [])}
 
         for _ in range(int(max_new_tokens)):
@@ -824,7 +970,8 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
                 top_k=top_k,
             )
             next_embed = self.get_input_embeddings()(next_token).to(inputs_embeds.dtype)
-            input_ids = torch.cat([input_ids, next_token], dim=1)
+            model_input_ids = torch.cat([model_input_ids, next_token], dim=1)
+            output_input_ids = torch.cat([output_input_ids, next_token], dim=1)
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones((1, 1))], dim=1)
             if int(next_token.item()) in eos_ids:
                 break
@@ -843,32 +990,23 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             text_input_id_history = torch.cat([text_input_id_history, next_token], dim=1)
 
             if fovea_id is not None and int(next_token.item()) == int(fovea_id) and retrieve_memory_cache is not None:
-                trigger_batch = torch.zeros((1,), device=token_hidden.device, dtype=torch.long)
-                history_attention = text_input_id_history.new_ones(text_input_id_history.shape)
-                history_position = torch.tensor(
-                    [[0, text_hidden_history.shape[1] - 1]],
-                    device=token_hidden.device,
-                    dtype=torch.long,
-                )
-                fovea_queries = self._condition_fovea_queries_from_text(
+                fovea_vectors, _ = self._retrieve_runtime_fovea_vectors(
                     text_hidden_history,
-                    history_attention,
                     text_input_id_history,
-                    history_position,
+                    retrieve_memory_cache=retrieve_memory_cache,
                 )
-                fovea_vectors, _ = self._retrieve_fovea_from_memory(fovea_queries, trigger_batch, *retrieve_memory_cache)
                 fovea_embeds = fovea_vectors.squeeze(0).unsqueeze(0).to(device=token_hidden.device, dtype=inputs_embeds.dtype)
                 attention_mask = torch.cat([attention_mask, attention_mask.new_ones((1, fovea_embeds.shape[1]))], dim=1)
                 outputs = self._language_forward_from_embeds(
                     fovea_embeds,
                     attention_mask=attention_mask,
-                    position_ids=None,
+                    position_ids=self._cached_decode_position_ids(attention_mask, fovea_embeds.shape[1]),
                     past_key_values=past_key_values,
                     **model_kwargs,
                 )
                 logits = self.lm_head(outputs[0][:, -1, :])
                 past_key_values = outputs.past_key_values
-        return input_ids
+        return output_input_ids
 
     def generate(self, *args, **kwargs):
         if kwargs.get("retrieve_pixel_values") is not None:
@@ -896,7 +1034,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
             logits_to_keep=logits_to_keep,
             **kwargs,
         )
-        if cache_position is None or cache_position[0] == 0:
+        if cache_position is not None and cache_position[0] == 0:
             model_inputs["pixel_values"] = pixel_values
             model_inputs["image_sizes"] = image_sizes
         return model_inputs
@@ -918,6 +1056,8 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         logits_to_keep=0,
         **kwargs,
     ):
+        self._fovea_aux = {}
+        self._fovea_aux_history = []
         vision_feature_layer = kwargs.pop("vision_feature_layer", None)
         vision_feature_select_strategy = kwargs.pop("vision_feature_select_strategy", None)
         embeds_a, _ = self._build_multimodal_embeddings(
@@ -960,11 +1100,13 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         full_logits_b = self.lm_head(hidden_b)
         lm_loss = self.loss_function(logits=full_logits_b, labels=labels_b, vocab_size=full_logits_b.shape[-1])
         loss = lm_loss + float(self.config.fovea_lambda_align) * align_loss
+        loss = loss + self._unused_param_zero_anchor(loss)
         self._fovea_aux = {
             "lm_loss": lm_loss.detach(),
             "align_loss": align_loss.detach(),
             "num_queries": hidden_b.new_tensor(float(fovea_positions.shape[0])),
             "tokens_per_query": hidden_b.new_tensor(float(self.config.fovea_num_tokens)),
+            "fovea_attn_mean": self._fovea_aux.get("fovea_attn_mean"),
         }
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         return LlavaNextCausalLMOutputWithPast(
@@ -1001,6 +1143,67 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> tuple | LlavaNextCausalLMOutputWithPast:
+        if (
+            retrieve_pixel_values is None
+            and retrieve_image_sizes is None
+            and retrieve_patch_boxes is None
+            and retrieve_image_counts is None
+            and fovea_positions is None
+            and fovea_box_indices is None
+            and fovea_boxes is None
+        ):
+            output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+            output_hidden_states = (
+                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            )
+            vision_feature_layer = kwargs.pop("vision_feature_layer", None)
+            vision_feature_select_strategy = kwargs.pop("vision_feature_select_strategy", None)
+            vision_feature_layer = (
+                vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
+            )
+            vision_feature_select_strategy = (
+                vision_feature_select_strategy
+                if vision_feature_select_strategy is not None
+                else self.config.vision_feature_select_strategy
+            )
+
+            outputs = self.model(
+                input_ids,
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+                vision_feature_layer=vision_feature_layer,
+                vision_feature_select_strategy=vision_feature_select_strategy,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs[0]
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
+            loss = None
+            if labels is not None:
+                loss = self.loss_function(
+                    logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                )
+                loss = loss + self._unused_param_zero_anchor(loss)
+
+            return LlavaNextCausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                image_hidden_states=outputs.image_hidden_states,
+            )
+
         model_kwargs = {
             "use_cache": use_cache,
             "output_attentions": output_attentions,
@@ -1052,6 +1255,7 @@ class FoveaForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixin):
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
+            loss = loss + self._unused_param_zero_anchor(loss)
         return LlavaNextCausalLMOutputWithPast(
             loss=loss,
             logits=logits,

@@ -1,7 +1,9 @@
 import copy
+import io
 import json
 import os
 import re
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -24,9 +26,7 @@ SOT_EOT_IMAGE_RE = re.compile(r"<SOT>\s*(\[[^\]]+\])\s*<EOT>\s*<image>")
 ORPHAN_VGR_TAG_RE = re.compile(r"<SOT>|<EOT>")
 
 
-def load_training_records(data_path: str) -> list[dict[str, Any]]:
-    """Load VGR parquet records from a file or `data/vgr` directory."""
-
+def training_parquet_paths(data_path: str) -> list[Path]:
     path = Path(data_path)
     if path.is_dir():
         paths = sorted(path.glob("*.parquet"))
@@ -34,19 +34,36 @@ def load_training_records(data_path: str) -> list[dict[str, Any]]:
             raise FileNotFoundError(f"No parquet training files found under {path}.")
     else:
         paths = [path]
-
-    records: list[dict[str, Any]] = []
     for item in paths:
-        if item.suffix == ".parquet":
-            try:
-                import pandas as pd
-            except ImportError as exc:
-                raise ImportError("Reading VGR parquet requires pandas and pyarrow.") from exc
-            frame = pd.read_parquet(item)
-            records.extend(frame.to_dict("records"))
-        else:
-            raise ValueError(f"Only VGR parquet training files are supported: {item}")
-    return records
+        if item.suffix != ".parquet":
+            raise ValueError(f"Only parquet training files are supported: {item}")
+    return paths
+
+
+@dataclass(frozen=True)
+class ParquetShard:
+    path: Path
+    start: int
+    stop: int
+
+
+def build_training_shards(data_path: str) -> list[ParquetShard]:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise ImportError("Reading parquet training data requires pandas and pyarrow.") from exc
+
+    shards: list[ParquetShard] = []
+    offset = 0
+    for path in training_parquet_paths(data_path):
+        row_count = int(pq.ParquetFile(path).metadata.num_rows)
+        if row_count <= 0:
+            continue
+        shards.append(ParquetShard(path=path, start=offset, stop=offset + row_count))
+        offset += row_count
+    if not shards:
+        raise FileNotFoundError(f"No non-empty parquet training files found under {data_path}.")
+    return shards
 
 
 def parse_vgr_box(box_text: str) -> tuple[float, float, float, float]:
@@ -221,6 +238,7 @@ def encode_hf_chat_template_example(
     rendered = _render_chat_template(processor, tokenizer, messages)
     input_ids = tokenize_text(tokenizer, rendered)
     labels = [IGNORE_INDEX] * len(input_ids)
+    last_assistant_end = None
 
     for msg_idx, message in enumerate(messages):
         if message["role"] != "assistant":
@@ -243,6 +261,12 @@ def encode_hf_chat_template_example(
         if end <= start:
             continue
         labels[start:end] = input_ids[start:end]
+        last_assistant_end = end
+
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is not None and (not input_ids or input_ids[-1] != eos_token_id):
+        input_ids.append(eos_token_id)
+        labels.append(eos_token_id if last_assistant_end is not None else IGNORE_INDEX)
 
     return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
@@ -467,7 +491,9 @@ class LazySupervisedDataset(Dataset):
         system_message: str = DEFAULT_SYSTEM_MESSAGE,
         model_max_length: int | None = None,
     ) -> None:
-        self.records = load_training_records(data_path)
+        self.shards = build_training_shards(data_path)
+        self.shard_stops = [shard.stop for shard in self.shards]
+        self.total_records = int(self.shards[-1].stop)
         self.image_folder = image_folder
         self.processor = processor
         self.tokenizer = tokenizer
@@ -476,20 +502,58 @@ class LazySupervisedDataset(Dataset):
         self.system_message = system_message
         self.model_max_length = int(model_max_length or getattr(tokenizer, "model_max_length", 0) or 0)
         self._printed_overlength_indices: set[int] = set()
+        self._cached_shard_path: Path | None = None
+        self._cached_shard_records: list[dict[str, Any]] | None = None
 
     def __len__(self) -> int:
-        return len(self.records)
+        return self.total_records
 
-    def _load_image(self, image_name: str) -> tuple[torch.Tensor, torch.LongTensor, int]:
-        """Load an image file relative to `image_folder` and pack it."""
+    def _resolve_shard_index(self, index: int) -> tuple[ParquetShard, int]:
+        if not (0 <= index < self.total_records):
+            raise IndexError(f"index out of range: {index}, total={self.total_records}")
+        shard_idx = bisect_right(self.shard_stops, index)
+        shard = self.shards[shard_idx]
+        return shard, index - shard.start
 
-        image_path = os.path.join(self.image_folder, image_name)
-        image = Image.open(image_path).convert("RGB")
+    def _load_shard_records(self, shard: ParquetShard) -> list[dict[str, Any]]:
+        if self._cached_shard_path == shard.path and self._cached_shard_records is not None:
+            return self._cached_shard_records
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            raise ImportError("Reading parquet training data requires pandas and pyarrow.") from exc
+        frame = pd.read_parquet(shard.path)
+        records = frame.to_dict("records")
+        self._cached_shard_path = shard.path
+        self._cached_shard_records = records
+        return records
+
+    def _record_at(self, index: int) -> dict[str, Any]:
+        shard, row_index = self._resolve_shard_index(index)
+        records = self._load_shard_records(shard)
+        return records[row_index]
+
+    def _open_image(self, image_value: Any) -> Image.Image:
+        if isinstance(image_value, dict):
+            image_bytes = image_value.get("bytes")
+            if image_bytes is not None:
+                return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            image_path = image_value.get("path")
+            if image_path:
+                return Image.open(os.path.join(self.image_folder, str(image_path))).convert("RGB")
+            raise ValueError("Unsupported image dict: expected `bytes` or `path`.")
+        if not isinstance(image_value, str):
+            raise ValueError(f"Unsupported image value type: {type(image_value)!r}")
+        return Image.open(os.path.join(self.image_folder, image_value)).convert("RGB")
+
+    def _load_image(self, image_value: Any) -> tuple[torch.Tensor, torch.LongTensor, int]:
+        """Load one image from inline bytes or from `image_folder`."""
+
+        image = self._open_image(image_value)
         return self.vision_packer.pack(image)
 
-    def _load_retrieve_image(self, image_name: str) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
-        image_path = os.path.join(self.image_folder, image_name)
-        image = Image.open(image_path).convert("RGB")
+    def _load_retrieve_image(self, image_value: Any) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
+        image = self._open_image(image_value)
         return self.vision_packer.pack_retrieve(image)
 
     def _build_instance(self, index: int) -> dict[str, Any]:
@@ -500,7 +564,7 @@ class LazySupervisedDataset(Dataset):
         - `pixel_values`, `image_sizes`: LLaVA-NeXT image data, or `None`
         """
 
-        record = self.records[index]
+        record = self._record_at(index)
         image_field = record.get("image")
         pixel_values = None
         image_sizes = None
@@ -517,9 +581,9 @@ class LazySupervisedDataset(Dataset):
             retrieve_pixels_list = []
             retrieve_size_list = []
             retrieve_box_list = []
-            for image_name in image_names:
-                packed_pixels, packed_image_sizes, image_token_count = self._load_image(image_name)
-                retrieve_pixels, retrieve_sizes, retrieve_boxes = self._load_retrieve_image(image_name)
+            for image_value in image_names:
+                packed_pixels, packed_image_sizes, image_token_count = self._load_image(image_value)
+                retrieve_pixels, retrieve_sizes, retrieve_boxes = self._load_retrieve_image(image_value)
                 retrieve_pixels_list.append(retrieve_pixels)
                 retrieve_size_list.append(retrieve_sizes)
                 retrieve_box_list.append(retrieve_boxes)
@@ -535,14 +599,11 @@ class LazySupervisedDataset(Dataset):
                     retrieve_patch_boxes = torch.cat(retrieve_box_list, dim=0)
 
         conversations = copy.deepcopy(record["conversations"])
-        if image_field is None:
-            raise ValueError("Fovea training requires an image.")
-        image_names = image_field if isinstance(image_field, list) else [image_field]
-        if len(image_names) != 1:
-            raise ValueError("Fovea training expects one image per sample.")
-        if not record.get("fovea_preprocessed", False) or "fovea_query_boxes" not in record:
-            raise ValueError("Training requires offline-preprocessed VGR parquet with fovea_query_boxes.")
-        query_boxes.extend(tuple(float(v) for v in box) for box in record["fovea_query_boxes"])
+        if image_field is not None:
+            image_names = image_field if isinstance(image_field, list) else [image_field]
+            if len(image_names) != 1:
+                raise ValueError("Fovea training expects one image per sample.")
+        query_boxes.extend(tuple(float(v) for v in box) for box in record.get("fovea_query_boxes", []))
 
         input_ids, labels = encode_hf_chat_template_example(
             processor=self.processor,
@@ -576,21 +637,21 @@ class LazySupervisedDataset(Dataset):
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        for offset in range(len(self.records)):
-            current_index = (index + offset) % len(self.records)
+        for offset in range(self.total_records):
+            current_index = (index + offset) % self.total_records
             instance = self._build_instance(current_index)
             if self.model_max_length <= 0 or instance["input_ids"].numel() <= self.model_max_length:
                 return instance
             if current_index not in self._printed_overlength_indices:
                 self._printed_overlength_indices.add(current_index)
-                image_name = self.records[current_index].get("image", "<no-image>")
+                image_name = self._record_at(current_index).get("image", "<no-image>")
                 print(
                     "[data] skip overlength sample "
                     f"index={current_index} image={image_name} "
                     f"tokens={instance['input_ids'].numel()} model_max_length={self.model_max_length}",
                     flush=True,
                 )
-        raise RuntimeError(f"All {len(self.records)} training samples exceed model_max_length={self.model_max_length}.")
+        raise RuntimeError(f"All {self.total_records} training samples exceed model_max_length={self.model_max_length}.")
 
 
 @dataclass

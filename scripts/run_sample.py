@@ -16,12 +16,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="fovea", help="lmms-eval model name")
     parser.add_argument(
         "--model_args",
-        default="pretrained=llava-hf/llava-v1.6-vicuna-7b-hf,device=cuda:0,device_map=cuda:0,attn_implementation=sdpa,disable_fovea_retrieval=true,enable_thinking=false",
+        default="pretrained=checkpoints/fovea-vgr-ft/checkpoint-6250,device=cuda:1,device_map=cuda:1,attn_implementation=sdpa,enable_thinking=true",
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")
-    parser.add_argument("--task", default="mmstar", help="lmms-eval task name")
-    parser.add_argument("--index", type=int, default=0, help="Start index in the task docs")
+    parser.add_argument("--task", default="chartqa", help="lmms-eval task name")
+    parser.add_argument("--index", type=int, default=5, help="Start index in the task docs")
     parser.add_argument("--num_samples", type=int, default=6, help="Number of consecutive samples to run")
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.4)
@@ -90,10 +90,7 @@ def _build_simple_messages(model, visuals, question: str):
     for visual in visuals:
         content.append({"type": "image", "image": visual})
     content.append({"type": "text", "text": question})
-    return [
-        {"role": "system", "content": model.system_prompt},
-        {"role": "user", "content": content},
-    ]
+    return [{"role": "user", "content": content}]
 
 
 def _prepare_simple_inputs(model, visuals, question: str):
@@ -105,7 +102,7 @@ def _prepare_simple_inputs(model, visuals, question: str):
     }
     inputs = model.processor(**processor_kwargs)
 
-    if hasattr(model, "vision_packer") and visuals:
+    if getattr(model, "vision_packer", None) is not None and visuals and not getattr(model, "disable_fovea_retrieval", False):
         retrieve_pixels, retrieve_sizes, retrieve_boxes = model.vision_packer.pack_retrieve(visuals[0])
         import torch
 

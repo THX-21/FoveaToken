@@ -24,9 +24,9 @@ FoveaToken 基于 `llava-hf/llava-v1.6-vicuna-7b-hf` / LLaVA-NeXT 多模态实�
 -> second decoder pass for observation / reasoning / final answer
 ```
 
-64 个 fovea latent 是模型内置参数，不写入文本序列。普通文本 token 的 hidden states 会通过 Qwen3.5 GatedDeltaNet 风格的 `q/k/v/beta/g/z` 线性投影和 chunk gated-delta-rule 持续更新这 64 条 latent stream；只有检测到 `<fovea>` 时，才把当前位置对应的 64 个 latent 拿去视觉池检索并插入 64 个虚拟视觉 token。训练 labels 对这些插入的虚拟 token 固定为 `IGNORE_INDEX`。`L_align` 使用 `<fovea>` 绑定的原图归一化 box 监督 64 个 token 的检索注意力落到目标区域内。
+64 个 fovea latent 是模型内置参数，不写入文本序列。普通文本 token 的 hidden states 会通过 Qwen3.5 GatedDeltaNet 风格的 `q/k/v/beta/g/z` 线性投影和 chunk gated-delta-rule 持续更新这 64 条 latent stream；只有检测到 `<fovea>` 时，才把当前位置对应的 64 个 latent 拿去视觉池检索并插入 64 个虚拟视觉 token。训练 labels 对这些插入的虚拟 token 固定为 `IGNORE_INDEX`。`L_align` 用 `<fovea>` 绑定的原图归一化 box 生成 patch overlap 目标，约束 64 个 query 的注意力整体覆盖目标区域，并加上去塌缩项。
 
-视觉 token 默认压缩策略：初始 LLM 图像上下文中，base image tokens 经过 `2x2` pooling，high-res unpadded tokens 经过 `4x4` pooling，并保留 pooled high-res 每行 newline token；Fovea 视觉池不使用 base image tokens 和 newline tokens，只保留 high-res unpadded tokens，并统一经过 `2x2` pooling。
+视觉 token 默认策略：初始 LLM 图像上下文与原始 LLaVA-NeXT 一致，不做额外 pooling；Fovea 视觉池默认也不做额外 pooling，并保持原始 tile 分辨率。Retrieval 仍不使用 base image tokens 和 newline tokens，只使用 high-res unpadded 特征。
 
 ## 数据
 
@@ -52,6 +52,7 @@ VGR 中的：
 每个 `<fovea>` 必须绑定一个原图归一化 box，用于 `L_align`。图像路径相对 `image_folder`。assistant 文本里不属于合法 region tag 的残留 `<image>`、孤立 `<SOT>`、孤立 `<EOT>` 会在离线预处理阶段直接清掉，不再参与 placeholder 展开。
 
 训练 prompt 使用 checkpoint 自带的 HF `processor.apply_chat_template()` 渲染，保持和 LLaVA-NeXT 原生推理入口一致。由于本仓库使用自定义 pooled image token 数，`<image>` 占位符仍在模板渲染前由 `src/fovea_token/train/data.py` 按本地 token count 展开；assistant 文本中的 `<think>`/`</think>` 是本仓库新增的 atomic marker tokens。LLaVA-NeXT 原生没有 thinking chat-template 开关；评测时 `enable_thinking=true` 会在 assistant 生成前预填 `<think>`，否则预填 `<think>\n\n</think>`。
+训练编码阶段如果 chat template 本身没有在 assistant 结尾给出 `eos`，会额外补一个 `eos_token_id`，并把它纳入 LM 监督。
 
 训练默认读取离线预处理结果：
 
@@ -60,14 +61,15 @@ data/vgr/preprocessed/vgr_shortcot.parquet
 data/vgr/preprocessed/vgr_longcot.parquet
 ```
 
-`data_path` 指向目录时读取目录下全部 parquet；显式传入单个 parquet 文件时只读取该文件。固定 fovea 机制不使用离散视觉码。
+`data_path` 指向目录时读取目录下全部 parquet；显式传入单个 parquet 文件时只读取该文件。训练 parquet 的 `image` 字段既可以是相对 `image_folder` 的字符串路径，也可以是官方 `LLaVA-NeXT-Data` parquet 里的内嵌图片对象；后者会直接按字节解码。没有 `fovea_query_boxes` 的样本按普通图文 SFT 处理。固定 fovea 机制不使用离散视觉码。
 
-LLaVA-NeXT anyres 候选分辨率使用扩展范围：
+LLaVA-NeXT anyres 候选分辨率保持原始范围：
 
 ```python
 [
     [336, 672], [672, 336], [672, 672], [1008, 336], [336, 1008],
-    [672, 1344], [1344, 672], [1344, 1344], [2016, 672], [672, 2016],
+    [1008, 672], [672, 1008], [1344, 672], [672, 1344], [1008, 1008],
+    [1344, 1008], [1008, 1344], [1344, 1344], [1680, 1344], [1344, 1680],
 ]
 ```
 

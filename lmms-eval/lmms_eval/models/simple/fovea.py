@@ -37,8 +37,8 @@ class Fovea(lmms):
     """lmms-eval adapter for the local Fovea implementation."""
 
     DEFAULT_GEN_KWARGS = {
-        "max_new_tokens": 4096,
-        "temperature": 0.0,
+        "max_new_tokens": 1024,
+        "temperature": 0.4,
         "top_p": None,
         "num_beams": 1,
     }
@@ -94,6 +94,7 @@ class Fovea(lmms):
         enable_thinking: Optional[bool] = True,
         reasoning_prompt: Optional[str] = None,
         disable_fovea_retrieval: Optional[bool] = False,
+        fovea_auto_retrieve_on_answer_start: Optional[bool] = True,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -122,8 +123,9 @@ class Fovea(lmms):
         }
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
-        self._model = FoveaForConditionalGeneration.from_pretrained(load_pretrained, **model_kwargs)
         tokenizer_source = load_pretrained
+        self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
+        self._model = FoveaForConditionalGeneration.from_pretrained(load_pretrained, **model_kwargs)
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
         add_fovea_tokens(self._tokenizer)
         if len(self._tokenizer) != self._model.get_input_embeddings().weight.shape[0]:
@@ -154,7 +156,7 @@ class Fovea(lmms):
         self.processor._get_number_of_features = self._get_pooled_number_of_features
 
         self.enable_thinking = enable_thinking
-        self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
+        self.fovea_auto_retrieve_on_answer_start = bool(fovea_auto_retrieve_on_answer_start)
         if reasoning_prompt:
             self.reasoning_prompt = reasoning_prompt.replace("\\n", "\n")
         else:
@@ -304,6 +306,8 @@ class Fovea(lmms):
             val = current.get(key)
             if val is not None:
                 generate_kwargs[key] = val
+        if not self.disable_fovea_retrieval:
+            generate_kwargs["fovea_auto_retrieve_on_answer_start"] = self.fovea_auto_retrieve_on_answer_start
         return generate_kwargs
 
     def _load_deepspeed_trainables(self, checkpoint_path: str) -> None:
@@ -382,8 +386,6 @@ class Fovea(lmms):
             if "<image>" in context:
                 context = context.replace("<image>", "")
 
-            message = [{"role": "system", "content": self.system_prompt}]
-
             if self.reasoning_prompt:
                 context = context.strip() + self.reasoning_prompt
                 contexts[i] = context
@@ -398,12 +400,7 @@ class Fovea(lmms):
                         processed_visuals.append({"type": "image", "image": visual})
 
             if self.interleave_visuals is False:
-                message.append(
-                    {
-                        "role": "user",
-                        "content": processed_visuals + [{"type": "text", "text": context}],
-                    }
-                )
+                message = [{"role": "user", "content": processed_visuals + [{"type": "text", "text": context}]}]
                 image_inputs.extend(part["image"] for part in processed_visuals)
                 image_counts_per_sample.append(len(processed_visuals))
             else:
@@ -424,12 +421,7 @@ class Fovea(lmms):
                     if placeholder_idx + 1 < len(text_parts) and text_parts[placeholder_idx + 1]:
                         content_parts.append({"type": "text", "text": text_parts[placeholder_idx + 1]})
 
-                message.append(
-                    {
-                        "role": "user",
-                        "content": content_parts,
-                    }
-                )
+                message = [{"role": "user", "content": content_parts}]
                 image_counts_per_sample.append(sample_image_count)
 
             batched_messages.append(message)

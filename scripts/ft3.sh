@@ -22,9 +22,9 @@ export WORLD_SIZE=$((NNODES * NUM_GPUS))
 export RANK=0
 
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
-RUN_NAME="${FT3_RUN_NAME:-fovea-fixed-token}"
+RUN_NAME="${FT3_RUN_NAME:-fovea-vgr-242}"
 DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr/preprocessed}"
-IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/vgr/llava_next_raw_format}"
+IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/llava_next/llava_next_raw_format}"
 CKPT_PATH="${FT3_CKPT_PATH:-llava-hf/llava-v1.6-vicuna-7b-hf}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-100}"
@@ -99,7 +99,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
     --max_steps "${MAX_STEPS}" \
     --per_device_train_batch_size "${FT3_BATCH_SIZE:-1}" \
-    --gradient_accumulation_steps "${FT3_GRAD_ACCUM:-4}" \
+    --gradient_accumulation_steps "${FT3_GRAD_ACCUM:-8}" \
     --eval_strategy no \
     --save_strategy steps \
     --save_steps "${SAVE_STEPS}" \
@@ -112,7 +112,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --attn_implementation "${ATTN_IMPLEMENTATION}" \
     --lr_scheduler_type cosine \
     --logging_steps 1 \
-    --model_max_length 32768 \
+    --model_max_length 8096 \
     --gradient_checkpointing true \
     --dataloader_num_workers "${FT3_DATALOADER_NUM_WORKERS:-8}" \
     --report_to tensorboard \
