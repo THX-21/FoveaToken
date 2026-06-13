@@ -17,23 +17,34 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize Fovea attention.")
-    parser.add_argument("--task", default="mmstar", help="`train` or an lmms-eval task like `mmstar`.")
-    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-ft/checkpoint-2800")
-    parser.add_argument("--index", type=int, default=50)
+    parser.add_argument("--task", default="chartqa", help="`train` or an lmms-eval task like `mmstar`.")
+    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-qwen/checkpoint-2300")
+    parser.add_argument("--index", type=int, nargs="+", default=[3, 7, 15, 22, 31, 48, 56, 63, 78, 91])
     parser.add_argument("--output_dir", default="outputs/fovea_visualize")
     parser.add_argument("--alpha", type=float, default=0.45)
     parser.add_argument("--cmap", default="magma")
-    parser.add_argument("--device", default="cuda:3")
-    parser.add_argument("--device_map", default="cuda:3")
+    parser.add_argument("--device", default="cuda:4")
+    parser.add_argument("--device_map", default="cuda:4")
     parser.add_argument("--attn_implementation", default="sdpa")
-    parser.add_argument("--enable_thinking", action="store_true")
+    parser.add_argument("--enable_thinking", type=lambda x: x.lower() == "true", default=True)
     parser.add_argument("--force_simple", action="store_true")
-    parser.add_argument("--max_new_tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max_new_tokens", type=int, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--data_path", default="data/vgr/preprocessed")
-    parser.add_argument("--image_folder", default="data/vgr/llava_next_raw_format")
+    parser.add_argument("--image_folder", default="data/llava_next/llava_next_raw_format")
+    parser.add_argument("--disable_fovea_retrieval", type=lambda x: x.lower() == "true", default=False,
+                        help="Disable fovea retrieval pipeline.")
+    parser.add_argument("--fovea_auto_retrieve_on_answer_start", type=lambda x: x.lower() == "true", default=False,
+                        help="Auto trigger fovea on answer start.")
+    parser.add_argument("--crop", default="true", help="Crop the most-attended regions and save them.")
+    parser.add_argument("--crop_threshold", type=float, default=0.3,
+                        help="Threshold for cropping: boxes with weight > threshold * max_weight are cropped.")
+    parser.add_argument("--crop_margin", type=float, default=1.0,
+                        help="Patch count tolerance for connectivity. 0 = strictly adjacent, 1 = one-patch gap allowed.")
+    parser.add_argument("--crop_padding", type=float, default=1.0,
+                        help="Expand each crop region by this many patches outward.")
     return parser.parse_args()
 
 
@@ -41,10 +52,18 @@ def to_numpy_image(image: Image.Image) -> np.ndarray:
     return np.asarray(image.convert("RGB"))
 
 
+def normalize_patch_boxes(boxes: torch.Tensor) -> torch.Tensor:
+    if boxes.ndim == 3 and boxes.shape[0] == 1:
+        return boxes[0]
+    if boxes.ndim != 2 or boxes.shape[-1] != 4:
+        raise ValueError(f"Expected patch boxes with shape [N, 4] or [1, N, 4], got {tuple(boxes.shape)}")
+    return boxes
+
+
 def render_heatmap(image: np.ndarray, boxes: torch.Tensor, weights: torch.Tensor, alpha: float, cmap: str) -> np.ndarray:
     h, w = image.shape[:2]
     heat = np.zeros((h, w), dtype=np.float32)
-    boxes = boxes.detach().cpu().numpy()
+    boxes = normalize_patch_boxes(boxes).detach().cpu().numpy()
     weights = weights.detach().cpu().numpy()
     for box, weight in zip(boxes, weights):
         x1 = max(0, min(w, int(round(box[0] * w))))
@@ -57,6 +76,140 @@ def render_heatmap(image: np.ndarray, boxes: torch.Tensor, weights: torch.Tensor
         heat = heat / heat.max()
     colored = plt.get_cmap(cmap)(heat)[..., :3]
     return (image * (1.0 - alpha) + colored * 255.0 * alpha).clip(0, 255).astype(np.uint8)
+
+
+def _box_boundary_distance(box_a: tuple, box_b: tuple) -> float:
+    """Min L2 distance between the boundaries of two non-overlapping boxes."""
+    dx = max(box_a[0] - box_b[2], box_b[0] - box_a[2], 0)
+    dy = max(box_a[1] - box_b[3], box_b[1] - box_a[3], 0)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _find_connected_components(
+    boxes: list[tuple], weights: list[float], margin: float,
+) -> list[list[int]]:
+    """Group boxes into connected components via BFS.
+
+    Two boxes are connected if their boundary distance ≤ margin * patch_size.
+    margin=0 means strictly adjacent (shared boundary), margin=1 allows one-patch gap.
+    """
+    n = len(boxes)
+    if n == 0:
+        return []
+
+    # Compute characteristic patch size from the first box
+    pw = boxes[0][2] - boxes[0][0]  # patch width in pixels
+    ph = boxes[0][3] - boxes[0][1]  # patch height in pixels
+    patch_size = max(pw, ph)
+    max_dist = margin * patch_size
+
+    # Build adjacency list
+    adj = {i: [] for i in range(n)}
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _box_boundary_distance(boxes[i], boxes[j]) <= max_dist:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    # BFS connected components
+    visited = set()
+    components = []
+    for i in range(n):
+        if i in visited:
+            continue
+        comp = []
+        queue = [i]
+        visited.add(i)
+        while queue:
+            node = queue.pop()
+            comp.append(node)
+            for nb in adj[node]:
+                if nb not in visited:
+                    visited.add(nb)
+                    queue.append(nb)
+        components.append(comp)
+
+    return components
+
+
+def crop_attended_regions(
+    image: Image.Image,
+    boxes: torch.Tensor,
+    weights: torch.Tensor,
+    threshold: float = 0.3,
+    margin: float = 0.0,
+    padding: float = 0.0,
+) -> list[dict]:
+    """Crop the most-attended regions via threshold + connected components.
+
+    Args:
+        image: PIL Image.
+        boxes: [N, 4] normalized box coordinates [x1, y1, x2, y2].
+        weights: [N] attention weight per box.
+        threshold: boxes with weight > threshold * max(weight) are cropped.
+        margin: max boundary distance in units of patch size (0 = strictly adjacent).
+        padding: expand crop bounding box by this many patches outward.
+
+    Returns:
+        List of dicts sorted by region weight (desc), each with box, weight, crop.
+    """
+    w, h = image.size
+    boxes_np = normalize_patch_boxes(boxes).detach().cpu().numpy()
+    weights_np = weights.detach().cpu().numpy()
+
+    max_w = weights_np.max()
+    if max_w == 0:
+        return []
+
+    # 1. Threshold: keep boxes with weight > threshold * max_weight
+    kept_boxes = []
+    kept_weights = []
+    for box, weight in zip(boxes_np, weights_np):
+        if weight <= threshold * max_w:
+            continue
+        x1 = max(0, min(w, int(round(box[0] * w))))
+        y1 = max(0, min(h, int(round(box[1] * h))))
+        x2 = max(0, min(w, int(round(box[2] * w))))
+        y2 = max(0, min(h, int(round(box[3] * h))))
+        if x2 > x1 and y2 > y1:
+            kept_boxes.append((x1, y1, x2, y2))
+            kept_weights.append(float(weight))
+
+    if not kept_boxes:
+        return []
+
+    # patch pixel size for padding (use first box before threshold, which covers all boxes)
+    pw = int(round((boxes_np[0, 2] - boxes_np[0, 0]) * w))
+    ph = int(round((boxes_np[0, 3] - boxes_np[0, 1]) * h))
+
+    # 2. Connected components on the adjacency graph
+    components = _find_connected_components(kept_boxes, kept_weights, margin)
+
+    # 3. Each component → bounding box → expand by padding → crop
+    crops = []
+    for comp in components:
+        x1 = min(kept_boxes[i][0] for i in comp)
+        y1 = min(kept_boxes[i][1] for i in comp)
+        x2 = max(kept_boxes[i][2] for i in comp)
+        y2 = max(kept_boxes[i][3] for i in comp)
+        # Apply padding in patch units
+        pad_x = int(round(padding * pw))
+        pad_y = int(round(padding * ph))
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(w, x2 + pad_x)
+        y2 = min(h, y2 + pad_y)
+        comp_weight = max(kept_weights[i] for i in comp)
+        crop_img = image.crop((x1, y1, x2, y2))
+        crops.append({
+            "box": (x1, y1, x2, y2),
+            "weight": comp_weight,
+            "crop": crop_img,
+        })
+
+    # Sort by weight descending
+    crops.sort(key=lambda c: c["weight"], reverse=True)
+    return crops
 
 
 def get_sample_qa(record: dict) -> tuple[str, str]:
@@ -129,51 +282,32 @@ def _init_model(force_simple: bool, model_kwargs: dict):
     return resolved, model_cls(**model_kwargs)
 
 
-def _build_simple_messages(model, visuals, question: str):
-    content = []
-    for visual in visuals:
-        content.append({"type": "image", "image": visual})
-    content.append({"type": "text", "text": question})
-    return [{"role": "user", "content": content}]
+def _task_eval_split(task) -> str:
+    if task.has_test_docs():
+        return task.config.test_split
+    if task.has_validation_docs():
+        return task.config.validation_split
+    raise ValueError(f"Task '{task.config.task}' has no test or validation split.")
 
 
-def _prepare_simple_inputs(model, visuals, question: str):
-    texts = model._apply_chat_template([_build_simple_messages(model, visuals, question)])
-    inputs = model.processor(
-        text=texts,
-        images=list(visuals),
-        return_mm_token_type_ids=True,
-        return_tensors="pt",
+def _run_simple_sample(model, task, doc_idx: int, context: str, gen_kwargs: dict):
+    from lmms_eval.api.instance import Instance, unwrap_generation_output
+
+    split = _task_eval_split(task)
+    task_name = task.config.task
+    model.task_dict = {task_name: {split: task.task_docs}}
+    request = Instance(
+        request_type="generate_until",
+        arguments=(context, gen_kwargs, task.doc_to_visual, doc_idx, task_name, split),
+        idx=0,
+        metadata={"task": task_name, "doc_id": doc_idx, "repeats": 1},
     )
-    if getattr(model, "vision_packer", None) is not None and visuals and not getattr(model, "disable_fovea_retrieval", False):
-        retrieve_pixels = []
-        retrieve_grids = []
-        retrieve_boxes = []
-        for visual in visuals:
-            pixels, grid, boxes = model.vision_packer.pack_retrieve(visual, getattr(model, "retrieve_max_image_tokens", None))
-            retrieve_pixels.append(pixels)
-            retrieve_grids.append(grid)
-            retrieve_boxes.append(boxes)
-        inputs["retrieve_pixel_values"] = torch.cat(retrieve_pixels, dim=0)
-        inputs["retrieve_grid_thw"] = torch.stack(retrieve_grids, dim=0)
-        inputs["retrieve_patch_boxes"] = torch.cat(retrieve_boxes, dim=0)
-        inputs["retrieve_image_counts"] = torch.tensor([len(visuals)], dtype=torch.long)
-    return {
-        key: value.to(model.device) if hasattr(value, "to") else value
-        for key, value in inputs.items()
-    }, texts[0]
+    output = model.generate_until([request])[0]
+    text, token_counts = unwrap_generation_output(output)
+    return text, token_counts
 
 
-def _decode_generated_text(model, full_ids: torch.Tensor, prompt_len: int) -> str:
-    generated = full_ids[prompt_len:]
-    return model.processor.batch_decode(
-        [generated],
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )[0]
-
-
-def load_train_sample(args):
+def load_train_sample(args, index: int):
     from fovea_token import FoveaForConditionalGeneration
     from fovea_token.tokenizers.tokenization_fovea import add_fovea_tokens, sync_fovea_token_ids
     from fovea_token.train.data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
@@ -207,13 +341,13 @@ def load_train_sample(args):
         vision_packer=packer,
         image_token_id=model.config.image_token_id,
     )
-    item = dataset[args.index]
+    item = dataset[index]
     batch = DataCollatorForQwen3_5SFT(tokenizer=tokenizer, model_max_length=32768)([item])
     batch = {k: v.to(args.device) if hasattr(v, "to") else v for k, v in batch.items()}
     with torch.no_grad():
         model(**{k: v for k, v in batch.items() if v is not None})
 
-    record = dataset.records[args.index]
+    record = dataset.records[index]
     image_name = record["image"]
     image = Image.open(Path(args.image_folder) / image_name).convert("RGB")
     question, answer = get_sample_qa(record)
@@ -239,11 +373,11 @@ def load_train_sample(args):
         "answer": answer,
         "prediction": answer,
         "history": history,
-        "sample_name": f"train_{args.index:05d}",
+        "sample_name": f"train_{index:05d}",
     }
 
 
-def load_lmms_eval_sample(args):
+def load_lmms_eval_sample(args, index: int):
     resolved_model, lmms_model = _init_model(
         force_simple=args.force_simple,
         model_kwargs={
@@ -252,11 +386,13 @@ def load_lmms_eval_sample(args):
             "device_map": args.device_map,
             "attn_implementation": args.attn_implementation,
             "enable_thinking": args.enable_thinking,
+            "disable_fovea_retrieval": args.disable_fovea_retrieval,
+            "fovea_auto_retrieve_on_answer_start": args.fovea_auto_retrieve_on_answer_start,
         },
     )
     task = _init_task(args.task, resolved_model.model_id, resolved_model.model_type)
-    doc = task.task_docs[args.index]
-    doc_index = doc.get("index", args.index)
+    doc = task.task_docs[index]
+    doc_index = doc.get("index", index)
     question = task.doc_to_text(doc) if hasattr(task, "doc_to_text") else ""
     answer = doc.get("answer", task.doc_to_target(doc) if hasattr(task, "doc_to_target") else "")
     visuals = task.doc_to_visual(doc) or []
@@ -266,18 +402,19 @@ def load_lmms_eval_sample(args):
     if not isinstance(visual, Image.Image):
         raise ValueError(f"Current lmms-eval visualization expects PIL image input, got {type(visual)}.")
 
-    inputs, _prompt = _prepare_simple_inputs(lmms_model, visuals, question)
-    gen_kwargs = lmms_model._build_generate_kwargs(
-        {
-            "max_new_tokens": args.max_new_tokens,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-        }
-    )
+    gen_kwargs = dict(getattr(task.config, "generation_kwargs", {}) or {})
+    if args.max_new_tokens is not None:
+        gen_kwargs["max_new_tokens"] = args.max_new_tokens
+    if args.temperature is not None:
+        gen_kwargs["temperature"] = args.temperature
+        gen_kwargs["do_sample"] = args.temperature > 0
+    if args.top_p is not None:
+        gen_kwargs["top_p"] = args.top_p
+    if args.top_k is not None:
+        gen_kwargs["top_k"] = args.top_k
+
     with torch.no_grad():
-        cont = lmms_model.model.generate(**inputs, **gen_kwargs)
-    prediction = _decode_generated_text(lmms_model, cont[0], inputs["input_ids"].shape[1])
+        prediction, _token_counts = _run_simple_sample(lmms_model, task, index, question, gen_kwargs)
 
     history = []
     for call_idx, entry in enumerate(lmms_model.model._fovea_aux_history):
@@ -290,7 +427,7 @@ def load_lmms_eval_sample(args):
                     "call_idx": call_idx,
                     "trigger_idx": trigger_idx,
                     "attn": attn,
-                    "boxes": inputs["retrieve_patch_boxes"],
+                    "boxes": entry["retrieve_patch_boxes"],
                     "query_box": None,
                 }
             )
@@ -346,8 +483,24 @@ def save_visualizations(sample: dict, args) -> None:
         fig.savefig(out_dir / f"{stem}_summary.png", dpi=200, bbox_inches="tight")
         plt.close(fig)
 
-        fig, axes = plt.subplots(8, 8, figsize=(24, 24))
+        # Crop most-attended regions
+        if getattr(args, "crop", False):
+            crops = crop_attended_regions(
+                sample["image"], entry["boxes"], summary,
+                threshold=args.crop_threshold, margin=args.crop_margin, padding=args.crop_padding,
+            )
+            for crop_idx, c in enumerate(crops):
+                crop_path = out_dir / f"{stem}_crop_{crop_idx:02d}.png"
+                c["crop"].save(crop_path)
+                print(f"Saved crop: {crop_path}  box={c['box']}  weight={c['weight']:.4f}")
+
+        num_tokens = int(entry["attn"].shape[0])
+        grid_size = int(np.ceil(num_tokens**0.5))
+        fig, axes = plt.subplots(grid_size, grid_size, figsize=(grid_size * 3, grid_size * 3))
         for token_idx, ax in enumerate(axes.flat):
+            if token_idx >= num_tokens:
+                ax.axis("off")
+                continue
             panel = render_heatmap(image_np, entry["boxes"], entry["attn"][token_idx], args.alpha, args.cmap)
             ax.imshow(panel)
             ax.set_title(f"{token_idx:02d}", fontsize=8)
@@ -372,11 +525,13 @@ def main() -> None:
         args.device = "cpu"
         args.device_map = "cpu"
 
-    if args.task == "train":
-        sample = load_train_sample(args)
-    else:
-        sample = load_lmms_eval_sample(args)
-    save_visualizations(sample, args)
+    for idx in args.index:
+        print(f"\n=== Processing index {idx} ===")
+        if args.task == "train":
+            sample = load_train_sample(args, idx)
+        else:
+            sample = load_lmms_eval_sample(args, idx)
+        save_visualizations(sample, args)
 
 
 if __name__ == "__main__":

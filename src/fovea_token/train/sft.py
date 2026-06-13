@@ -30,6 +30,7 @@ class DataArguments:
     data_path: str = field(default=None)
     image_folder: str = field(default=None)
     system_message: str = field(default="You are a helpful assistant.")
+    max_img_tokens: int = field(default=2048)
 
 
 @dataclass
@@ -307,8 +308,36 @@ class FT3Trainer(Trainer):
             return self.optimizer
 
         vision_tower_lr = self.args.vision_tower_lr
-        if vision_tower_lr is None:
+
+        # embed_tokens / lm_head always get weight_decay=0, even when
+        # freeze_embed_base=true (grad hooks zero non-special rows but
+        # AdamW weight decay still acts directly on param.data).
+        no_wd_prefixes = ("embed_tokens", "lm_head")
+
+        if vision_tower_lr is None and self.args.weight_decay <= 0:
             return super().create_optimizer()
+
+        if vision_tower_lr is None:
+            # build custom groups just for the no-wd prefixes
+            decay_parameter_names = set(get_parameter_names(self.model, ALL_LAYERNORM_LAYERS))
+            decay_parameter_names = {name for name in decay_parameter_names if not name.endswith("bias")}
+            optimizer_grouped_parameters = [
+                {"params": [], "weight_decay": self.args.weight_decay, "lr": self.args.learning_rate},
+                {"params": [], "weight_decay": 0.0, "lr": self.args.learning_rate},
+            ]
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if any(name.startswith(p) for p in no_wd_prefixes):
+                    optimizer_grouped_parameters[1]["params"].append(param)
+                elif name in decay_parameter_names:
+                    optimizer_grouped_parameters[0]["params"].append(param)
+                else:
+                    optimizer_grouped_parameters[1]["params"].append(param)
+            optimizer_grouped_parameters = [g for g in optimizer_grouped_parameters if g["params"]]
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args, self.model)
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+            return self.optimizer
 
         decay_parameter_names = set(get_parameter_names(self.model, ALL_LAYERNORM_LAYERS))
         decay_parameter_names = {name for name in decay_parameter_names if not name.endswith("bias")}
@@ -327,11 +356,12 @@ class FT3Trainer(Trainer):
                 continue
             is_vision = id(param) in vision_param_ids
             uses_decay = name in decay_parameter_names
-            if is_vision and uses_decay:
+            no_wd = any(name.startswith(p) for p in no_wd_prefixes)
+            if is_vision and (uses_decay and not no_wd):
                 optimizer_grouped_parameters[2]["params"].append(param)
             elif is_vision:
                 optimizer_grouped_parameters[3]["params"].append(param)
-            elif uses_decay:
+            elif uses_decay and not no_wd:
                 optimizer_grouped_parameters[0]["params"].append(param)
             else:
                 optimizer_grouped_parameters[1]["params"].append(param)
@@ -389,6 +419,12 @@ class FoveaMetricsCallback(transformers.TrainerCallback):
         aux = self._find_fovea_aux(model)
         if aux is None:
             return control
+        # Numerical diagnostics from fovea retrieval
+        num_diag = aux.get("_num_diag")
+        if isinstance(num_diag, dict):
+            for k, v in num_diag.items():
+                logs[f"num/{k}"] = v
+
         for key in ("lm_loss", "align_loss", "num_queries", "tokens_per_query"):
             value = aux.get(key)
             if value is None:
@@ -400,7 +436,150 @@ class FoveaMetricsCallback(transformers.TrainerCallback):
             if hasattr(value, "item"):
                 value = value.item()
             logs[f"fovea/{key}"] = value
+        # --- tensor-level gradient trace (survives aux overwrites) ---
+        grad_trace = getattr(model, "_fovea_grad_trace", None)
+        # Drill through PEFT / DeepSpeed wrappers to find the raw model
+        if grad_trace is None:
+            for attr in ("module", "base_model", "model"):
+                inner = getattr(model, attr, None)
+                if inner is not None:
+                    grad_trace = getattr(inner, "_fovea_grad_trace", None)
+                    if grad_trace is not None:
+                        break
+        if isinstance(grad_trace, dict):
+            for key, value in grad_trace.items():
+                logs[f"trace/{key}"] = value
+        # Log backward gradient diagnostic
+        bw_grads = aux.get("_bw_grads")
+        if isinstance(bw_grads, dict):
+            for module_name, pgrads in bw_grads.items():
+                if not isinstance(pgrads, dict):
+                    continue
+                for pname, gnorm in pgrads.items():
+                    logs[f"bw/{module_name}/{pname}"] = gnorm
+        # Log tensor-level gradient diagnostic
+        tensor_grads = aux.get("_tensor_grads")
+        if isinstance(tensor_grads, dict):
+            for tname, grad_list in tensor_grads.items():
+                if isinstance(grad_list, list) and grad_list:
+                    logs[f"tg/{tname}/norm"] = grad_list[-1]
         return control
+
+
+class PerModuleGradNormCallback(transformers.TrainerCallback):
+    """Log per-module gradient norms after each optimizer step.
+
+    Registers backward hooks on all trainable parameters during on_train_begin
+    and accumulates per-module squared gradient norms. Per-step norms are
+    logged at the same cadence as the trainer's default logging.
+    """
+
+    def __init__(self, log_prefix: str = "grad"):
+        self.log_prefix = log_prefix
+        self._handles: list = []
+        self._accumulated: dict[str, float] = {}
+
+    def on_train_begin(self, _args, state, control, model=None, **kwargs):
+        if model is None:
+            return control
+        self._register_hooks(model)
+        return control
+
+    @staticmethod
+    def _module_group(name: str) -> str:
+        """Collapse parameter names into top-level groups."""
+        full = name
+
+        # Fovea SSM params
+        if "fovea_ssm_in_proj_qkv" in full:
+            return "fovea_ssm_in_qkv"
+        if "fovea_ssm_in_proj_z" in full:
+            return "fovea_ssm_in_z"
+        if "fovea_ssm_in_proj_b" in full:
+            return "fovea_ssm_in_beta"
+        if "fovea_ssm_in_proj_a" in full:
+            return "fovea_ssm_in_a"
+        if "fovea_ssm_out_proj" in full:
+            return "fovea_ssm_out"
+        if "fovea_ssm_dt_bias" in full:
+            return "fovea_ssm_dt_bias"
+        if "fovea_ssm_A_log" in full:
+            return "fovea_ssm_A_log"
+        if "fovea_ssm_norm" in full:
+            return "fovea_ssm_norm"
+
+        # Fovea retrieval attn
+        if "fovea_q_proj" in full or "fovea_q_norm" in full:
+            return "fovea_attn_q"
+        if "fovea_k_proj" in full or "fovea_k_norm" in full:
+            return "fovea_attn_k"
+        if "fovea_v_proj" in full:
+            return "fovea_attn_v"
+        if "fovea_o_proj" in full:
+            return "fovea_attn_o"
+
+        if "fovea_tokens" in full:
+            return "fovea_tokens"
+
+        # LoRA weights
+        if "lora_A" in full:
+            if "visual" in full or "vision" in full:
+                return "lora_A_vision"
+            if "self_attn" in full:
+                return "lora_A_attn"
+            return "lora_A_ffn"
+        if "lora_B" in full:
+            if "visual" in full or "vision" in full:
+                return "lora_B_vision"
+            if "self_attn" in full:
+                return "lora_B_attn"
+            return "lora_B_ffn"
+
+        if "embed_tokens" in full and "modules_to_save" in full:
+            return "embed_tokens"
+        if "lm_head" in full and "modules_to_save" in full:
+            return "lm_head"
+
+        return "other"
+
+    def _make_hook(self, group_name: str):
+        def hook(grad, _group=group_name):
+            if grad is None:
+                return
+            sq_norm = grad.detach().float().norm().pow(2).item()
+            self._accumulated[_group] = self._accumulated.get(_group, 0.0) + sq_norm
+        return hook
+
+    def _register_hooks(self, model) -> None:
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            group = self._module_group(name)
+            handle = param.register_hook(self._make_hook(group))
+            self._handles.append(handle)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self._accumulated:
+            return control
+        # Snapshot and reset for the next optimizer step
+        state.__dict__["_per_module_grads"] = {
+            f"{self.log_prefix}/{group}": sq_sum ** 0.5
+            for group, sq_sum in self._accumulated.items()
+        }
+        self._accumulated = {}
+        return control
+
+    def on_log(self, _args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return control
+        per_module = state.__dict__.get("_per_module_grads", {})
+        logs.update(per_module)
+        return control
+
+    def __del__(self):
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
 
 
 
@@ -442,7 +621,7 @@ def main() -> None:
     model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
     model.config.vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
     model.config.vision_end_token_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
-    print_loading_summary(model, loading_info, source_label=loading_source_label)
+    # print_loading_summary(model, loading_info, source_label=loading_source_label)
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
@@ -461,11 +640,12 @@ def main() -> None:
         freeze_base_embedding_rows(model, model.config, tokenizer=tokenizer)
     if model_args.lora_enable:
         configure_vision_trainability_for_lora(model, unfreeze_vision=model_args.unfreeze_vision)
-    print_parameter_summary(model)
+    # print_parameter_summary(model)
 
     vision_packer = VisionPacker(
         processor=processor,
         vision_config=model.config.vision_config,
+        max_image_tokens=data_args.max_img_tokens,
     )
     train_dataset = LazySupervisedDataset(
         data_path=data_args.data_path,
@@ -488,7 +668,7 @@ def main() -> None:
         train_dataset=train_dataset,
         data_collator=data_collator,
         processing_class=processor,
-        callbacks=[StopAtStepCallback, FoveaMetricsCallback],
+        callbacks=[StopAtStepCallback, FoveaMetricsCallback, PerModuleGradNormCallback],
     )
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_state()

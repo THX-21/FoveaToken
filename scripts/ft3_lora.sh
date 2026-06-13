@@ -21,6 +21,7 @@ REPORT_TO="${FT3_REPORT_TO:-none}"
 WORKERS="${FT3_DATALOADER_NUM_WORKERS:-4}"
 UNFREEZE_VISION="${FT3_UNFREEZE_VISION:-true}"
 FREEZE_EMBED_BASE="${FT3_FREEZE_EMBED_BASE:-true}"
+MAX_IMG_TOKENS="${FT3_MAX_IMG_TOKENS:-2048}"
 
 echo "[ft3_lora] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
 echo "[ft3_lora] RUN_NAME=${RUN_NAME}"
@@ -33,6 +34,7 @@ echo "[ft3_lora] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
 echo "[ft3_lora] DATALOADER_NUM_WORKERS=${WORKERS}"
 echo "[ft3_lora] UNFREEZE_VISION=${UNFREEZE_VISION}"
 echo "[ft3_lora] FREEZE_EMBED_BASE=${FREEZE_EMBED_BASE}"
+echo "[ft3_lora] MAX_IMG_TOKENS=${MAX_IMG_TOKENS}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
@@ -67,6 +69,7 @@ fi
     --model_name_or_path "${CKPT_PATH}" \
     --data_path "${DATA_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
+    --max_img_tokens "${MAX_IMG_TOKENS}" \
     --lora_enable true \
     --lora_r 64 \
     --lora_alpha 16 \

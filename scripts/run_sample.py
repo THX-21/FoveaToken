@@ -16,20 +16,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="fovea", help="lmms-eval model name")
     parser.add_argument(
         "--model_args",
-        default="pretrained=checkpoints/fovea-vgr-ft/checkpoint-6250,device=cuda:1,device_map=cuda:1,attn_implementation=sdpa,enable_thinking=true",
+        default="pretrained=checkpoints/fovea-vgr-qwen/checkpoint-2500,device=cuda:4,device_map=cuda:4,attn_implementation=sdpa,enable_thinking=True, max_image_tokens=2048,disable_fovea_retrieval=False,fovea_auto_retrieve_on_answer_start=True",
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")
     parser.add_argument("--task", default="chartqa", help="lmms-eval task name")
-    parser.add_argument("--index", type=int, default=5, help="Start index in the task docs")
+    parser.add_argument("--index", type=int, default=10, help="Start index in the task docs")
     parser.add_argument("--num_samples", type=int, default=6, help="Number of consecutive samples to run")
-    parser.add_argument("--max_new_tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=0.4)
+    parser.add_argument("--max_new_tokens", type=int, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--show_prompt", action="store_true", help="Print the full rendered prompt")
     parser.add_argument("--show_full", action="store_true", help="Print the full decoded prompt+generation")
-    parser.add_argument("--preview_chars", type=int, default=800, help="Max chars to show for preview blocks")
+    parser.add_argument("--preview_chars", type=int, default=3000, help="Max chars to show for preview blocks")
     return parser.parse_args()
 
 
@@ -85,42 +85,6 @@ def _init_model(model_name: str, model_args: dict, force_simple: bool):
     return resolved, model_cls(**model_args)
 
 
-def _build_simple_messages(model, visuals, question: str):
-    content = []
-    for visual in visuals:
-        content.append({"type": "image", "image": visual})
-    content.append({"type": "text", "text": question})
-    return [{"role": "user", "content": content}]
-
-
-def _prepare_simple_inputs(model, visuals, question: str):
-    texts = model._apply_chat_template([_build_simple_messages(model, visuals, question)])
-    processor_kwargs = {
-        "text": texts,
-        "images": list(visuals),
-        "return_mm_token_type_ids": True,
-        "return_tensors": "pt",
-    }
-    inputs = model.processor(**processor_kwargs)
-
-    if getattr(model, "vision_packer", None) is not None and visuals and not getattr(model, "disable_fovea_retrieval", False):
-        retrieve_pixels, retrieve_grid, retrieve_boxes = model.vision_packer.pack_retrieve(
-            visuals[0],
-            getattr(model, "retrieve_max_image_tokens", None),
-        )
-        import torch
-
-        inputs["retrieve_pixel_values"] = retrieve_pixels
-        inputs["retrieve_grid_thw"] = retrieve_grid.unsqueeze(0)
-        inputs["retrieve_patch_boxes"] = retrieve_boxes
-        inputs["retrieve_image_counts"] = torch.tensor([1], dtype=torch.long)
-
-    return {
-        key: value.to(model.device) if hasattr(value, "to") else value
-        for key, value in inputs.items()
-    }, texts[0]
-
-
 def _task_eval_split(task) -> str:
     if task.has_test_docs():
         return task.config.test_split
@@ -163,45 +127,14 @@ def _run_simple_sample(model, task, doc_idx: int, context: str, gen_kwargs: dict
     return text, token_counts
 
 
-def _decode_raw(model, gen_ids):
-    decoder = getattr(model, "processor", None) or getattr(model, "tokenizer", None)
-    if decoder is None or not hasattr(decoder, "batch_decode"):
-        raise RuntimeError(f"Model '{type(model).__name__}' does not expose a batch_decode-capable processor/tokenizer.")
-    raw = decoder.batch_decode(
-        [gen_ids],
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )[0]
-    clean = decoder.batch_decode(
-        [gen_ids],
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )[0]
-    return raw, clean
+def _restore_logged_output(model, text: str) -> str:
+    from lmms_eval.api.reasoning import restore_prefilled_reasoning_prefix
 
-
-def _decode_prompt_and_full(model, prompt_ids, full_ids):
-    decoder = getattr(model, "processor", None) or getattr(model, "tokenizer", None)
-    if decoder is None or not hasattr(decoder, "batch_decode"):
-        raise RuntimeError(f"Model '{type(model).__name__}' does not expose a batch_decode-capable processor/tokenizer.")
-    prompt = decoder.batch_decode(
-        [prompt_ids],
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )[0]
-    full = decoder.batch_decode(
-        [full_ids],
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )[0]
-    return prompt, full
-
-
-def _count_fovea_tokens(model, ids_list: list[int]) -> str:
-    cfg = getattr(model.model, "config", None)
-    if cfg is None or getattr(cfg, "fovea_token_id", None) is None:
-        return "n/a"
-    return str(ids_list.count(int(cfg.fovea_token_id)))
+    return restore_prefilled_reasoning_prefix(
+        text,
+        [["<think>", "</think>"]],
+        getattr(model, "enable_thinking", None),
+    )
 
 
 def _compact_text(text: str, limit: int) -> str:
@@ -226,8 +159,6 @@ def main() -> None:
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-    import torch
-
     model_args = _parse_model_args(args.model_args)
     resolved_model, model = _init_model(args.model, model_args, args.force_simple)
     task = _init_task(args.task, resolved_model.model_id, resolved_model.model_type)
@@ -239,61 +170,49 @@ def main() -> None:
 
     total_time = 0.0
     for i in range(args.num_samples):
-        prompt_text = None
-        full_text = None
         doc_idx = args.index + i
         doc = docs[doc_idx]
         question = task.doc_to_text(doc) if hasattr(task, "doc_to_text") else ""
         context = question
         answer = doc.get("answer", task.doc_to_target(doc) if hasattr(task, "doc_to_target") else "N/A")
 
-        sample_gen_kwargs = {
-            "max_new_tokens": args.max_new_tokens,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-            "do_sample": args.temperature > 0,
-        }
+        sample_gen_kwargs = dict(getattr(task.config, "generation_kwargs", {}) or {})
+        if args.max_new_tokens is not None:
+            sample_gen_kwargs["max_new_tokens"] = args.max_new_tokens
+        if args.temperature is not None:
+            sample_gen_kwargs["temperature"] = args.temperature
+            sample_gen_kwargs["do_sample"] = args.temperature > 0
+        if args.top_p is not None:
+            sample_gen_kwargs["top_p"] = args.top_p
+        if args.top_k is not None:
+            sample_gen_kwargs["top_k"] = args.top_k
 
         if resolved_model.model_type == "chat":
             t0 = time.time()
             raw, token_counts = _run_chat_sample(model, task, doc_idx, question, sample_gen_kwargs)
             elapsed = time.time() - t0
             total_time += elapsed
+            display_raw = _restore_logged_output(model, raw)
 
             n_tok = token_counts.output_tokens if token_counts is not None else "n/a"
-            hit_limit = n_tok != "n/a" and int(n_tok) >= args.max_new_tokens
-            has_think_end = "</think>" in raw
-            fovea_count = "n/a"
-        elif not hasattr(model, "_apply_chat_template"):
+            max_new_tokens = sample_gen_kwargs.get("max_new_tokens")
+            hit_limit = n_tok != "n/a" and max_new_tokens is not None and int(n_tok) >= int(max_new_tokens)
+            has_think_end = "</think>" in display_raw
+            fovea_hist = getattr(getattr(model, "model", None), "_fovea_aux_history", None) or []
+            fovea_count = len(fovea_hist)
+        else:
             t0 = time.time()
             raw, token_counts = _run_simple_sample(model, task, doc_idx, question, sample_gen_kwargs)
             elapsed = time.time() - t0
             total_time += elapsed
+            display_raw = _restore_logged_output(model, raw)
 
             n_tok = token_counts.output_tokens if token_counts is not None else "n/a"
-            hit_limit = n_tok != "n/a" and int(n_tok) >= args.max_new_tokens
-            has_think_end = "</think>" in raw
-            fovea_count = "n/a"
-        else:
-            visuals = task.doc_to_visual(doc) or []
-            inputs, context = _prepare_simple_inputs(model, visuals, question)
-
-            gen_kwargs = model._build_generate_kwargs(sample_gen_kwargs)
-
-            t0 = time.time()
-            with torch.no_grad():
-                cont = model.model.generate(**inputs, **gen_kwargs)
-            elapsed = time.time() - t0
-            total_time += elapsed
-
-            gen_ids = cont[0, inputs["input_ids"].shape[1] :]
-            n_tok = int(gen_ids.shape[0])
-            hit_limit = n_tok >= args.max_new_tokens
-            raw, _clean = _decode_raw(model, gen_ids)
-            prompt_text, full_text = _decode_prompt_and_full(model, inputs["input_ids"][0], cont[0])
-            has_think_end = "</think>" in raw
-            fovea_count = _count_fovea_tokens(model, gen_ids.tolist())
+            max_new_tokens = sample_gen_kwargs.get("max_new_tokens")
+            hit_limit = n_tok != "n/a" and max_new_tokens is not None and int(n_tok) >= int(max_new_tokens)
+            has_think_end = "</think>" in display_raw
+            fovea_hist = getattr(getattr(model, "model", None), "_fovea_aux_history", None) or []
+            fovea_count = len(fovea_hist)
 
         print(f"\n{'=' * 80}")
         print(f"Sample {doc_idx}")
@@ -301,18 +220,7 @@ def main() -> None:
         print(f"GT: {answer}")
         print(f"Q: {question or context}")
         print(f"{'─' * 80}")
-        if prompt_text is not None:
-            if args.show_prompt:
-                _print_block("PROMPT", prompt_text, args.preview_chars)
-            else:
-                _print_block("PROMPT PREVIEW", prompt_text, args.preview_chars)
-            print(f"{'─' * 80}")
-            _print_block("OUTPUT", raw, args.preview_chars)
-            if args.show_full:
-                print(f"{'─' * 80}")
-                _print_block("FULL", full_text, args.preview_chars)
-        else:
-            _print_block("OUTPUT", raw, args.preview_chars)
+        _print_block("OUTPUT", display_raw, args.preview_chars)
         print(f"{'=' * 80}")
 
     print(f"\nTotal time: {total_time:.1f}s | Avg: {total_time / args.num_samples:.1f}s/sample")

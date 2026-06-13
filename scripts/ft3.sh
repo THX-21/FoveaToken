@@ -22,9 +22,9 @@ export WORLD_SIZE=$((NNODES * NUM_GPUS))
 export RANK=0
 
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
-RUN_NAME="${FT3_RUN_NAME:-fovea-vgr-242}"
+RUN_NAME="${FT3_RUN_NAME:-fovea-vgr-qwen}"
 DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr/preprocessed}"
-IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/vgr/llava_next_raw_format}"
+IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/llava_next/llava_next_raw_format}"
 CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen3.5-4B}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-100}"
@@ -32,6 +32,7 @@ MAX_STEPS="${FT3_MAX_STEPS:--1}"
 ATTN_IMPLEMENTATION="${FT3_ATTN_IMPLEMENTATION:-sdpa}"
 UNFREEZE_VISION="${FT3_UNFREEZE_VISION:-true}"
 FREEZE_EMBED_BASE="${FT3_FREEZE_EMBED_BASE:-false}"
+MAX_IMG_TOKENS="${FT3_MAX_IMG_TOKENS:-2048}"
 
 echo "[ft3] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
 echo "[ft3] RUN_NAME=${RUN_NAME}"
@@ -43,6 +44,7 @@ echo "[ft3] SAVE_STEPS=${SAVE_STEPS}"
 echo "[ft3] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
 echo "[ft3] UNFREEZE_VISION=${UNFREEZE_VISION}"
 echo "[ft3] FREEZE_EMBED_BASE=${FREEZE_EMBED_BASE}"
+echo "[ft3] MAX_IMG_TOKENS=${MAX_IMG_TOKENS}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 
@@ -87,6 +89,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --model_name_or_path "${CKPT_PATH}" \
     --data_path "${DATA_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
+    --max_img_tokens "${MAX_IMG_TOKENS}" \
     --lora_enable false \
     --lora_r 64 \
     --lora_alpha 16 \

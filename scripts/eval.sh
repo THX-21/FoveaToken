@@ -9,16 +9,18 @@ BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen3.5-4B}"
 CHECKPOINT_MODE="${EVAL_CHECKPOINT_MODE:-full}"
 # LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr/checkpoint-200}"
 # LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-Qwen/Qwen3.5-4B}"
-# FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr-ft/checkpoint-6250}"
+# FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr-qwen/checkpoint-2300}"
 FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-Qwen/Qwen3.5-4B}"
 TASKS="${EVAL_TASKS:-chartqa}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 ATTN_IMPLEMENTATION="${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
-DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:0}"
+DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:3}"
 DEVICE="${EVAL_DEVICE:-${DEVICE_MAP}}"
 BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
+MAX_IMG_TOKENS="${EVAL_MAX_IMG_TOKENS:-2048}"
+MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-1024}"
 
-COMMON_MODEL_ARGS="device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=false,fovea_auto_retrieve_on_answer_start=true"
+COMMON_MODEL_ARGS="device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=true,fovea_auto_retrieve_on_answer_start=false,max_image_tokens=${MAX_IMG_TOKENS}"
 case "${CHECKPOINT_MODE}" in
   full)
     RESOLVED_CHECKPOINT="${FULL_CHECKPOINT}"
@@ -50,6 +52,8 @@ echo "[eval] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
 echo "[eval] DEVICE=${DEVICE}"
 echo "[eval] DEVICE_MAP=${DEVICE_MAP}"
 echo "[eval] BATCH_SIZE=${BATCH_SIZE}"
+echo "[eval] MAX_IMG_TOKENS=${MAX_IMG_TOKENS}"
+echo "[eval] MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
 echo "[eval] LOG_SUFFIX=${LOG_SUFFIX}"
 echo "[eval] ACCELERATE_BIN=${ACCELERATE_BIN}"
 echo "[eval] MODEL_ARGS=${MODEL_ARGS}"
@@ -65,6 +69,7 @@ echo "[eval] MODEL_ARGS=${MODEL_ARGS}"
   --model_args "${MODEL_ARGS}" \
   --tasks "${TASKS}" \
   --batch_size "${BATCH_SIZE}" \
+  --gen_kwargs "max_new_tokens=${MAX_NEW_TOKENS}" \
   --log_samples \
   --log_samples_suffix "${LOG_SUFFIX}" \
   --output_path "${OUTPUT_PATH}" \

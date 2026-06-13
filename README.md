@@ -58,6 +58,7 @@ bash scripts/ft3_lora.sh
 - `FT3_IMAGE_FOLDER`
 - `FT3_CKPT_PATH`
 - `FT3_OUTPUT_DIR`
+- `FT3_MAX_IMG_TOKENS`
 - `FT3_NUM_TRAIN_EPOCHS`
 - `FT3_MAX_STEPS`
 - `FT3_UNFREEZE_VISION`
@@ -67,8 +68,9 @@ bash scripts/ft3_lora.sh
 
 `scripts/ft3_lora.sh` 默认启用 LoRA；`FT3_UNFREEZE_VISION=true` 时只训练 vision tower LoRA，设为 `false` 时 vision tower 完全冻结。`FT3_FREEZE_EMBED_BASE=true` 时冻结 embedding/`lm_head` 的 base vocab rows，只训练 `<fovea>`、`<think>`、`</think>` 新增 token rows。
 
-训练 prompt 使用 checkpoint 自带的 HF `processor.apply_chat_template()` 渲染，和 Qwen3.5 原生推理入口保持一致。图像 `<image>` 占位符仍由本仓库按 `image_grid_thw` 对应 token count 提前展开；assistant 内容中的 `<think>`/`</think>` 是本仓库新增的 atomic marker tokens。
-训练编码阶段如果 chat template 本身没有在 assistant 结尾给出 `eos`，会额外补一个 `eos_token_id`，并把它纳入 LM 监督。
+训练 prompt 使用 checkpoint 自带的 HF `processor.apply_chat_template()` 渲染，和 Qwen3.5 原生推理入口保持一致。图像 `<image>` 占位符仍由本仓库按 `image_grid_thw` 对应 token count 提前展开；assistant 内容中的 `<think>`/`</think>` 是本仓库新增的 atomic marker tokens。训练前会把 assistant 开头的思维块规范成 Qwen 风格 `"<think>\n...\n</think>\n\n答案"`；其中开头的 `<think>\n` 只作为前缀上下文，不进入 LM 监督。
+训练时初始图像上下文默认通过官方 `max_pixels` 路径限制到 `FT3_MAX_IMG_TOKENS=2048` 个 Qwen 图像 token，避免大图直接把上下文撑满；fovea retrieval 视觉池仍单独使用 `retrieve_max_image_tokens=4096`。
+训练编码阶段只监督 assistant 结尾的 `<|im_end|>`，不监督它后面的换行，也不额外补 `eos`。
 
 ## 离线预处理
 

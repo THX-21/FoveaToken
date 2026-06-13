@@ -24,6 +24,8 @@ DEFAULT_VISION_START = "<|vision_start|>"
 DEFAULT_VISION_END = "<|vision_end|>"
 SOT_EOT_IMAGE_RE = re.compile(r"<SOT>\s*(\[[^\]]+\])\s*<EOT>\s*<image>")
 ORPHAN_VGR_TAG_RE = re.compile(r"<SOT>|<EOT>")
+THINK_START = "<think>"
+THINK_END = "</think>"
 
 
 def image_token_count_from_grid(image_grid_thw, merge_size: int) -> int:
@@ -187,6 +189,50 @@ def _render_chat_template(processor, messages: Sequence[dict[str, Any]]) -> str:
     return rendered
 
 
+def _assistant_role_prefix_token_len(tokenizer: PreTrainedTokenizerBase) -> int:
+    """Token length of the assistant role prefix emitted by the Qwen chat template."""
+
+    return len(tokenize_text(tokenizer, "<|im_start|>assistant\n"))
+
+
+def _assistant_turn_suffix_token_len(tokenizer: PreTrainedTokenizerBase) -> int:
+    """Token length of the assistant turn suffix emitted by the Qwen chat template."""
+
+    return len(tokenize_text(tokenizer, "<|im_end|>\n"))
+
+
+def normalize_assistant_think_text(text: str) -> str:
+    """Normalize leading assistant think blocks to Qwen-style newlines."""
+
+    if not text.startswith(THINK_START):
+        return text
+
+    remainder = text[len(THINK_START) :]
+    if not remainder.startswith("\n"):
+        remainder = "\n" + remainder
+
+    if THINK_END not in remainder:
+        return THINK_START + remainder
+
+    think_body, suffix = remainder.split(THINK_END, 1)
+    think_body = think_body.rstrip("\n")
+    if suffix:
+        suffix = suffix.lstrip("\n")
+        return f"{THINK_START}{think_body}\n{THINK_END}\n\n{suffix}"
+    return f"{THINK_START}{think_body}\n{THINK_END}"
+
+
+def normalize_conversation_think_format(conversations: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized = copy.deepcopy(list(conversations))
+    for sentence in normalized:
+        if sentence.get("from") not in {"gpt", "assistant"}:
+            continue
+        value = sentence.get("value")
+        if isinstance(value, str):
+            sentence["value"] = normalize_assistant_think_text(value)
+    return normalized
+
+
 def encode_chat_template_example(
     processor,
     tokenizer: PreTrainedTokenizerBase,
@@ -196,14 +242,10 @@ def encode_chat_template_example(
 ) -> tuple[torch.LongTensor, torch.LongTensor]:
     """Encode one conversation into causal-LM inputs and labels.
 
-    Labeling policy:
-    - system turns: ignored
-    - user turns: ignored
-    - assistant turns: supervise the sample-provided assistant content and turn
-      end marker, not the role prefix
-
-    This is the standard SFT setup where the model learns to continue the prompt
-    as the assistant.
+    The checkpoint chat template requires at least one user query, so we only
+    render cumulative prefixes after the first user message exists. This keeps
+    the prompt fully template-compatible while still letting us build
+    assistant-only supervision by diffing valid rendered prefixes.
     """
 
     prompt_conversations = replace_image_tokens_in_conversations(list(conversations), image_token_counts)
@@ -216,20 +258,28 @@ def encode_chat_template_example(
     input_ids: list[int] = []
     labels: list[int] = []
 
-    def append_segment(text: str, supervised_prefix_len: int | None) -> None:
-        # `supervised_prefix_len=None` means the entire segment is context only.
-        # Otherwise we mask the prefix tokens and train on the remainder.
+    def append_segment(text: str, supervised_prefix_len: int | None, supervised_suffix_len: int = 0) -> None:
         segment_ids = tokenize_text(tokenizer, text)
         input_ids.extend(segment_ids)
         if supervised_prefix_len is None:
             labels.extend([IGNORE_INDEX] * len(segment_ids))
         else:
             supervised_prefix_len = min(supervised_prefix_len, len(segment_ids))
+            supervised_suffix_len = min(supervised_suffix_len, max(0, len(segment_ids) - supervised_prefix_len))
+            supervised_end = len(segment_ids) - supervised_suffix_len
             labels.extend([IGNORE_INDEX] * supervised_prefix_len)
-            labels.extend(segment_ids[supervised_prefix_len:])
+            labels.extend(segment_ids[supervised_prefix_len:supervised_end])
+            labels.extend([IGNORE_INDEX] * supervised_suffix_len)
 
-    rendered_prefix = ""
-    for message_index, message in enumerate(messages):
+    first_user_index = next((idx for idx, message in enumerate(messages) if message["role"] == "user"), None)
+    if first_user_index is None:
+        raise ValueError("Chat-template training samples must contain at least one user message.")
+
+    rendered_prefix = _render_chat_template(processor, messages[: first_user_index + 1])
+    append_segment(rendered_prefix, supervised_prefix_len=None)
+
+    for message_index in range(first_user_index + 1, len(messages)):
+        message = messages[message_index]
         rendered_current = _render_chat_template(processor, messages[: message_index + 1])
         if not rendered_current.startswith(rendered_prefix):
             raise ValueError("Chat template rendering is not prefix-stable; cannot build assistant-only labels.")
@@ -238,17 +288,12 @@ def encode_chat_template_example(
         if message["role"] != "assistant":
             append_segment(segment, supervised_prefix_len=None)
             continue
-        content = str(message["content"])
-        content_offset = segment.find(content)
-        if content_offset < 0:
-            raise ValueError("Could not locate assistant content inside rendered chat template segment.")
-        prefix_len = len(tokenize_text(tokenizer, segment[:content_offset]))
-        append_segment(segment, supervised_prefix_len=prefix_len)
-
-    eos_token_id = tokenizer.eos_token_id
-    if messages[-1]["role"] == "assistant" and eos_token_id is not None and (not input_ids or input_ids[-1] != eos_token_id):
-        input_ids.append(int(eos_token_id))
-        labels.append(int(eos_token_id))
+        prefix_len = _assistant_role_prefix_token_len(tokenizer)
+        if message["content"].startswith(THINK_START + "\n"):
+            prefix_len += len(tokenize_text(tokenizer, THINK_START + "\n"))
+        suffix_len = _assistant_turn_suffix_token_len(tokenizer)
+        # Supervise only the final <|im_end|>, not the trailing newline.
+        append_segment(segment, supervised_prefix_len=prefix_len, supervised_suffix_len=max(0, suffix_len - 1))
 
     return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
@@ -369,6 +414,13 @@ class VisionPacker:
     def _process(self, image: Image.Image, max_image_tokens: int | None = None) -> tuple[torch.Tensor, torch.LongTensor]:
         kwargs = {}
         if max_image_tokens is not None:
+            min_pixels = getattr(self.image_processor, "min_pixels", None)
+            if min_pixels is None:
+                size = getattr(self.image_processor, "size", None)
+                if size is not None:
+                    min_pixels = size.get("shortest_edge")
+            if min_pixels is not None:
+                kwargs["min_pixels"] = int(min_pixels)
             kwargs["max_pixels"] = (
                 int(max_image_tokens)
                 * self.spatial_merge_size
@@ -453,15 +505,8 @@ class LazySupervisedDataset(Dataset):
             raise ValueError(f"Unsupported image value type: {type(image_value)!r}")
         return Image.open(os.path.join(self.image_folder, image_value)).convert("RGB")
 
-    def _load_image(self, image_value: Any) -> tuple[torch.Tensor, torch.LongTensor]:
-        """Load one image from inline bytes or from `image_folder` and pack it."""
-
-        image = self._open_image(image_value)
-        return self.vision_packer.pack(image)
-
-    def _load_retrieve_image(self, image_value: Any) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
-        image = self._open_image(image_value)
-        return self.vision_packer.pack_retrieve(image, self.retrieve_max_image_tokens)
+    def _load_image(self, image_value: Any) -> Image.Image:
+        return self._open_image(image_value)
 
     def _build_instance(self, index: int) -> dict[str, Any]:
         """Build one training instance.
@@ -490,8 +535,9 @@ class LazySupervisedDataset(Dataset):
             retrieve_grid_list = []
             retrieve_box_list = []
             for image_value in image_values:
-                packed_pixels, packed_grid = self._load_image(image_value)
-                retrieve_pixels, retrieve_grid, retrieve_boxes = self._load_retrieve_image(image_value)
+                pil_image = self._open_image(image_value)
+                packed_pixels, packed_grid = self.vision_packer.pack(pil_image)
+                retrieve_pixels, retrieve_grid, retrieve_boxes = self.vision_packer.pack_retrieve(pil_image, self.retrieve_max_image_tokens)
                 retrieve_pixels_list.append(retrieve_pixels)
                 retrieve_grid_list.append(retrieve_grid)
                 retrieve_box_list.append(retrieve_boxes)
@@ -511,7 +557,7 @@ class LazySupervisedDataset(Dataset):
                     retrieve_grid_thw = torch.stack(retrieve_grid_list, dim=0)
                     retrieve_patch_boxes = torch.cat(retrieve_box_list, dim=0)
 
-        conversations = copy.deepcopy(record["conversations"])
+        conversations = normalize_conversation_think_format(record["conversations"])
         query_boxes.extend(tuple(float(v) for v in box) for box in record.get("fovea_query_boxes", []))
         if query_boxes:
             if image_field is None:
@@ -554,21 +600,16 @@ class LazySupervisedDataset(Dataset):
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        for offset in range(len(self.records)):
-            current_index = (index + offset) % len(self.records)
-            instance = self._build_instance(current_index)
-            if self.model_max_length <= 0 or instance["input_ids"].numel() <= self.model_max_length:
-                return instance
-            if current_index not in self._printed_overlength_indices:
-                self._printed_overlength_indices.add(current_index)
-                image_name = self.records[current_index].get("image", "<no-image>")
-                print(
-                    "[data] skip overlength sample "
-                    f"index={current_index} image={image_name} "
-                    f"tokens={instance['input_ids'].numel()} model_max_length={self.model_max_length}",
-                    flush=True,
-                )
-        raise RuntimeError(f"All {len(self.records)} training samples exceed model_max_length={self.model_max_length}.")
+        instance = self._build_instance(index)
+        if self.model_max_length > 0 and instance["input_ids"].numel() > self.model_max_length:
+            image_name = self.records[index].get("image", "<no-image>")
+            print(
+                "[data] overlength sample (will be truncated by collator) "
+                f"index={index} image={image_name} "
+                f"tokens={instance['input_ids'].numel()} model_max_length={self.model_max_length}",
+                flush=True,
+            )
+        return instance
 
 
 @dataclass

@@ -10,7 +10,7 @@ class FoveaConfig(_Qwen3_5Config):
     def __init__(
         self,
         *args,
-        fovea_num_tokens: int = 64,
+        fovea_num_tokens: int = 256,
         fovea_lambda_align: float = 0.2,
         fovea_align_eps: float = 1e-6,
         fovea_align_alpha: float = 1.0,

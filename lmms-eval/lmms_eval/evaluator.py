@@ -28,7 +28,7 @@ import lmms_eval.api.registry
 from lmms_eval import models
 from lmms_eval.api.instance import Instance, unwrap_generation_output
 from lmms_eval.api.model import lmms
-from lmms_eval.api.reasoning import parse_reasoning_tags_config, strip_reasoning_tags
+from lmms_eval.api.reasoning import parse_reasoning_tags_config, restore_prefilled_reasoning_prefix, strip_reasoning_tags
 from lmms_eval.api.task import Task
 from lmms_eval.baselines import (
     BASELINE_REGISTRY,
@@ -1177,12 +1177,39 @@ def evaluate(
                         else:
                             per_sample_tc.append(None)
 
+                    logged_resps = []
+                    for req in requests:
+                        raw_resp = req.resps
+                        if isinstance(raw_resp, list):
+                            logged_resps.append(
+                                [
+                                    restore_prefilled_reasoning_prefix(
+                                        resp,
+                                        reasoning_tags,
+                                        getattr(lm, "enable_thinking", None),
+                                    )
+                                    if isinstance(resp, str)
+                                    else resp
+                                    for resp in raw_resp
+                                ]
+                            )
+                        elif isinstance(raw_resp, str):
+                            logged_resps.append(
+                                restore_prefilled_reasoning_prefix(
+                                    raw_resp,
+                                    reasoning_tags,
+                                    getattr(lm, "enable_thinking", None),
+                                )
+                            )
+                        else:
+                            logged_resps.append(raw_resp)
+
                     example = {
                         "doc_id": doc_id,
                         "doc": saved_doc,
                         "target": target,
                         "arguments": filtered_arguments,
-                        "resps": [req.raw_filtered_resps.get(filter_key, req.resps) for req in requests],
+                        "resps": logged_resps,
                         "filtered_resps": [req.filtered_resps[filter_key] for req in requests],
                         "token_counts": per_sample_tc,
                         "doc_hash": hash_string(

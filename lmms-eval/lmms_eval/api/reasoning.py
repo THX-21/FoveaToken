@@ -45,3 +45,16 @@ def parse_reasoning_tags_config(cli_value: Optional[str] = None, task_value: Opt
     if isinstance(effective, str):
         return json.loads(effective)
     return effective
+
+
+def restore_prefilled_reasoning_prefix(text: str, tag_pairs: Optional[List[List[str]]], enable_thinking: Optional[bool] = None) -> str:
+    """Restore a prefilled reasoning prefix for log display."""
+    if not isinstance(text, str) or not tag_pairs:
+        return text
+    start_tag, _ = tag_pairs[0]
+    if start_tag in text:
+        return text
+    if enable_thinking is False:
+        prefix = f"{start_tag}\n\n</think>\n\n"
+        return f"{prefix}{text}" if text else prefix.rstrip()
+    return f"{start_tag}\n{text}" if text else start_tag

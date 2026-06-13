@@ -73,6 +73,9 @@ class FinalAnswerFilter(Filter):
         if not text:
             return ""
 
+        # Strip special tokens like <|im_end|>, <|endoftext|>
+        text = re.sub(r"<\|[^<>|]+\|>", "", text)
+
         answer_tags = re.findall(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.IGNORECASE | re.DOTALL)
         if answer_tags:
             text = answer_tags[-1].strip()

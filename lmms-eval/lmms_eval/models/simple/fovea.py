@@ -89,7 +89,7 @@ class Fovea(Qwen3_VL):
         max_image_tokens: int | None = 512,
         retrieve_max_image_tokens: int | None = 4096,
         disable_fovea_retrieval: Optional[bool] = False,
-        fovea_auto_retrieve_on_answer_start: Optional[bool] = True,
+        fovea_auto_retrieve_on_answer_start: Optional[bool] = False,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -377,7 +377,7 @@ class Fovea(Qwen3_VL):
                 generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
                 answers = self.processor.batch_decode(
                     generated_ids_trimmed,
-                    skip_special_tokens=True,
+                    skip_special_tokens=False,
                     clean_up_tokenization_spaces=False,
                 )
                 for i, ans in enumerate(answers):
@@ -387,7 +387,6 @@ class Fovea(Qwen3_VL):
                     answers[i] = ans
 
                 for ans, context in zip(answers, contexts):
-                    ans = self._strip_thinking(ans)
                     res.append(ans)
                     self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
                     pbar.update(1)

@@ -50,8 +50,12 @@ VGR 中的：
 
 每个 `<fovea>` 必须绑定一个原图归一化 box，用于 `L_align`。图像路径相对 `image_folder`。assistant 文本里不属于合法 region tag 的残留 `<image>`、孤立 `<SOT>`、孤立 `<EOT>` 会在离线预处理阶段直接清掉，不再参与 placeholder 展开。
 
-训练 prompt 使用 checkpoint 自带的 HF `processor.apply_chat_template()` 渲染，保持和 Qwen3.5 原生推理入口一致。`<image>` 占位符在模板渲染前由 `src/fovea_token/train/data.py` 按 `image_grid_thw` 对应 token count 展开；assistant 文本中的 `<think>`/`</think>` 是本仓库新增的 atomic marker tokens。
-训练编码阶段如果 chat template 本身没有在 assistant 结尾给出 `eos`，会额外补一个 `eos_token_id`，并把它纳入 LM 监督。
+训练 prompt 使用 checkpoint 自带的 HF `processor.apply_chat_template()` 渲染，保持和 Qwen3.5 原生推理入口一致。`<image>` 占位符在模板渲染前由 `src/fovea_token/train/data.py` 按 `image_grid_thw` 对应 token count 展开；assistant 文本中的 `<think>`/`</think>` 是本仓库新增的 atomic marker tokens。训练前会把 assistant 开头的思维块规范成 Qwen 风格 `"<think>\n...\n</think>\n\n答案"`。
+训练监督规则固定为：
+- `"<|im_start|>assistant\n"` 不监督。
+- assistant 开头的 `"<think>\n"` 不监督，只作为前缀上下文。
+- `</think>`、其后的 `"\n\n"`、最终答案正文都继续监督。
+- assistant 结尾只监督 `<|im_end|>`，不监督它后面的换行，也不额外补 `eos`。
 
 训练默认读取离线预处理结果：
 
@@ -98,6 +102,7 @@ bash scripts/test_deepspeed_2gpu.sh
 - `FT3_IMAGE_FOLDER`
 - `FT3_CKPT_PATH`
 - `FT3_OUTPUT_DIR`
+- `FT3_MAX_IMG_TOKENS`
 - `FT3_UNFREEZE_VISION`
 - `FT3_FREEZE_EMBED_BASE`
 - `FT3_DATALOADER_NUM_WORKERS`
@@ -110,6 +115,17 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 ```
 
 LoRA 训练如果同时开启 `unfreeze_vision=true`，vision tower 只训练 LoRA 参数；`unfreeze_vision=false` 时 vision tower 完全冻结，不额外保存全量 `vision_tower.safetensors`。全参训练（`lora_enable=false`）也遵守 `unfreeze_vision`：`true` 时全量训练 vision tower，`false` 时冻结 vision tower、其余参数继续全参训练。`freeze_embed_base=true` 时 embedding/`lm_head` 的 base vocab rows 冻结，只训练 `<fovea>`、`<think>`、`</think>` 新增 token rows；设为 `false` 时不加 row-level gradient mask。
+训练时初始图像上下文默认通过官方 `max_pixels` 路径限制到 `FT3_MAX_IMG_TOKENS=2048` 个 Qwen 图像 token；fovea retrieval 视觉池仍保持单独的 `retrieve_max_image_tokens=4096`。
+
+## 运行环境
+
+所有 Python 命令默认使用项目根目录下的 `.venv`：
+
+```bash
+.venv/bin/python script.py
+```
+
+不要使用其他 conda 环境或系统 python。
 
 ## 修改规则
 

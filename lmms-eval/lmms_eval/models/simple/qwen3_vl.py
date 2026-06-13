@@ -283,8 +283,11 @@ class Qwen3_VL(lmms):
         """Strip <think>...</think> content from model output if enable_thinking is set."""
         if self.enable_thinking:
             _, _, remaining = answer.partition("</think>")
-            return remaining.strip()
-        return answer
+            answer = remaining.strip()
+        # Remove EOS/IM_END tokens that may appear after special-token-inclusive decoding
+        for tok in ("<|im_end|>", "<|endoftext|>"):
+            answer = answer.replace(tok, "")
+        return answer.strip()
 
     def _preprocess_chunk(self, chunk):
         """Preprocess a batch chunk on CPU: message building, video decoding, tokenization.
@@ -435,7 +438,7 @@ class Qwen3_VL(lmms):
             generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
             answers = self.processor.batch_decode(
                 generated_ids_trimmed,
-                skip_special_tokens=True,
+                skip_special_tokens=False,
                 clean_up_tokenization_spaces=False,
             )
             for i, ans in enumerate(answers):
@@ -445,7 +448,6 @@ class Qwen3_VL(lmms):
                 answers[i] = ans
 
             for ans, context in zip(answers, contexts):
-                ans = self._strip_thinking(ans)
                 res.append(ans)
                 self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
                 pbar.update(1)
