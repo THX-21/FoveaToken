@@ -11,6 +11,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
+from ..fovea_crop import crop_from_normalized_box
 from ..tokenizers.tokenization_fovea import FOVEA_TOKEN
 
 Image.MAX_IMAGE_PIXELS = None
@@ -43,6 +44,36 @@ def build_visual_placeholder(
     vision_end_token: str = DEFAULT_VISION_END,
 ) -> str:
     return f"{vision_start_token}{image_token * int(num_image_tokens)}{vision_end_token}"
+
+
+def append_visual_placeholders_to_fovea(
+    conversations: Sequence[dict[str, Any]],
+    crop_token_counts: Sequence[int],
+) -> list[dict[str, Any]]:
+    updated = copy.deepcopy(list(conversations))
+    crop_cursor = 0
+    for sentence in updated:
+        value = str(sentence.get("value", ""))
+        if FOVEA_TOKEN not in value:
+            sentence["value"] = value
+            continue
+        pieces: list[str] = []
+        start = 0
+        while True:
+            idx = value.find(FOVEA_TOKEN, start)
+            if idx < 0:
+                pieces.append(value[start:])
+                break
+            pieces.append(value[start : idx + len(FOVEA_TOKEN)])
+            if crop_cursor >= len(crop_token_counts):
+                raise ValueError("Missing crop token counts for <fovea> placeholders.")
+            pieces.append(build_visual_placeholder(crop_token_counts[crop_cursor]))
+            crop_cursor += 1
+            start = idx + len(FOVEA_TOKEN)
+        sentence["value"] = "".join(pieces)
+    if crop_cursor != len(crop_token_counts):
+        raise ValueError("Unused crop token counts remain after expanding <fovea> placeholders.")
+    return updated
 
 
 def build_mm_token_type_ids(input_ids, image_token_id: int, video_token_id: int | None = None):
@@ -295,7 +326,27 @@ def encode_chat_template_example(
         # Supervise only the final <|im_end|>, not the trailing newline.
         append_segment(segment, supervised_prefix_len=prefix_len, supervised_suffix_len=max(0, suffix_len - 1))
 
-    return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+    input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    return input_ids_tensor, mask_visual_placeholder_labels(input_ids_tensor, labels_tensor, tokenizer)
+
+
+def mask_visual_placeholder_labels(
+    input_ids: torch.LongTensor,
+    labels: torch.LongTensor,
+    tokenizer: PreTrainedTokenizerBase,
+) -> torch.LongTensor:
+    masked = labels.clone()
+    for token_text in (DEFAULT_VISION_START, DEFAULT_IMAGE_PAD, DEFAULT_VISION_END):
+        token_ids = tokenize_text(tokenizer, token_text)
+        if not token_ids:
+            continue
+        width = len(token_ids)
+        last_start = input_ids.shape[0] - width
+        for start in range(max(last_start + 1, 0)):
+            if input_ids[start : start + width].tolist() == token_ids:
+                masked[start : start + width] = IGNORE_INDEX
+    return masked
 
 
 def apply_selective_label_substrings(
@@ -473,7 +524,7 @@ class LazySupervisedDataset(Dataset):
         vision_packer: VisionPacker,
         image_token_id: int,
         system_message: str = DEFAULT_SYSTEM_MESSAGE,
-        retrieve_max_image_tokens: int | None = 4096,
+        fovea_crop_max_image_tokens: int | None = 1024,
         model_max_length: int | None = None,
     ) -> None:
         self.records = load_training_records(data_path)
@@ -483,7 +534,7 @@ class LazySupervisedDataset(Dataset):
         self.vision_packer = vision_packer
         self.image_token_id = image_token_id
         self.system_message = system_message
-        self.retrieve_max_image_tokens = retrieve_max_image_tokens
+        self.fovea_crop_max_image_tokens = fovea_crop_max_image_tokens
         self.model_max_length = int(model_max_length or getattr(tokenizer, "model_max_length", 0) or 0)
         self._printed_overlength_indices: set[int] = set()
 
@@ -521,26 +572,19 @@ class LazySupervisedDataset(Dataset):
         image_field = record.get("image")
         pixel_values = None
         image_grid_thw = None
-        retrieve_pixel_values = None
-        retrieve_grid_thw = None
-        retrieve_patch_boxes = None
         image_token_counts: list[list[int]] = []
+        crop_token_counts: list[int] = []
         query_boxes: list[tuple[float, float, float, float]] = []
+        source_images: list[Image.Image] = []
 
         if image_field is not None:
             image_values = image_field if isinstance(image_field, list) else [image_field]
             pixel_values_list = []
             image_grid_list = []
-            retrieve_pixels_list = []
-            retrieve_grid_list = []
-            retrieve_box_list = []
             for image_value in image_values:
                 pil_image = self._open_image(image_value)
+                source_images.append(pil_image)
                 packed_pixels, packed_grid = self.vision_packer.pack(pil_image)
-                retrieve_pixels, retrieve_grid, retrieve_boxes = self.vision_packer.pack_retrieve(pil_image, self.retrieve_max_image_tokens)
-                retrieve_pixels_list.append(retrieve_pixels)
-                retrieve_grid_list.append(retrieve_grid)
-                retrieve_box_list.append(retrieve_boxes)
                 pixel_values_list.append(packed_pixels)
                 image_grid_list.append(packed_grid)
                 image_token_counts.append([
@@ -552,10 +596,6 @@ class LazySupervisedDataset(Dataset):
             if pixel_values_list:
                 pixel_values = torch.cat(pixel_values_list, dim=0)
                 image_grid_thw = torch.stack(image_grid_list, dim=0)
-                if retrieve_pixels_list:
-                    retrieve_pixel_values = torch.cat(retrieve_pixels_list, dim=0)
-                    retrieve_grid_thw = torch.stack(retrieve_grid_list, dim=0)
-                    retrieve_patch_boxes = torch.cat(retrieve_box_list, dim=0)
 
         conversations = normalize_conversation_think_format(record["conversations"])
         query_boxes.extend(tuple(float(v) for v in box) for box in record.get("fovea_query_boxes", []))
@@ -565,6 +605,18 @@ class LazySupervisedDataset(Dataset):
             image_values = image_field if isinstance(image_field, list) else [image_field]
             if len(image_values) != 1:
                 raise ValueError("Fovea training expects one image per sample when fovea_query_boxes are present.")
+            crop_pixel_values_list = []
+            crop_grid_list = []
+            for box in query_boxes:
+                crop_image = crop_from_normalized_box(source_images[0], box)
+                crop_pixels, crop_grid = self.vision_packer._process(crop_image, max_image_tokens=self.fovea_crop_max_image_tokens)
+                crop_pixel_values_list.append(crop_pixels)
+                crop_grid_list.append(crop_grid)
+                crop_token_counts.append(image_token_count_from_grid(crop_grid, self.vision_packer.spatial_merge_size))
+            if crop_pixel_values_list:
+                pixel_values = torch.cat([pixel_values, *crop_pixel_values_list], dim=0)
+                image_grid_thw = torch.cat([image_grid_thw, torch.stack(crop_grid_list, dim=0)], dim=0)
+            conversations = append_visual_placeholders_to_fovea(conversations, crop_token_counts)
 
         input_ids, labels = encode_chat_template_example(
             processor=self.processor,
@@ -593,9 +645,6 @@ class LazySupervisedDataset(Dataset):
             "mm_token_type_ids": mm_token_type_ids,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
-            "retrieve_pixel_values": retrieve_pixel_values,
-            "retrieve_grid_thw": retrieve_grid_thw,
-            "retrieve_patch_boxes": retrieve_patch_boxes,
             **fovea_metadata,
         }
 
@@ -647,18 +696,7 @@ class DataCollatorForQwen3_5SFT:
         if pixel_values:
             batch["pixel_values"] = torch.cat(pixel_values, dim=0)
             batch["image_grid_thw"] = torch.cat(image_grid_thw, dim=0)
-
-        retrieve_pixel_values = [instance["retrieve_pixel_values"] for instance in instances if instance.get("retrieve_pixel_values") is not None]
-        retrieve_grid_thw = [instance["retrieve_grid_thw"] for instance in instances if instance.get("retrieve_grid_thw") is not None]
-        retrieve_patch_boxes = [instance["retrieve_patch_boxes"] for instance in instances if instance.get("retrieve_patch_boxes") is not None]
-        if retrieve_pixel_values:
-            batch["retrieve_pixel_values"] = torch.cat(retrieve_pixel_values, dim=0)
-            batch["retrieve_grid_thw"] = torch.cat(retrieve_grid_thw, dim=0)
-            batch["retrieve_patch_boxes"] = torch.cat(retrieve_patch_boxes, dim=0)
-            batch["retrieve_image_counts"] = torch.tensor(
-                [int(instance["retrieve_grid_thw"].shape[0]) if instance.get("retrieve_grid_thw") is not None else 0 for instance in instances],
-                dtype=torch.long,
-            )
+            batch["num_images_per_sample"] = [int(grid.shape[0]) for grid in image_grid_thw]
 
         fovea_positions = []
         fovea_box_indices = []

@@ -4,22 +4,27 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import textwrap
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "lmms-eval"))
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from fovea_token.fovea_crop import crop_attended_regions, normalize_patch_boxes
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize Fovea attention.")
     parser.add_argument("--task", default="chartqa", help="`train` or an lmms-eval task like `mmstar`.")
-    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-qwen/checkpoint-2300")
-    parser.add_argument("--index", type=int, nargs="+", default=[3, 7, 15, 22, 31, 48, 56, 63, 78, 91])
+    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-qwen/checkpoint-1550")
+    parser.add_argument("--index", type=int, nargs="+", default=[0,1,2,3,4,5,6,7,8,9,10])
     parser.add_argument("--output_dir", default="outputs/fovea_visualize")
     parser.add_argument("--alpha", type=float, default=0.45)
     parser.add_argument("--cmap", default="magma")
@@ -52,14 +57,6 @@ def to_numpy_image(image: Image.Image) -> np.ndarray:
     return np.asarray(image.convert("RGB"))
 
 
-def normalize_patch_boxes(boxes: torch.Tensor) -> torch.Tensor:
-    if boxes.ndim == 3 and boxes.shape[0] == 1:
-        return boxes[0]
-    if boxes.ndim != 2 or boxes.shape[-1] != 4:
-        raise ValueError(f"Expected patch boxes with shape [N, 4] or [1, N, 4], got {tuple(boxes.shape)}")
-    return boxes
-
-
 def render_heatmap(image: np.ndarray, boxes: torch.Tensor, weights: torch.Tensor, alpha: float, cmap: str) -> np.ndarray:
     h, w = image.shape[:2]
     heat = np.zeros((h, w), dtype=np.float32)
@@ -76,140 +73,6 @@ def render_heatmap(image: np.ndarray, boxes: torch.Tensor, weights: torch.Tensor
         heat = heat / heat.max()
     colored = plt.get_cmap(cmap)(heat)[..., :3]
     return (image * (1.0 - alpha) + colored * 255.0 * alpha).clip(0, 255).astype(np.uint8)
-
-
-def _box_boundary_distance(box_a: tuple, box_b: tuple) -> float:
-    """Min L2 distance between the boundaries of two non-overlapping boxes."""
-    dx = max(box_a[0] - box_b[2], box_b[0] - box_a[2], 0)
-    dy = max(box_a[1] - box_b[3], box_b[1] - box_a[3], 0)
-    return (dx * dx + dy * dy) ** 0.5
-
-
-def _find_connected_components(
-    boxes: list[tuple], weights: list[float], margin: float,
-) -> list[list[int]]:
-    """Group boxes into connected components via BFS.
-
-    Two boxes are connected if their boundary distance ≤ margin * patch_size.
-    margin=0 means strictly adjacent (shared boundary), margin=1 allows one-patch gap.
-    """
-    n = len(boxes)
-    if n == 0:
-        return []
-
-    # Compute characteristic patch size from the first box
-    pw = boxes[0][2] - boxes[0][0]  # patch width in pixels
-    ph = boxes[0][3] - boxes[0][1]  # patch height in pixels
-    patch_size = max(pw, ph)
-    max_dist = margin * patch_size
-
-    # Build adjacency list
-    adj = {i: [] for i in range(n)}
-    for i in range(n):
-        for j in range(i + 1, n):
-            if _box_boundary_distance(boxes[i], boxes[j]) <= max_dist:
-                adj[i].append(j)
-                adj[j].append(i)
-
-    # BFS connected components
-    visited = set()
-    components = []
-    for i in range(n):
-        if i in visited:
-            continue
-        comp = []
-        queue = [i]
-        visited.add(i)
-        while queue:
-            node = queue.pop()
-            comp.append(node)
-            for nb in adj[node]:
-                if nb not in visited:
-                    visited.add(nb)
-                    queue.append(nb)
-        components.append(comp)
-
-    return components
-
-
-def crop_attended_regions(
-    image: Image.Image,
-    boxes: torch.Tensor,
-    weights: torch.Tensor,
-    threshold: float = 0.3,
-    margin: float = 0.0,
-    padding: float = 0.0,
-) -> list[dict]:
-    """Crop the most-attended regions via threshold + connected components.
-
-    Args:
-        image: PIL Image.
-        boxes: [N, 4] normalized box coordinates [x1, y1, x2, y2].
-        weights: [N] attention weight per box.
-        threshold: boxes with weight > threshold * max(weight) are cropped.
-        margin: max boundary distance in units of patch size (0 = strictly adjacent).
-        padding: expand crop bounding box by this many patches outward.
-
-    Returns:
-        List of dicts sorted by region weight (desc), each with box, weight, crop.
-    """
-    w, h = image.size
-    boxes_np = normalize_patch_boxes(boxes).detach().cpu().numpy()
-    weights_np = weights.detach().cpu().numpy()
-
-    max_w = weights_np.max()
-    if max_w == 0:
-        return []
-
-    # 1. Threshold: keep boxes with weight > threshold * max_weight
-    kept_boxes = []
-    kept_weights = []
-    for box, weight in zip(boxes_np, weights_np):
-        if weight <= threshold * max_w:
-            continue
-        x1 = max(0, min(w, int(round(box[0] * w))))
-        y1 = max(0, min(h, int(round(box[1] * h))))
-        x2 = max(0, min(w, int(round(box[2] * w))))
-        y2 = max(0, min(h, int(round(box[3] * h))))
-        if x2 > x1 and y2 > y1:
-            kept_boxes.append((x1, y1, x2, y2))
-            kept_weights.append(float(weight))
-
-    if not kept_boxes:
-        return []
-
-    # patch pixel size for padding (use first box before threshold, which covers all boxes)
-    pw = int(round((boxes_np[0, 2] - boxes_np[0, 0]) * w))
-    ph = int(round((boxes_np[0, 3] - boxes_np[0, 1]) * h))
-
-    # 2. Connected components on the adjacency graph
-    components = _find_connected_components(kept_boxes, kept_weights, margin)
-
-    # 3. Each component → bounding box → expand by padding → crop
-    crops = []
-    for comp in components:
-        x1 = min(kept_boxes[i][0] for i in comp)
-        y1 = min(kept_boxes[i][1] for i in comp)
-        x2 = max(kept_boxes[i][2] for i in comp)
-        y2 = max(kept_boxes[i][3] for i in comp)
-        # Apply padding in patch units
-        pad_x = int(round(padding * pw))
-        pad_y = int(round(padding * ph))
-        x1 = max(0, x1 - pad_x)
-        y1 = max(0, y1 - pad_y)
-        x2 = min(w, x2 + pad_x)
-        y2 = min(h, y2 + pad_y)
-        comp_weight = max(kept_weights[i] for i in comp)
-        crop_img = image.crop((x1, y1, x2, y2))
-        crops.append({
-            "box": (x1, y1, x2, y2),
-            "weight": comp_weight,
-            "crop": crop_img,
-        })
-
-    # Sort by weight descending
-    crops.sort(key=lambda c: c["weight"], reverse=True)
-    return crops
 
 
 def get_sample_qa(record: dict) -> tuple[str, str]:
@@ -489,10 +352,10 @@ def save_visualizations(sample: dict, args) -> None:
                 sample["image"], entry["boxes"], summary,
                 threshold=args.crop_threshold, margin=args.crop_margin, padding=args.crop_padding,
             )
-            for crop_idx, c in enumerate(crops):
+            for crop_idx, c in enumerate(crops[:2]):
                 crop_path = out_dir / f"{stem}_crop_{crop_idx:02d}.png"
-                c["crop"].save(crop_path)
-                print(f"Saved crop: {crop_path}  box={c['box']}  weight={c['weight']:.4f}")
+                c.crop.save(crop_path)
+                print(f"Saved crop: {crop_path}  box={c.box}  weight={c.weight:.4f}")
 
         num_tokens = int(entry["attn"].shape[0])
         grid_size = int(np.ceil(num_tokens**0.5))

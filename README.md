@@ -1,6 +1,6 @@
 # FoveaToken
 
-FoveaToken 是一个基于 transformers 官方 Qwen3.5 多模态模型的本地实验仓库。当前机制是固定 fovea token 检索：64 个内置 fovea latent 会按 Qwen3.5 GatedDeltaNet 的 q/k/v/beta/g/z 线性 SSM 规则，随普通文本 token hidden states 做 chunk-parallel recurrent 更新；模型生成或读到 `<fovea>` 后，取当前位置对应的 64 个 latent，再用 q/k/v/o 多头注意力从 Qwen 图像 token memory 聚合出 64 个连续视觉 embedding，并把它们作为虚拟 token 插到 `<fovea>` 后继续推理。
+FoveaToken 是一个基于 transformers 官方 Qwen3.5 多模态模型的本地实验仓库。当前机制是固定 fovea token 检索：256 个内置 fovea latent 会按 Qwen3.5 GatedDeltaNet 的 q/k/v/beta/g/z 线性 SSM 规则，随普通文本 token hidden states 做 chunk-parallel recurrent 更新；模型生成或读到 `<fovea>` 后，取当前位置对应的 256 个 latent，直接在整图 Qwen 图像 token memory 上做检索。训练时用 GT box 从原图裁出 crop 图并插到 `<fovea>` 后；推理时根据检索注意力裁原图、重走视觉塔，再把这些 crop 图作为独立视觉片段插到 `<fovea>` 后继续推理。
 
 运行训练和评测时设置：
 
@@ -10,12 +10,13 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 
 ## 代码结构
 
-- `src/fovea_token/modeling_fovea.py`：`FoveaForConditionalGeneration` 和固定 64-token fovea retrieval。
+- `src/fovea_token/modeling_fovea.py`：`FoveaForConditionalGeneration`、整图检索和 `<fovea>` crop 图插入。
 - `src/fovea_token/train/data.py`：训练 parquet 读取、Qwen3.5 chat template 编码、collator 和官方 processor 图像预处理适配；同时支持本地图片路径和 parquet 内嵌图片字节。
+- `src/fovea_token/fovea_crop.py`：检索热区连通域裁剪逻辑，训练脚本、推理和可视化共用。
 - `src/fovea_token/tokenizers/tokenization_fovea.py`：`<fovea>`、`<think>`、`</think>` token helper。
 - `scripts/preprocess_vgr.py`：把原始 VGR region tag 离线转换成 `<fovea>` 训练 parquet。
 - `scripts/preprocess_pretrain_data.py`：把 Visual Genome regions 转成固定 fovea grounding parquet；旧 Stage A visual-code LM 已移除。
-- `scripts/visualize_fovea.py`：把 64 个 fovea token 的检索注意力画到原图上；`--task train` 读取训练 parquet，其他任务名直接读取 `lmms-eval` 样本。
+- `scripts/visualize_fovea.py`：把 fovea 检索注意力画到原图上，并导出和推理主链路一致的 crop 区域。
 - `scripts/ft3.sh`：VGR 训练入口。
 - `scripts/ft3_lora.sh`：单卡 LoRA 训练入口。
 - `lmms-eval/lmms_eval/models/simple/fovea.py`：本地 lmms-eval adapter。
@@ -37,7 +38,7 @@ data/vgr/llava_next_raw_format
 视觉 token 默认策略：
 
 - 初始 LLM 图像上下文：与 transformers Qwen3.5 processor/model 保持一致。
-- Fovea 视觉池：复用 processor 生成的 Qwen 图像 token，并按 `image_grid_thw` 生成归一化 patch boxes。
+- Fovea 检索：直接复用整图 processor 生成的 Qwen 图像 token，并按 `image_grid_thw` 生成归一化 patch boxes。
 - 推理时默认会在 assistant 开始回答处自动触发一次内部 `<fovea>` 检索；若开启 `enable_thinking=true`，触发位置是 `<think>` 之后而不是之前。可用 `fovea_auto_retrieve_on_answer_start=false` 关闭。
 
 默认训练：
@@ -69,7 +70,7 @@ bash scripts/ft3_lora.sh
 `scripts/ft3_lora.sh` 默认启用 LoRA；`FT3_UNFREEZE_VISION=true` 时只训练 vision tower LoRA，设为 `false` 时 vision tower 完全冻结。`FT3_FREEZE_EMBED_BASE=true` 时冻结 embedding/`lm_head` 的 base vocab rows，只训练 `<fovea>`、`<think>`、`</think>` 新增 token rows。
 
 训练 prompt 使用 checkpoint 自带的 HF `processor.apply_chat_template()` 渲染，和 Qwen3.5 原生推理入口保持一致。图像 `<image>` 占位符仍由本仓库按 `image_grid_thw` 对应 token count 提前展开；assistant 内容中的 `<think>`/`</think>` 是本仓库新增的 atomic marker tokens。训练前会把 assistant 开头的思维块规范成 Qwen 风格 `"<think>\n...\n</think>\n\n答案"`；其中开头的 `<think>\n` 只作为前缀上下文，不进入 LM 监督。
-训练时初始图像上下文默认通过官方 `max_pixels` 路径限制到 `FT3_MAX_IMG_TOKENS=2048` 个 Qwen 图像 token，避免大图直接把上下文撑满；fovea retrieval 视觉池仍单独使用 `retrieve_max_image_tokens=4096`。
+训练时初始整图上下文默认通过官方 `max_pixels` 路径限制到 `FT3_MAX_IMG_TOKENS=2048` 个 Qwen 图像 token，避免大图直接把上下文撑满；`<fovea>` 裁剪图另外使用 `fovea_crop_max_image_tokens` 控制再次编码时的 token 上限。
 训练编码阶段只监督 assistant 结尾的 `<|im_end|>`，不监督它后面的换行，也不额外补 `eos`。
 
 ## 离线预处理
@@ -110,12 +111,12 @@ PYTHONPATH="$PWD/src" python scripts/preprocess_pretrain_data.py \
 
 ## 训练目标
 
-训练 forward 是固定两次 decoder pass：
+训练 forward 是单次主前向：
 
-1. Pass A：正常多模态前向，得到所有 token 的最后 hidden states。
-2. GatedDelta update：构造 `[B * 64, T, H]` latent/input 序列，投影出 `q/k/v/beta/g/z`，使用 Qwen3.5 的 chunk gated-delta-rule 更新 KV recurrent state 并得到每个位置的 64 个 fovea latent。
-3. Retrieval：在 `<fovea>` 位置 gather 当前 64 个 latent，通过 q/k/v/o 多头检索 pooled high-res visual memory，得到 64 个虚拟视觉 embedding 与 `L_align`。`L_align` 用 GT box 的 patch overlap 分布监督 64 个 query 的区域覆盖，并加上 query 间去塌缩项。
-4. Pass B：把 64 个虚拟 token 插到对应 `<fovea>` 后，扩展 attention mask 和 labels，再计算文本 LM loss。插入的虚拟 token labels 为 `IGNORE_INDEX`。
+1. 训练数据阶段先把整图和每个 `<fovea>` 对应的 GT crop 图编码成标准 Qwen 多图输入。
+2. 主前向正常计算文本 LM loss。
+3. 同一次前向里，取 `<fovea>` 位置对应的 256 个 latent/query，在整图图像 memory 上做检索并计算 `L_align`。
+4. 总损失是文本 LM loss 加 `L_align`，不再做”检索后再插 256 个虚拟 token 的第二次 decoder pass”。
 
 总损失：
 

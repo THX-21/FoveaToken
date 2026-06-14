@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch import nn
 from torch.nn import init
 
@@ -16,13 +17,11 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
 from .configuration_fovea import FoveaConfig
+from .fovea_crop import crop_attended_regions
 
 
 class KwargsForCausalLM(TransformersKwargs, total=False):
     pass
-
-
-from .train.data import IGNORE_INDEX
 
 
 class FoveaRMSNormGated(nn.Module):
@@ -133,7 +132,7 @@ def _torch_chunk_gated_delta_rule(
 
 
 class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
-    """Qwen3.5 multimodal LM with 64 fixed fovea vectors inserted after `<fovea>`."""
+    """Qwen3.5 multimodal LM with 256 fixed fovea vectors inserted after `<fovea>`."""
 
     config_class = FoveaConfig
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
@@ -160,7 +159,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         self.fovea_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.fovea_k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.fovea_v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.fovea_o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.fovea_q_norm = Qwen3_5RMSNorm(self.fovea_head_dim, eps=eps)
         self.fovea_k_norm = Qwen3_5RMSNorm(self.fovea_head_dim, eps=eps)
         self.fovea_ssm_in_proj_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=False)
@@ -218,7 +216,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             self.fovea_q_proj,
             self.fovea_k_proj,
             self.fovea_v_proj,
-            self.fovea_o_proj,
             self.fovea_ssm_in_proj_qkv,
             self.fovea_ssm_in_proj_z,
             self.fovea_ssm_in_proj_b,
@@ -251,7 +248,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             "fovea_q_proj": self.fovea_q_proj,
             "fovea_k_proj": self.fovea_k_proj,
             "fovea_v_proj": self.fovea_v_proj,
-            "fovea_o_proj": self.fovea_o_proj,
             "fovea_q_norm": self.fovea_q_norm,
             "fovea_k_norm": self.fovea_k_norm,
             "fovea_ssm_in_qkv": self.fovea_ssm_in_proj_qkv,
@@ -294,7 +290,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 self.fovea_q_proj,
                 self.fovea_k_proj,
                 self.fovea_v_proj,
-                self.fovea_o_proj,
                 self.fovea_ssm_in_proj_qkv,
                 self.fovea_ssm_in_proj_z,
                 self.fovea_ssm_in_proj_b,
@@ -333,12 +328,16 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         video_grid_thw=None,
         mm_token_type_ids=None,
         input_embeds_override=None,
+        image_hidden_states_override=None,
     ):
         inputs_embeds = self.get_input_embeddings()(input_ids) if input_embeds_override is None else input_embeds_override
         image_hidden_states = None
-        if pixel_values is not None:
+        if image_hidden_states_override is not None:
+            image_hidden_states = image_hidden_states_override
+        elif pixel_values is not None:
             image_outputs = self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, return_dict=True)
             image_hidden_states = image_outputs.pooler_output
+        if image_hidden_states is not None:
             image_embeds = torch.cat(image_hidden_states, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.model.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
@@ -388,21 +387,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             **kwargs,
         )
 
-    def _split_retrieve_features_by_sample(self, retrieve_pixel_values, retrieve_grid_thw, retrieve_image_counts):
-        outputs = self.model.get_image_features(pixel_values=retrieve_pixel_values, image_grid_thw=retrieve_grid_thw, return_dict=True)
-        features = list(outputs.pooler_output)
-        counts = retrieve_image_counts.to(device="cpu", dtype=torch.long).tolist()
-        per_sample, start = [], 0
-        for count in counts:
-            count = int(count)
-            if count > 0:
-                per_sample.append(torch.cat(features[start : start + count], dim=0))
-            else:
-                hidden_size = int(self.config.text_config.hidden_size)
-                per_sample.append(retrieve_pixel_values.new_zeros((0, hidden_size)))
-            start += count
-        return per_sample
-
     def _retrieve_runtime_fovea_vectors(self, text_hidden_history, text_input_id_history, retrieve_memory_cache):
         last_pos = text_hidden_history.shape[1] - 1
         history_attention = text_input_id_history.new_ones(text_input_id_history.shape)
@@ -415,56 +399,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         )
         trigger_batch = torch.zeros((1,), device=text_hidden_history.device, dtype=torch.long)
         return self._retrieve_fovea_from_memory(fovea_queries, trigger_batch, *retrieve_memory_cache)
-
-    def _build_retrieve_memory(
-        self,
-        retrieve_pixel_values,
-        retrieve_grid_thw,
-        retrieve_patch_boxes,
-        retrieve_image_counts,
-        batch_size,
-        device=None,
-        dtype=None,
-    ):
-        if retrieve_pixel_values is None or retrieve_grid_thw is None or retrieve_patch_boxes is None or retrieve_image_counts is None:
-            raise ValueError("Fovea retrieval requires retrieve_pixel_values, retrieve_grid_thw, retrieve_patch_boxes, and retrieve_image_counts.")
-        memories = self._split_retrieve_features_by_sample(retrieve_pixel_values, retrieve_grid_thw, retrieve_image_counts)
-        if len(memories) != batch_size:
-            raise ValueError("retrieve_image_counts must contain one entry per batch sample.")
-        return self._pad_sample_memory(
-            memories,
-            retrieve_patch_boxes,
-            device or retrieve_pixel_values.device,
-            dtype or retrieve_pixel_values.dtype,
-        )
-
-    def _pad_sample_memory(self, memories, patch_boxes, device, dtype):
-        max_len = max(max(1, mem.shape[0]) for mem in memories)
-        hidden = int(self.config.text_config.hidden_size)
-        batch_size = len(memories)
-        memory = torch.zeros((batch_size, max_len, hidden), device=device, dtype=dtype)
-        mask = torch.zeros((batch_size, max_len), device=device, dtype=torch.bool)
-        boxes = torch.zeros((batch_size, max_len, 4), device=device, dtype=torch.float32)
-        box_start = 0
-        for batch_idx, mem in enumerate(memories):
-            count = int(mem.shape[0])
-            if count > 0:
-                memory[batch_idx, :count] = mem.to(device=device, dtype=dtype)
-                mask[batch_idx, :count] = True
-            if box_start + count > patch_boxes.shape[0]:
-                raise ValueError(
-                    "retrieve_patch_boxes is shorter than the Qwen3.5 retrieval memory: "
-                    f"need {box_start + count}, got {patch_boxes.shape[0]}."
-                )
-            if count > 0:
-                boxes[batch_idx, :count] = patch_boxes[box_start : box_start + count].to(device=device, dtype=torch.float32)
-            box_start += count
-        if box_start != patch_boxes.shape[0]:
-            raise ValueError(
-                "retrieve_patch_boxes must match the Qwen3.5 retrieval memory length exactly: "
-                f"used {box_start}, got {patch_boxes.shape[0]}."
-            )
-        return memory, mask, boxes
 
     def _condition_fovea_queries_from_text(self, hidden_states, attention_mask, input_ids, fovea_positions):
         device = hidden_states.device
@@ -523,14 +457,49 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         self._trace_grad(fovea_queries, "ssm_fovea_queries")
         return fovea_queries
 
+    def _grid_boxes(self, grid_thw: torch.LongTensor, device) -> torch.Tensor:
+        _, grid_h, grid_w = [int(v) for v in grid_thw.tolist()]
+        merge = max(int(getattr(self.config.vision_config, "spatial_merge_size", 2)), 1)
+        rows = torch.arange(0, grid_h, merge, dtype=torch.float32, device=device)
+        cols = torch.arange(0, grid_w, merge, dtype=torch.float32, device=device)
+        row_grid, col_grid = torch.meshgrid(rows, cols, indexing="ij")
+        return torch.stack(
+            [
+                col_grid / float(grid_w),
+                row_grid / float(grid_h),
+                (col_grid + merge).clamp_max(float(grid_w)) / float(grid_w),
+                (row_grid + merge).clamp_max(float(grid_h)) / float(grid_h),
+            ],
+            dim=-1,
+        ).reshape(-1, 4)
+
+    def _build_image_memory(self, image_hidden_states, image_grid_thw, batch_size, device, dtype):
+        if image_hidden_states is None or image_grid_thw is None:
+            raise ValueError("Fovea retrieval requires image_hidden_states and image_grid_thw.")
+        memories = [hidden.to(device=device, dtype=dtype) for hidden in image_hidden_states]
+        max_len = max(max(1, mem.shape[0]) for mem in memories)
+        hidden = int(self.config.text_config.hidden_size)
+        memory = torch.zeros((batch_size, max_len, hidden), device=device, dtype=dtype)
+        mask = torch.zeros((batch_size, max_len), device=device, dtype=torch.bool)
+        boxes = torch.zeros((batch_size, max_len, 4), device=device, dtype=torch.float32)
+        for batch_idx, mem in enumerate(memories):
+            count = int(mem.shape[0])
+            if count > 0:
+                memory[batch_idx, :count] = mem
+                mask[batch_idx, :count] = True
+                sample_boxes = self._grid_boxes(image_grid_thw[batch_idx], device=device)
+                if sample_boxes.shape[0] != count:
+                    raise ValueError(f"Patch box count {sample_boxes.shape[0]} does not match image memory length {count}.")
+                boxes[batch_idx, :count] = sample_boxes
+        return memory, mask, boxes
+
     def _retrieve_fovea_from_memory(self, fovea_queries, trigger_batch, memory, memory_mask, patch_boxes, fovea_box_indices=None, fovea_boxes=None):
         device = fovea_queries.device
         dtype = fovea_queries.dtype
         num_triggers = int(fovea_queries.shape[0])
         num_fovea = int(self.config.fovea_num_tokens)
         if num_triggers == 0:
-            return (fovea_queries.new_empty((0, num_fovea, fovea_queries.shape[-1])),
-                    fovea_queries.new_zeros(()))
+            return fovea_queries.new_zeros(())
         heads = self.fovea_num_heads
         head_dim = self.fovea_head_dim
         memory_len = int(memory.shape[1])
@@ -542,9 +511,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         scale = head_dim**-0.5
         trigger_batch = trigger_batch.to(device=device, dtype=torch.long)
 
-        # Build output tensors functionally (no in-place into detached leaf)
-        # to preserve autograd connectivity through fovea retrieval.
-        vector_parts: list[torch.Tensor] = [None] * num_triggers  # type: ignore[list-item]
         attn_mean_parts: list[torch.Tensor] = [None] * num_triggers  # type: ignore[list-item]
 
         for sample_idx in trigger_batch.unique(sorted=True):
@@ -557,7 +523,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             v = self.fovea_v_proj(sample_memory).view(1, memory_len, heads, head_dim)
             k = self.fovea_k_norm(k).squeeze(0).permute(1, 0, 2)
             v = v.squeeze(0).permute(1, 0, 2)
-            # num diag: v, memory, q
+            # num diag
             mem_f = sample_memory.detach().float()
             v_f = v.detach().float()
             q_f = q.detach().float()
@@ -569,42 +535,14 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             scores = torch.einsum("tnhd,hmd->tnhm", q, k) * scale
             scores = scores.masked_fill((~sample_mask).view(1, 1, 1, -1), torch.finfo(scores.dtype).min)
             attn = torch.softmax(scores, dim=-1)
-            context = torch.einsum("tnhm,hmd->tnhd", attn, v).reshape(trigger_indices.shape[0], num_fovea, -1)
-            # numerical diagnostics
-            ctx_f = context.detach().float()
-            self._fovea_aux.setdefault("_num_diag", {})
-            self._fovea_aux["_num_diag"][f"ctx_s{sample_id}"] = f"mean={ctx_f.mean():.3e} std={ctx_f.std():.3e} min={ctx_f.min():.3e} max={ctx_f.max():.3e} norm={ctx_f.norm():.3e}"
-            retrieved_raw = self.fovea_o_proj(context)
-            # numerical diagnostics: context (input), weight, output
-            ctx_f = context.detach().float()
-            w_f = self.fovea_o_proj.weight.detach().float()
-            out_f = retrieved_raw.detach().float()
-            self._fovea_aux.setdefault("_num_diag", {})
-            self._fovea_aux["_num_diag"][f"ctx_s{sample_id}"] = (
-                f"mean={ctx_f.mean():.3e} std={ctx_f.std():.3e} min={ctx_f.min():.3e} max={ctx_f.max():.3e} norm={ctx_f.norm():.3e}"
-            )
-            self._fovea_aux["_num_diag"][f"w_s{sample_id}"] = (
-                f"mean={w_f.mean():.3e} std={w_f.std():.3e} min={w_f.min():.3e} max={w_f.max():.3e} norm={w_f.norm():.3e}"
-            )
-            self._fovea_aux["_num_diag"][f"out_s{sample_id}"] = (
-                f"mean={out_f.mean():.3e} std={out_f.std():.3e} min={out_f.min():.3e} max={out_f.max():.3e} norm={out_f.norm():.3e}"
-            )
-            # end numerical diagnostics
-            self._trace_grad(context, f"retrieval_context_s{sample_id}")  # before o_proj
-            self._trace_grad(retrieved_raw, f"retrieval_oproj_out_s{sample_id}")  # o_proj raw output
-            retrieved = retrieved_raw.to(dtype)
-            self._trace_grad(retrieved, f"retrieval_retrieved_s{sample_id}")  # after .to(dtype)
             attn_flat = attn.mean(dim=2).to(torch.float32)
             for i_local, i_global in enumerate(trigger_indices.tolist()):
-                vector_parts[i_global] = retrieved[i_local : i_local + 1]
                 attn_mean_parts[i_global] = attn_flat[i_local : i_local + 1]
 
-        vectors = torch.cat(vector_parts, dim=0)
         attn_mean = torch.cat(attn_mean_parts, dim=0)
-        self._trace_grad(vectors, "retrieval_vectors")
         self._trace_grad(attn_mean, "retrieval_attn_mean")
 
-        align_loss = vectors.new_zeros(())
+        align_loss = memory.new_zeros(())
         if fovea_boxes is not None and fovea_boxes.numel() > 0 and fovea_box_indices is not None and fovea_box_indices.numel() > 0:
             boxes_for_trigger = fovea_boxes.to(device=device, dtype=torch.float32).index_select(0, fovea_box_indices.to(device=device, dtype=torch.long))
             boxes_for_memory = patch_boxes.index_select(0, trigger_batch).to(device=device, dtype=torch.float32)
@@ -652,108 +590,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         }
         self._fovea_aux = entry
         self._fovea_aux_history.append(entry)
-        return vectors, align_loss
-
-    def _expand_with_fovea_tokens(self, base_embeds, attention_mask, labels, fovea_positions, fovea_vectors):
-        batch_size, seq_len, hidden_size = base_embeds.shape
-        num_fovea = int(self.config.fovea_num_tokens)
-        fovea_vectors = fovea_vectors.to(base_embeds.dtype)
-
-        by_batch: list[list[tuple[int, int]]] = [[] for _ in range(batch_size)]
-        for query_idx, (batch_idx, token_pos) in enumerate(fovea_positions.to(device="cpu", dtype=torch.long).tolist()):
-            if 0 <= batch_idx < batch_size and 0 <= token_pos < seq_len:
-                by_batch[batch_idx].append((token_pos, query_idx))
-        for items in by_batch:
-            items.sort(key=lambda item: item[0])
-
-        # Build per-sample embedding sequences functionally via concatenation
-        # to preserve autograd connectivity through fovea_vectors.
-        new_embed_parts: list[torch.Tensor] = []
-        new_attn_parts: list[torch.Tensor] = []
-        new_label_parts: list[torch.Tensor] = []
-        for batch_idx, items in enumerate(by_batch):
-            src_cursor = 0
-            embed_chunks: list[torch.Tensor] = []
-            attn_chunks: list[torch.Tensor] = []
-            label_chunks: list[torch.Tensor] = []
-            for token_pos, query_idx in items:
-                if token_pos >= src_cursor:
-                    embed_chunks.append(base_embeds[batch_idx, src_cursor : token_pos + 1])
-                    if attention_mask is not None:
-                        attn_chunks.append(attention_mask[batch_idx, src_cursor : token_pos + 1])
-                    if labels is not None:
-                        label_chunks.append(labels[batch_idx, src_cursor : token_pos + 1])
-                embed_chunks.append(fovea_vectors[query_idx])
-                if attention_mask is not None:
-                    attn_chunks.append(attention_mask.new_ones((num_fovea,)))
-                if labels is not None:
-                    label_chunks.append(labels.new_full((num_fovea,), IGNORE_INDEX))
-                src_cursor = token_pos + 1
-            if src_cursor < seq_len:
-                embed_chunks.append(base_embeds[batch_idx, src_cursor:])
-                if attention_mask is not None:
-                    attn_chunks.append(attention_mask[batch_idx, src_cursor:])
-                if labels is not None:
-                    label_chunks.append(labels[batch_idx, src_cursor:])
-            new_embed_parts.append(torch.cat(embed_chunks, dim=0))
-            if attention_mask is not None:
-                new_attn_parts.append(torch.cat(attn_chunks, dim=0))
-            if labels is not None:
-                new_label_parts.append(torch.cat(label_chunks, dim=0))
-
-        # Pad all samples to the same length (functional, preserves autograd)
-        max_len = max(p.shape[0] for p in new_embed_parts)
-        padded_embeds: list[torch.Tensor] = []
-        padded_attns: list[torch.Tensor] = []
-        padded_labels: list[torch.Tensor] = []
-        for batch_idx in range(batch_size):
-            pad_len = max_len - new_embed_parts[batch_idx].shape[0]
-            padded_embeds.append(F.pad(new_embed_parts[batch_idx], (0, 0, 0, pad_len)))
-            if attention_mask is not None:
-                padded_attns.append(F.pad(new_attn_parts[batch_idx], (0, pad_len)))
-            if labels is not None:
-                padded_labels.append(F.pad(new_label_parts[batch_idx], (0, pad_len), value=IGNORE_INDEX))
-        new_embeds = torch.stack(padded_embeds, dim=0)
-        new_attention = torch.stack(padded_attns, dim=0) if attention_mask is not None else None
-        new_labels = torch.stack(padded_labels, dim=0) if labels is not None else None
-
-        return new_embeds, new_attention, new_labels
-
-    def _expand_position_ids_with_fovea(self, position_ids, attention_mask, fovea_positions):
-        if position_ids is None:
-            return None
-        streams, batch_size, seq_len = position_ids.shape
-        num_fovea = int(self.config.fovea_num_tokens)
-        by_batch: list[list[int]] = [[] for _ in range(batch_size)]
-        for batch_idx, token_pos in fovea_positions.to(device="cpu", dtype=torch.long).tolist():
-            if 0 <= batch_idx < batch_size and 0 <= token_pos < seq_len:
-                by_batch[batch_idx].append(token_pos)
-        for items in by_batch:
-            items.sort()
-        lengths = [seq_len + len(items) * num_fovea for items in by_batch]
-        max_len = max(lengths)
-        expanded = position_ids.new_zeros((streams, batch_size, max_len))
-        for batch_idx, items in enumerate(by_batch):
-            src_cursor = 0
-            dst_cursor = 0
-            offset = 0
-            for token_pos in items:
-                copy_len = token_pos - src_cursor + 1
-                if copy_len > 0:
-                    expanded[:, batch_idx, dst_cursor : dst_cursor + copy_len] = position_ids[
-                        :, batch_idx, src_cursor : token_pos + 1
-                    ] + offset
-                    dst_cursor += copy_len
-                base = expanded[:, batch_idx, dst_cursor - 1 : dst_cursor]
-                delta = torch.arange(1, num_fovea + 1, device=position_ids.device, dtype=position_ids.dtype).view(1, -1)
-                expanded[:, batch_idx, dst_cursor : dst_cursor + num_fovea] = base + delta
-                dst_cursor += num_fovea
-                offset += num_fovea
-                src_cursor = token_pos + 1
-            tail_len = seq_len - src_cursor
-            if tail_len > 0:
-                expanded[:, batch_idx, dst_cursor : dst_cursor + tail_len] = position_ids[:, batch_idx, src_cursor:] + offset
-        return expanded
+        return align_loss
 
     def _cached_decode_position_ids(self, attention_mask, num_new_tokens: int = 1):
         num_new_tokens = int(num_new_tokens)
@@ -762,6 +599,84 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if self.model.rope_deltas is not None:
             position_ids = position_ids + self.model.rope_deltas.to(position_ids.device).view(1, -1, 1)
         return position_ids
+
+    def _encode_crop_images(self, crop_images: list[Image.Image], image_processor, device, dtype):
+        if not crop_images:
+            return None, None, None
+        merge = max(int(getattr(image_processor, "merge_size", getattr(self.config.vision_config, "spatial_merge_size", 2))), 1)
+        patch_size = getattr(image_processor, "patch_size", getattr(self.config.vision_config, "patch_size", 16))
+        if isinstance(patch_size, (list, tuple)):
+            patch_size = patch_size[-1]
+        max_pixels = (
+            int(self.config.fovea_crop_max_image_tokens)
+            * merge
+            * merge
+            * int(patch_size)
+            * int(patch_size)
+        )
+        inputs = image_processor(images=crop_images, return_tensors="pt", max_pixels=max_pixels)
+        pixel_values = inputs["pixel_values"].to(device=device)
+        grid_thw = inputs["image_grid_thw"].to(device=device, dtype=torch.long)
+        image_outputs = self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=grid_thw, return_dict=True)
+        image_hidden_states = [hidden.to(device=device, dtype=dtype) for hidden in image_outputs.pooler_output]
+        return pixel_values, grid_thw, image_hidden_states
+
+    def _build_crop_injection_embeds(self, crop_hidden_states: list[torch.Tensor], device, dtype):
+        if not crop_hidden_states:
+            return None
+        vision_start_id = int(self.config.vision_start_token_id)
+        image_token_id = int(self.config.image_token_id)
+        vision_end_id = int(self.config.vision_end_token_id)
+        embed_tokens = self.get_input_embeddings()
+        segments: list[torch.Tensor] = []
+        for crop_hidden in crop_hidden_states:
+            start_embed = embed_tokens.weight[vision_start_id].to(device=device, dtype=dtype).view(1, -1)
+            pad_embed = embed_tokens.weight[image_token_id].to(device=device, dtype=dtype).view(1, -1)
+            end_embed = embed_tokens.weight[vision_end_id].to(device=device, dtype=dtype).view(1, -1)
+            segments.append(start_embed)
+            segments.append(crop_hidden.to(device=device, dtype=dtype))
+            segments.append(end_embed)
+        return torch.cat(segments, dim=0).unsqueeze(0)
+
+    def _select_crop_regions(self, image: Image.Image, patch_boxes: torch.Tensor, attn_mean: torch.Tensor):
+        summary = attn_mean.mean(dim=0)
+        return crop_attended_regions(
+            image=image,
+            boxes=patch_boxes,
+            weights=summary,
+            threshold=float(self.config.fovea_crop_threshold),
+            margin=float(self.config.fovea_crop_margin),
+            padding=float(self.config.fovea_crop_padding),
+        )
+
+    def _run_crop_injection(
+        self,
+        source_image: Image.Image,
+        image_processor,
+        patch_boxes: torch.Tensor,
+        attn_mean: torch.Tensor,
+        attention_mask: torch.Tensor,
+        past_key_values,
+        model_kwargs: dict,
+        dtype,
+        device,
+    ):
+        regions = self._select_crop_regions(source_image, patch_boxes, attn_mean)
+        if not regions:
+            return attention_mask, past_key_values, None
+        regions = regions[:2]
+        crop_images = [region.crop for region in regions]
+        _pixel_values, _grid_thw, crop_hidden_states = self._encode_crop_images(crop_images, image_processor, device=device, dtype=dtype)
+        crop_embeds = self._build_crop_injection_embeds(crop_hidden_states, device=device, dtype=dtype)
+        attention_mask = torch.cat([attention_mask, attention_mask.new_ones((1, crop_embeds.shape[1]))], dim=1)
+        outputs = self._language_forward_from_embeds(
+            crop_embeds,
+            attention_mask=attention_mask,
+            position_ids=self._cached_decode_position_ids(attention_mask, crop_embeds.shape[1]),
+            past_key_values=past_key_values,
+            **model_kwargs,
+        )
+        return attention_mask, outputs.past_key_values, outputs
 
     def _sample_next_token(self, logits, *, do_sample: bool, temperature=None, top_p=None, top_k=None):
         if not do_sample:
@@ -803,10 +718,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         pixel_values_videos=None,
         video_grid_thw=None,
         mm_token_type_ids=None,
-        retrieve_pixel_values=None,
-        retrieve_grid_thw=None,
-        retrieve_patch_boxes=None,
-        retrieve_image_counts=None,
+        source_images=None,
+        image_processor=None,
         max_new_tokens=128,
         eos_token_id=None,
         pad_token_id=None,
@@ -817,6 +730,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         top_p=None,
         top_k=None,
         fovea_auto_retrieve_on_answer_start=None,
+        disable_fovea_retrieval=False,
         **kwargs,
     ):
         self._fovea_aux = {}
@@ -825,6 +739,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             raise ValueError("Fovea generation currently expects batch_size=1.")
         if int(num_beams) != 1:
             raise ValueError("Fovea generation currently supports num_beams=1 only.")
+        if not source_images or len(source_images) != 1:
+            raise ValueError("Fovea generation currently expects exactly one source image.")
+        if image_processor is None:
+            raise ValueError("Fovea generation requires image_processor for crop re-encoding.")
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
 
@@ -835,7 +753,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         output_input_ids = input_ids
         model_input_ids = input_ids
-        inputs_embeds, position_ids, _ = self._build_multimodal_embeddings_and_positions(
+        inputs_embeds, position_ids, image_hidden_states = self._build_multimodal_embeddings_and_positions(
             model_input_ids,
             attention_mask,
             pixel_values,
@@ -844,63 +762,31 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             video_grid_thw=video_grid_thw,
             mm_token_type_ids=mm_token_type_ids,
         )
-        retrieve_memory_cache = None
-        if retrieve_pixel_values is not None:
-            retrieve_memory_cache = self._build_retrieve_memory(
-                retrieve_pixel_values,
-                retrieve_grid_thw,
-                retrieve_patch_boxes,
-                retrieve_image_counts,
-                input_ids.shape[0],
-                inputs_embeds.device,
-                inputs_embeds.dtype,
-            )
+        retrieve_memory_cache = self._build_image_memory(
+            image_hidden_states,
+            image_grid_thw,
+            input_ids.shape[0],
+            inputs_embeds.device,
+            inputs_embeds.dtype,
+        )
         fovea_id = getattr(self.config, "fovea_token_id", None)
         if fovea_auto_retrieve_on_answer_start is None:
             fovea_auto_retrieve_on_answer_start = getattr(self.config, "fovea_auto_retrieve_on_answer_start", True)
         fovea_auto_retrieve_on_answer_start = bool(fovea_auto_retrieve_on_answer_start)
         text_hidden_history = None
         text_input_id_history = model_input_ids
-        if fovea_id is not None and retrieve_memory_cache is not None:
-            prompt_positions = torch.nonzero(model_input_ids.eq(int(fovea_id)), as_tuple=False)
-            if prompt_positions.numel() > 0:
-                prompt_outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask=attention_mask, position_ids=position_ids, **model_kwargs)
-                prompt_hidden = prompt_outputs[0]
-                text_hidden_history = prompt_hidden
-                trigger_batch = prompt_positions[:, 0].to(device=prompt_hidden.device, dtype=torch.long)
-                fovea_queries = self._condition_fovea_queries_from_text(
-                    prompt_hidden,
-                    attention_mask,
-                    input_ids,
-                    prompt_positions,
-                )
-                fovea_vectors, _ = self._retrieve_fovea_from_memory(
-                    fovea_queries,
-                    trigger_batch,
-                    *retrieve_memory_cache,
-                )
-                inputs_embeds, attention_mask, _ = self._expand_with_fovea_tokens(
-                    inputs_embeds,
-                    attention_mask,
-                    None,
-                    prompt_positions.to(device=prompt_hidden.device, dtype=torch.long),
-                    fovea_vectors,
-                )
-                position_ids = self._expand_position_ids_with_fovea(
-                    position_ids,
-                    attention_mask,
-                    prompt_positions.to(device=prompt_hidden.device, dtype=torch.long),
-                )
-        outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask=attention_mask, position_ids=position_ids, **model_kwargs)
-        if text_hidden_history is None:
-            text_hidden_history = outputs[0]
-        logits = self.lm_head(outputs[0][:, -1:, :]).squeeze(1)
-        past_key_values = outputs.past_key_values
+        past_key_values = None
+        if past_key_values is None:
+            outputs = self._language_forward_from_embeds(inputs_embeds, attention_mask=attention_mask, position_ids=position_ids, **model_kwargs)
+            if text_hidden_history is None:
+                text_hidden_history = outputs[0]
+            logits = self.lm_head(outputs[0][:, -1:, :]).squeeze(1)
+            past_key_values = outputs.past_key_values
 
         force_fovea_first = (
-            fovea_auto_retrieve_on_answer_start
+            not disable_fovea_retrieval
+            and fovea_auto_retrieve_on_answer_start
             and fovea_id is not None
-            and retrieve_memory_cache is not None
             and (model_input_ids.shape[1] == 0 or int(model_input_ids[0, -1].item()) != int(fovea_id))
         )
 
@@ -913,8 +799,12 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 next_token = model_input_ids.new_full((model_input_ids.shape[0], 1), int(fovea_id))
                 force_fovea_first = False
             else:
+                sample_logits = logits
+                if disable_fovea_retrieval and fovea_id is not None:
+                    sample_logits = logits.clone()
+                    sample_logits[:, int(fovea_id)] = float("-inf")
                 next_token = self._sample_next_token(
-                    logits,
+                    sample_logits,
                     do_sample=do_sample,
                     temperature=temperature,
                     top_p=top_p,
@@ -940,27 +830,31 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             text_hidden_history = torch.cat([text_hidden_history, token_hidden.unsqueeze(1)], dim=1)
             text_input_id_history = torch.cat([text_input_id_history, next_token], dim=1)
 
-            if fovea_id is not None and int(next_token.item()) == int(fovea_id) and retrieve_memory_cache is not None:
-                fovea_vectors, _ = self._retrieve_runtime_fovea_vectors(
+            if fovea_id is not None and int(next_token.item()) == int(fovea_id) and not disable_fovea_retrieval:
+                self._retrieve_runtime_fovea_vectors(
                     text_hidden_history,
                     text_input_id_history,
                     retrieve_memory_cache=retrieve_memory_cache,
                 )
-                fovea_embeds = fovea_vectors.squeeze(0).unsqueeze(0).to(device=token_hidden.device, dtype=inputs_embeds.dtype)
-                attention_mask = torch.cat([attention_mask, attention_mask.new_ones((1, fovea_embeds.shape[1]))], dim=1)
-                outputs = self._language_forward_from_embeds(
-                    fovea_embeds,
-                    attention_mask=attention_mask,
-                    position_ids=self._cached_decode_position_ids(attention_mask, fovea_embeds.shape[1]),
-                    past_key_values=past_key_values,
-                    **model_kwargs,
-                )
-                logits = self.lm_head(outputs[0][:, -1, :])
-                past_key_values = outputs.past_key_values
+                if self._fovea_aux_history:
+                    entry = self._fovea_aux_history[-1]
+                    attention_mask, past_key_values, crop_outputs = self._run_crop_injection(
+                        source_image=source_images[0],
+                        image_processor=image_processor,
+                        patch_boxes=entry["retrieve_patch_boxes"][0],
+                        attn_mean=entry["fovea_attn_mean"][0],
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        model_kwargs=model_kwargs,
+                        dtype=inputs_embeds.dtype,
+                        device=inputs_embeds.device,
+                    )
+                    if crop_outputs is not None:
+                        logits = self.lm_head(crop_outputs[0][:, -1, :])
         return output_input_ids
 
     def generate(self, *args, **kwargs):
-        if kwargs.get("retrieve_pixel_values") is not None:
+        if kwargs.get("source_images") is not None:
             return self.fovea_generate(*args, **kwargs)
         return super().generate(*args, **kwargs)
 
@@ -1006,14 +900,11 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         pixel_values_videos,
         video_grid_thw,
         mm_token_type_ids,
-        retrieve_pixel_values,
-        retrieve_grid_thw,
-        retrieve_patch_boxes,
-        retrieve_image_counts,
         fovea_positions,
         fovea_box_indices,
         fovea_boxes,
         logits_to_keep=0,
+        num_images_per_sample=None,
         **kwargs,
     ):
         self._fovea_aux = {}
@@ -1040,45 +931,49 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             input_ids,
             fovea_positions,
         )
-
-        memory = self._build_retrieve_memory(
-            retrieve_pixel_values,
-            retrieve_grid_thw,
-            retrieve_patch_boxes,
-            retrieve_image_counts,
+        # Build image memory from original images only (exclude crop image features).
+        if num_images_per_sample is not None and len(num_images_per_sample) == hidden_a.shape[0]:
+            offsets = [0]
+            for n in num_images_per_sample[:-1]:
+                offsets.append(offsets[-1] + n)
+            orig_indices = torch.tensor(offsets, device=hidden_a.device, dtype=torch.long)
+            orig_image_hidden = [image_hidden_states[i] for i in offsets]
+            orig_image_grid = image_grid_thw[orig_indices]
+        else:
+            orig_image_hidden = image_hidden_states
+            orig_image_grid = image_grid_thw
+        memory = self._build_image_memory(
+            orig_image_hidden,
+            orig_image_grid,
             hidden_a.shape[0],
             hidden_a.device,
             hidden_a.dtype,
         )
-        fovea_vectors, align_loss = self._retrieve_fovea_from_memory(
+        align_loss = self._retrieve_fovea_from_memory(
             fovea_queries,
             trigger_batch,
             *memory,
             fovea_box_indices=fovea_box_indices,
             fovea_boxes=fovea_boxes,
         )
-        embeds_b, attention_b, labels_b = self._expand_with_fovea_tokens(embeds_a, attention_mask, labels, fovea_positions, fovea_vectors)
-        position_ids_b = self._expand_position_ids_with_fovea(position_ids_a, attention_b, fovea_positions)
-        outputs_b = self._language_forward_from_embeds(embeds_b, attention_mask=attention_b, position_ids=position_ids_b, **kwargs)
-        hidden_b = outputs_b[0]
-        full_logits_b = self.lm_head(hidden_b)
-        lm_loss = self.loss_function(logits=full_logits_b, labels=labels_b, vocab_size=full_logits_b.shape[-1])
+        full_logits = self.lm_head(hidden_a)
+        lm_loss = self.loss_function(logits=full_logits, labels=labels, vocab_size=full_logits.shape[-1])
         loss = lm_loss + float(self.config.fovea_lambda_align) * align_loss
         self._fovea_aux = {
             "lm_loss": lm_loss.detach(),
             "align_loss": align_loss.detach(),
-            "num_queries": hidden_b.new_tensor(float(fovea_positions.shape[0])),
-            "tokens_per_query": hidden_b.new_tensor(float(self.config.fovea_num_tokens)),
+            "num_queries": hidden_a.new_tensor(float(fovea_positions.shape[0])),
+            "tokens_per_query": hidden_a.new_tensor(float(self.config.fovea_num_tokens)),
             "fovea_attn_mean": self._fovea_aux.get("fovea_attn_mean"),
             "_num_diag": self._fovea_aux.get("_num_diag", {}),
         }
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         return Qwen3_5CausalLMOutputWithPast(
             loss=loss,
-            logits=full_logits_b[:, slice_indices, :],
-            past_key_values=outputs_b.past_key_values,
-            hidden_states=outputs_b.hidden_states,
-            attentions=outputs_b.attentions,
+            logits=full_logits[:, slice_indices, :],
+            past_key_values=outputs_a.past_key_values,
+            hidden_states=outputs_a.hidden_states,
+            attentions=outputs_a.attentions,
         )
 
     @can_return_tuple
@@ -1099,10 +994,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         cache_position: torch.LongTensor | None = None,
-        retrieve_pixel_values: torch.Tensor | None = None,
-        retrieve_grid_thw: torch.LongTensor | None = None,
-        retrieve_patch_boxes: torch.Tensor | None = None,
-        retrieve_image_counts: torch.Tensor | None = None,
         fovea_positions: torch.LongTensor | None = None,
         fovea_box_indices: torch.LongTensor | None = None,
         fovea_boxes: torch.Tensor | None = None,
@@ -1110,11 +1001,7 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> tuple | Qwen3_5CausalLMOutputWithPast:
         if (
-            retrieve_pixel_values is None
-            and retrieve_grid_thw is None
-            and retrieve_patch_boxes is None
-            and retrieve_image_counts is None
-            and fovea_positions is None
+            fovea_positions is None
             and fovea_box_indices is None
             and fovea_boxes is None
         ):
@@ -1172,10 +1059,6 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
                 mm_token_type_ids=mm_token_type_ids,
-                retrieve_pixel_values=retrieve_pixel_values,
-                retrieve_grid_thw=retrieve_grid_thw,
-                retrieve_patch_boxes=retrieve_patch_boxes,
-                retrieve_image_counts=retrieve_image_counts,
                 fovea_positions=fovea_positions,
                 fovea_box_indices=fovea_box_indices,
                 fovea_boxes=fovea_boxes,

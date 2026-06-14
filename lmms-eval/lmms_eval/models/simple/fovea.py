@@ -87,7 +87,7 @@ class Fovea(Qwen3_VL):
         enable_thinking: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
         max_image_tokens: int | None = 512,
-        retrieve_max_image_tokens: int | None = 4096,
+        fovea_crop_max_image_tokens: int | None = 1024,
         disable_fovea_retrieval: Optional[bool] = False,
         fovea_auto_retrieve_on_answer_start: Optional[bool] = False,
         **kwargs,
@@ -147,7 +147,7 @@ class Fovea(Qwen3_VL):
             max_image_tokens=max_image_tokens,
         )
         self.vision_packer = vision_packer
-        self.retrieve_max_image_tokens = retrieve_max_image_tokens
+        self._model.config.fovea_crop_max_image_tokens = int(fovea_crop_max_image_tokens)
         self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
         self.fovea_auto_retrieve_on_answer_start = bool(fovea_auto_retrieve_on_answer_start)
 
@@ -236,8 +236,9 @@ class Fovea(Qwen3_VL):
 
     def _build_generate_kwargs(self, gen_kwargs):
         generate_kwargs = super()._build_generate_kwargs(gen_kwargs)
-        if not self.disable_fovea_retrieval:
-            generate_kwargs["fovea_auto_retrieve_on_answer_start"] = self.fovea_auto_retrieve_on_answer_start
+        generate_kwargs["fovea_auto_retrieve_on_answer_start"] = self.fovea_auto_retrieve_on_answer_start
+        if self.disable_fovea_retrieval:
+            generate_kwargs["disable_fovea_retrieval"] = True
         return generate_kwargs
 
     def _preprocess_chunk(self, chunk):
@@ -326,27 +327,7 @@ class Fovea(Qwen3_VL):
         if self.batch_size > 1:
             processor_kwargs.update({"padding": True, "padding_side": "left"})
         inputs = self.processor(**processor_kwargs)
-        if not self.disable_fovea_retrieval:
-            retrieve_pixels = []
-            retrieve_grids = []
-            retrieve_boxes = []
-            retrieve_counts = []
-            image_cursor = 0
-            for count in image_counts_per_sample:
-                retrieve_counts.append(count)
-                for image in image_inputs[image_cursor : image_cursor + count]:
-                    pixels, grid, boxes = self.vision_packer.pack_retrieve(image, self.retrieve_max_image_tokens)
-                    retrieve_pixels.append(pixels)
-                    retrieve_grids.append(grid)
-                    retrieve_boxes.append(boxes)
-                image_cursor += count
-            if retrieve_pixels:
-                inputs["retrieve_pixel_values"] = torch.cat(retrieve_pixels, dim=0)
-                inputs["retrieve_grid_thw"] = torch.stack(retrieve_grids, dim=0)
-                inputs["retrieve_patch_boxes"] = torch.cat(retrieve_boxes, dim=0)
-                inputs["retrieve_image_counts"] = torch.tensor(retrieve_counts, dtype=torch.long)
-
-        return inputs, contexts, gen_kwargs, until
+        return inputs, contexts, gen_kwargs, until, image_inputs
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
@@ -363,7 +344,7 @@ class Fovea(Qwen3_VL):
             future = executor.submit(self._preprocess_chunk, chunks[0]) if chunks else None
 
             for idx in range(len(chunks)):
-                inputs, contexts, gen_kwargs, until = future.result()
+                inputs, contexts, gen_kwargs, until, image_inputs = future.result()
                 if idx + 1 < len(chunks):
                     future = executor.submit(self._preprocess_chunk, chunks[idx + 1])
 
@@ -373,7 +354,12 @@ class Fovea(Qwen3_VL):
                     inputs = inputs.to(self.device)
 
                 generate_kwargs = self._build_generate_kwargs(gen_kwargs)
-                cont = self.model.generate(**inputs, **generate_kwargs)
+                cont = self.model.generate(
+                    **inputs,
+                    **generate_kwargs,
+                    source_images=image_inputs,
+                    image_processor=self.processor.image_processor,
+                )
                 generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
                 answers = self.processor.batch_decode(
                     generated_ids_trimmed,

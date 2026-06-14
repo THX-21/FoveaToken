@@ -16,13 +16,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="fovea", help="lmms-eval model name")
     parser.add_argument(
         "--model_args",
-        default="pretrained=checkpoints/fovea-vgr-qwen/checkpoint-2500,device=cuda:4,device_map=cuda:4,attn_implementation=sdpa,enable_thinking=True, max_image_tokens=2048,disable_fovea_retrieval=False,fovea_auto_retrieve_on_answer_start=True",
+        default="pretrained=checkpoints/fovea-vgr-qwen/checkpoint-1300,device=cuda:4,device_map=cuda:4,attn_implementation=sdpa,enable_thinking=True, max_image_tokens=2048,disable_fovea_retrieval=False,fovea_auto_retrieve_on_answer_start=False",
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")
     parser.add_argument("--task", default="chartqa", help="lmms-eval task name")
-    parser.add_argument("--index", type=int, default=10, help="Start index in the task docs")
-    parser.add_argument("--num_samples", type=int, default=6, help="Number of consecutive samples to run")
+    parser.add_argument("--index", type=int, default=0, help="Start index in the task docs")
+    parser.add_argument("--num_samples", type=int, default=10, help="Number of consecutive samples to run")
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_p", type=float, default=None)

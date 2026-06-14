@@ -5,22 +5,22 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 # export HF_HUB_OFFLINE=1
 
-BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen3.5-4B}"
+BASE_MODEL="${EVAL_BASE_MODEL:-checkpoints/fovea-4B}"
 CHECKPOINT_MODE="${EVAL_CHECKPOINT_MODE:-full}"
 # LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr/checkpoint-200}"
 # LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-Qwen/Qwen3.5-4B}"
-# FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr-qwen/checkpoint-2300}"
-FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-Qwen/Qwen3.5-4B}"
-TASKS="${EVAL_TASKS:-chartqa}"
+# FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/checkpoint-vgr-stash-qwen/checkpoint-100}"
+FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-checkpoints/fovea-4B}"
+TASKS="${EVAL_TASKS:-mmstar}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 ATTN_IMPLEMENTATION="${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
 DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:3}"
 DEVICE="${EVAL_DEVICE:-${DEVICE_MAP}}"
 BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 MAX_IMG_TOKENS="${EVAL_MAX_IMG_TOKENS:-2048}"
-MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-1024}"
+MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-10240}"
 
-COMMON_MODEL_ARGS="device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=true,fovea_auto_retrieve_on_answer_start=false,max_image_tokens=${MAX_IMG_TOKENS}"
+COMMON_MODEL_ARGS="device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=True,fovea_auto_retrieve_on_answer_start=False,max_image_tokens=${MAX_IMG_TOKENS}"
 case "${CHECKPOINT_MODE}" in
   full)
     RESOLVED_CHECKPOINT="${FULL_CHECKPOINT}"
@@ -73,4 +73,4 @@ echo "[eval] MODEL_ARGS=${MODEL_ARGS}"
   --log_samples \
   --log_samples_suffix "${LOG_SUFFIX}" \
   --output_path "${OUTPUT_PATH}" \
-  --limit 500
+  --limit 20

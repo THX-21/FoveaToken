@@ -31,6 +31,7 @@ class DataArguments:
     image_folder: str = field(default=None)
     system_message: str = field(default="You are a helpful assistant.")
     max_img_tokens: int = field(default=2048)
+    fovea_crop_max_img_tokens: int = field(default=1024)
 
 
 @dataclass
@@ -143,7 +144,6 @@ def maybe_enable_lora(model, model_args: ModelArguments):
         "fovea_q_proj",
         "fovea_k_proj",
         "fovea_v_proj",
-        "fovea_o_proj",
         "fovea_q_norm",
         "fovea_k_norm",
         "fovea_ssm_in_proj_qkv",
@@ -515,9 +515,6 @@ class PerModuleGradNormCallback(transformers.TrainerCallback):
             return "fovea_attn_k"
         if "fovea_v_proj" in full:
             return "fovea_attn_v"
-        if "fovea_o_proj" in full:
-            return "fovea_attn_o"
-
         if "fovea_tokens" in full:
             return "fovea_tokens"
 
@@ -621,6 +618,7 @@ def main() -> None:
     model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
     model.config.vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
     model.config.vision_end_token_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    model.config.fovea_crop_max_image_tokens = data_args.fovea_crop_max_img_tokens
     # print_loading_summary(model, loading_info, source_label=loading_source_label)
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     if tokenizer.pad_token is None:
@@ -655,6 +653,7 @@ def main() -> None:
         vision_packer=vision_packer,
         image_token_id=model.config.image_token_id,
         system_message=data_args.system_message,
+        fovea_crop_max_image_tokens=data_args.fovea_crop_max_img_tokens,
         model_max_length=training_args.model_max_length,
     )
     data_collator = DataCollatorForQwen3_5SFT(

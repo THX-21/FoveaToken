@@ -16,16 +16,15 @@ FoveaToken 基于 transformers 官方 Qwen3.5 多模态实现，新增逻辑集�
 
 ```text
 <fovea>
--> first decoder pass hidden states for normal text tokens
--> Qwen3.5-style chunk gated-delta-rule updates 64 learned fovea latent streams
--> q/k/v/o multi-head retrieval over pooled high-resolution visual memory
--> insert 64 virtual visual embeddings after <fovea>
--> second decoder pass for observation / reasoning / final answer
+-> Qwen3.5-style text-conditioned 256-query retrieval over the original image token memory
+-> training: use GT box to crop the original image and insert one crop image after each <fovea>
+-> inference: use retrieved regions to crop the original image, re-encode each crop, then insert them after <fovea>
+-> continue observation / reasoning / final answer
 ```
 
-64 个 fovea latent 是模型内置参数，不写入文本序列。普通文本 token 的 hidden states 会通过 Qwen3.5 GatedDeltaNet 风格的 `q/k/v/beta/g/z` 线性投影和 chunk gated-delta-rule 持续更新这 64 条 latent stream；只有检测到 `<fovea>` 时，才把当前位置对应的 64 个 latent 拿去视觉池检索并插入 64 个虚拟视觉 token。训练 labels 对这些插入的虚拟 token 固定为 `IGNORE_INDEX`。`L_align` 用 `<fovea>` 绑定的原图归一化 box 生成 patch overlap 目标，约束 64 个 query 的注意力整体覆盖目标区域，并加上去塌缩项。
+256 个 fovea latent 仍是模型内置参数，不写入文本序列。普通文本 token 的 hidden states 会通过 Qwen3.5 GatedDeltaNet 风格的 `q/k/v/beta/g/z` 线性投影和 chunk gated-delta-rule 持续更新这 256 条 latent/query；`<fovea>` 位置会用它们直接检索整图的 Qwen 图像 token memory。训练时不再把检索结果作为 256 个虚拟视觉 token 插入，而是直接用 `fovea_query_boxes` 从原图裁出 crop 图并插入到 `<fovea>` 后。推理时再根据检索注意力裁原图、重走视觉塔并插入真实 crop 图。`L_align` 继续用 `<fovea>` 绑定的原图归一化 box 生成 patch overlap 目标，约束 256 个 query 的注意力整体覆盖目标区域，并加上去塌缩项。
 
-视觉 token 默认策略：初始 LLM 图像上下文与 transformers Qwen3.5 processor/model 保持一致。Fovea 视觉池复用 processor 生成的 Qwen 图像 token，并按 `image_grid_thw` 生成归一化 patch boxes 用于 `L_align`。
+视觉 token 默认策略：初始 LLM 图像上下文与 transformers Qwen3.5 processor/model 保持一致。Fovea 检索直接复用整图的 Qwen 图像 token，并按 `image_grid_thw` 生成归一化 patch boxes 用于 `L_align`。训练和推理插入的 crop 图会再次经过官方 processor / vision tower 编码。
 
 ## 数据
 
@@ -115,7 +114,7 @@ export PYTHONPATH="$PWD/src:$PWD/lmms-eval"
 ```
 
 LoRA 训练如果同时开启 `unfreeze_vision=true`，vision tower 只训练 LoRA 参数；`unfreeze_vision=false` 时 vision tower 完全冻结，不额外保存全量 `vision_tower.safetensors`。全参训练（`lora_enable=false`）也遵守 `unfreeze_vision`：`true` 时全量训练 vision tower，`false` 时冻结 vision tower、其余参数继续全参训练。`freeze_embed_base=true` 时 embedding/`lm_head` 的 base vocab rows 冻结，只训练 `<fovea>`、`<think>`、`</think>` 新增 token rows；设为 `false` 时不加 row-level gradient mask。
-训练时初始图像上下文默认通过官方 `max_pixels` 路径限制到 `FT3_MAX_IMG_TOKENS=2048` 个 Qwen 图像 token；fovea retrieval 视觉池仍保持单独的 `retrieve_max_image_tokens=4096`。
+训练时初始整图上下文默认通过官方 `max_pixels` 路径限制到 `FT3_MAX_IMG_TOKENS=2048` 个 Qwen 图像 token；`<fovea>` 裁剪图另有独立的 `fovea_crop_max_image_tokens` 上限。
 
 ## 运行环境
 

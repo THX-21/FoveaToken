@@ -16,6 +16,10 @@ class FoveaConfig(_Qwen3_5Config):
         fovea_align_alpha: float = 1.0,
         fovea_align_beta: float = 0.1,
         fovea_auto_retrieve_on_answer_start: bool = True,
+        fovea_crop_max_image_tokens: int = 1024,
+        fovea_crop_threshold: float = 0.3,
+        fovea_crop_margin: float = 1.0,
+        fovea_crop_padding: float = 1.0,
         fovea_token_id: int | None = None,
         **kwargs,
     ):
@@ -27,6 +31,10 @@ class FoveaConfig(_Qwen3_5Config):
         self.fovea_align_alpha = float(fovea_align_alpha)
         self.fovea_align_beta = float(fovea_align_beta)
         self.fovea_auto_retrieve_on_answer_start = bool(fovea_auto_retrieve_on_answer_start)
+        self.fovea_crop_max_image_tokens = int(fovea_crop_max_image_tokens)
+        self.fovea_crop_threshold = float(fovea_crop_threshold)
+        self.fovea_crop_margin = float(fovea_crop_margin)
+        self.fovea_crop_padding = float(fovea_crop_padding)
         self.fovea_token_id = fovea_token_id
 
 
