@@ -23,7 +23,7 @@ from fovea_token.fovea_crop import crop_attended_regions, normalize_patch_boxes
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize Fovea attention.")
     parser.add_argument("--task", default="chartqa", help="`train` or an lmms-eval task like `mmstar`.")
-    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-qwen/checkpoint-1550")
+    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-qwen/checkpoint-666")
     parser.add_argument("--index", type=int, nargs="+", default=[0,1,2,3,4,5,6,7,8,9,10])
     parser.add_argument("--output_dir", default="outputs/fovea_visualize")
     parser.add_argument("--alpha", type=float, default=0.45)
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fovea_auto_retrieve_on_answer_start", type=lambda x: x.lower() == "true", default=False,
                         help="Auto trigger fovea on answer start.")
     parser.add_argument("--crop", default="true", help="Crop the most-attended regions and save them.")
-    parser.add_argument("--crop_threshold", type=float, default=0.3,
+    parser.add_argument("--crop_threshold", type=float, default=0.35,
                         help="Threshold for cropping: boxes with weight > threshold * max_weight are cropped.")
     parser.add_argument("--crop_margin", type=float, default=1.0,
                         help="Patch count tolerance for connectivity. 0 = strictly adjacent, 1 = one-patch gap allowed.")
@@ -170,12 +170,20 @@ def _run_simple_sample(model, task, doc_idx: int, context: str, gen_kwargs: dict
     return text, token_counts
 
 
-def load_train_sample(args, index: int):
+_TRAIN_STATE = None  # singleton: (model, tokenizer, processor, dataset, collator)
+
+
+def _init_train_state(args):
+    global _TRAIN_STATE
+    if _TRAIN_STATE is not None:
+        return _TRAIN_STATE
+
     from fovea_token import FoveaForConditionalGeneration
     from fovea_token.tokenizers.tokenization_fovea import add_fovea_tokens, sync_fovea_token_ids
     from fovea_token.train.data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
     from transformers import AutoProcessor, AutoTokenizer
 
+    print("Loading model (once)...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
     add_fovea_tokens(tokenizer)
     processor = AutoProcessor.from_pretrained(args.model_name_or_path)
@@ -204,8 +212,16 @@ def load_train_sample(args, index: int):
         vision_packer=packer,
         image_token_id=model.config.image_token_id,
     )
+    collator = DataCollatorForQwen3_5SFT(tokenizer=tokenizer, model_max_length=32768)
+    _TRAIN_STATE = (model, tokenizer, processor, dataset, collator)
+    return _TRAIN_STATE
+
+
+def load_train_sample(args, index: int):
+    model, tokenizer, processor, dataset, collator = _init_train_state(args)
+
     item = dataset[index]
-    batch = DataCollatorForQwen3_5SFT(tokenizer=tokenizer, model_max_length=32768)([item])
+    batch = collator([item])
     batch = {k: v.to(args.device) if hasattr(v, "to") else v for k, v in batch.items()}
     with torch.no_grad():
         model(**{k: v for k, v in batch.items() if v is not None})

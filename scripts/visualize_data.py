@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import textwrap
 from pathlib import Path
@@ -21,7 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize training data samples.")
     parser.add_argument("--data_path", default="data/vgr/preprocessed/vgr_shortcot.parquet")
     parser.add_argument("--image_folder", default="data/llava_next/llava_next_raw_format")
-    parser.add_argument("--index", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    parser.add_argument("--index", type=int, nargs="*", default=None)
+    parser.add_argument("--num_samples", type=int, default=0, help="Randomly sample N records (overrides --index)")
     parser.add_argument("--output_dir", default="outputs/data_visualize")
     parser.add_argument("--box_color", default="#FF4444")
     parser.add_argument("--box_alpha", type=float, default=0.3)
@@ -90,9 +92,11 @@ def render_sample(sample: dict, image_folder: Path, args) -> np.ndarray | None:
     n_fovea = answer.count("<fovea>")
     n_boxes = len(boxes)
 
+    source = sample.get("_source", "?")
+    orig_idx = sample.get("_orig_idx", "?")
     title_lines = [
-        f"Sample: {sample['image']}",
-        f"Fovea tokens: {n_fovea}  |  Boxes: {n_boxes}  |  Preprocessed: {sample.get('fovea_preprocessed', 'N/A')}",
+        f"Sample: {sample['image']}  |  Source: {source}  orig_idx={orig_idx}",
+        f"Fovea tokens: {n_fovea}  |  Boxes: {n_boxes}",
         f"",
         f"[QUESTION]",
         wrap_text(question, args.title_width),
@@ -115,23 +119,54 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Dataset: {len(df)} samples, {len(df.columns)} columns: {list(df.columns)}")
-    print(f"Image folder: {image_folder}")
-    print(f"Output: {out_dir}")
+    # Load index file for source tracing (vgr_merged_index.json next to the parquet)
+    data_path = Path(args.data_path)
+    index_path = data_path.parent / data_path.name.replace(".parquet", "_index.json")
+    index_map: list[dict] | None = None
+    if index_path.exists():
+        import json
+        with open(index_path) as f:
+            index_map = json.load(f)
 
-    for idx in args.index:
+    print(f"Dataset: {len(df)} samples, columns: {list(df.columns)}")
+    if index_map:
+        print(f"Index: {len(index_map)} entries")
+    print(f"Image folder: {image_folder}")
+
+    if args.num_samples > 0:
+        rng = np.random.default_rng(args.random_seed)
+        indices = sorted(rng.choice(len(df), size=min(args.num_samples, len(df)), replace=False).tolist())
+    elif args.index:
+        indices = args.index
+    else:
+        indices = list(range(min(10, len(df))))
+
+    print(f"Visualizing {len(indices)} samples")
+
+    for vis_i, idx in enumerate(indices):
         if idx >= len(df):
-            print(f"Index {idx} out of range ({len(df)} samples)")
             continue
-        print(f"\n=== Sample {idx} ===")
         row = df.iloc[idx]
         sample = {col: row[col] for col in df.columns}
+
+        # Source tracking from index file
+        if index_map and idx < len(index_map):
+            info = index_map[idx]
+            source = info["source"]
+            orig_idx = info["orig_idx"]
+        else:
+            source = "?"
+            orig_idx = idx
+        sample["_source"] = source
+        sample["_orig_idx"] = orig_idx
+
+        print(f"\n=== Sample {vis_i} (merged_idx={idx}, source={source}, orig_idx={orig_idx}) ===")
 
         fig = render_sample(sample, image_folder, args)
         if fig is None:
             continue
 
-        out_path = out_dir / f"sample_{idx:05d}.png"
+        out_path = out_dir / f"sample_{vis_i:05d}_{source}_{orig_idx}.png"
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"  Saved: {out_path}")

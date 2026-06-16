@@ -17,7 +17,7 @@ class FoveaConfig(_Qwen3_5Config):
         fovea_align_beta: float = 0.1,
         fovea_auto_retrieve_on_answer_start: bool = True,
         fovea_crop_max_image_tokens: int = 1024,
-        fovea_crop_threshold: float = 0.3,
+        fovea_crop_threshold: float = 0.35,
         fovea_crop_margin: float = 1.0,
         fovea_crop_padding: float = 1.0,
         fovea_token_id: int | None = None,
