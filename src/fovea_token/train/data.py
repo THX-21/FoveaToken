@@ -46,6 +46,14 @@ def build_visual_placeholder(
     return f"{vision_start_token}{image_token * int(num_image_tokens)}{vision_end_token}"
 
 
+def build_visual_payload(
+    num_image_tokens: int,
+    image_token: str = DEFAULT_IMAGE_PAD,
+    vision_end_token: str = DEFAULT_VISION_END,
+) -> str:
+    return f"{image_token * int(num_image_tokens)}{vision_end_token}"
+
+
 def append_visual_placeholders_to_fovea(
     conversations: Sequence[dict[str, Any]],
     crop_token_counts: Sequence[int],
@@ -66,13 +74,13 @@ def append_visual_placeholders_to_fovea(
                 break
             pieces.append(value[start : idx + len(FOVEA_TOKEN)])
             if crop_cursor >= len(crop_token_counts):
-                raise ValueError("Missing crop token counts for <fovea> placeholders.")
-            pieces.append(build_visual_placeholder(crop_token_counts[crop_cursor]))
+                raise ValueError("Missing crop token counts for Fovea placeholders.")
+            pieces.append(build_visual_payload(crop_token_counts[crop_cursor]))
             crop_cursor += 1
             start = idx + len(FOVEA_TOKEN)
         sentence["value"] = "".join(pieces)
     if crop_cursor != len(crop_token_counts):
-        raise ValueError("Unused crop token counts remain after expanding <fovea> placeholders.")
+        raise ValueError("Unused crop token counts remain after expanding Fovea placeholders.")
     return updated
 
 
@@ -121,13 +129,10 @@ def parse_vgr_box(box_text: str) -> tuple[float, float, float, float]:
     return x1, y1, x2, y2
 
 
-def replace_vgr_regions_with_visual_queries(
+def replace_vgr_regions_with_fovea(
     text: str,
-    *,
-    image_path: str,
-    visual_codec: Any | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Convert VGR `<SOT>box<EOT><image>` tags to fixed `<fovea>` triggers.
+    """Convert VGR `<SOT>box<EOT><image>` tags to built-in Qwen vision-start triggers.
 
     Assistant-side VGR data may also contain orphan `<SOT>/<EOT>` tags or stray
     plain `<image>` markers that do not correspond to a real extra image. Drop
@@ -337,15 +342,28 @@ def mask_visual_placeholder_labels(
     tokenizer: PreTrainedTokenizerBase,
 ) -> torch.LongTensor:
     masked = labels.clone()
-    for token_text in (DEFAULT_VISION_START, DEFAULT_IMAGE_PAD, DEFAULT_VISION_END):
-        token_ids = tokenize_text(tokenizer, token_text)
-        if not token_ids:
+    start_ids = tokenize_text(tokenizer, DEFAULT_VISION_START)
+    pad_ids = tokenize_text(tokenizer, DEFAULT_IMAGE_PAD)
+    end_ids = tokenize_text(tokenizer, DEFAULT_VISION_END)
+    if len(start_ids) != 1 or len(pad_ids) != 1 or len(end_ids) != 1:
+        raise ValueError("Qwen visual placeholder markers are expected to be single tokens.")
+    start_id, pad_id, end_id = start_ids[0], pad_ids[0], end_ids[0]
+    ids = input_ids.tolist()
+    idx = 0
+    while idx < len(ids):
+        if ids[idx] != start_id or idx + 1 >= len(ids) or ids[idx + 1] != pad_id:
+            idx += 1
             continue
-        width = len(token_ids)
-        last_start = input_ids.shape[0] - width
-        for start in range(max(last_start + 1, 0)):
-            if input_ids[start : start + width].tolist() == token_ids:
-                masked[start : start + width] = IGNORE_INDEX
+        end = idx + 2
+        while end < len(ids) and ids[end] == pad_id:
+            end += 1
+        if end < len(ids) and ids[end] == end_id:
+            # Keep <|vision_start|>: ignored on user image spans, supervised on
+            # assistant fovea spans, and used by build_fovea_metadata to split them.
+            masked[idx + 1 : end + 1] = IGNORE_INDEX
+            idx = end + 1
+            continue
+        idx += 1
     return masked
 
 
@@ -358,8 +376,7 @@ def apply_selective_label_substrings(
     """Keep labels only for exact tokenized substrings.
 
     This is used by auxiliary grounding stages where template text should be
-    context, while specific generated artifacts such as visual-query tokens and
-    bbox coordinates remain supervised.
+    context, while specific generated artifacts remain supervised.
     """
 
     if not substrings:
@@ -409,35 +426,37 @@ def build_fovea_metadata(
     tokenizer: PreTrainedTokenizerBase,
     query_boxes: Sequence[Sequence[float]],
 ) -> dict[str, torch.Tensor]:
-    """Locate `<fovea>` trigger tokens after tokenization."""
+    """Locate Fovea triggers.
+
+    Fovea reuses Qwen's built-in `<|vision_start|>` token. Only assistant-side
+    vision-start tokens are retrieval triggers; user-side image placeholders are
+    context and remain ignored in the labels.
+    """
 
     fovea_id = tokenizer.convert_tokens_to_ids(FOVEA_TOKEN)
-    if not query_boxes and fovea_id not in input_ids.tolist():
+    if not query_boxes:
         return {
             "fovea_positions": torch.empty((0,), dtype=torch.long),
             "fovea_box_indices": torch.empty((0,), dtype=torch.long),
             "fovea_boxes": torch.empty((0, 4), dtype=torch.float32),
         }
     if fovea_id < 0:
-        raise ValueError("The <fovea> special token must be added to the tokenizer before encoding VGR.")
+        raise ValueError("The built-in Qwen vision-start token must exist before encoding VGR.")
 
     ids = input_ids.tolist()
-    positions = [idx for idx, token_id in enumerate(ids) if token_id == fovea_id]
+    positions = [idx for idx, token_id in enumerate(ids) if token_id == fovea_id and labels[idx].item() != IGNORE_INDEX]
     if len(positions) != len(query_boxes):
-        raise ValueError(f"Parsed VGR boxes ({len(query_boxes)}) do not match tokenized <fovea> triggers ({len(positions)}).")
+        raise ValueError(
+            "Assistant-side fovea triggers do not match parsed VGR boxes: "
+            f"boxes={len(query_boxes)}, triggers={len(positions)}. "
+            "Fovea reuses <|vision_start|>; user-side image starts must be ignored, "
+            "while assistant-side fovea starts must remain labeled before selective supervision."
+        )
 
     return {
         "fovea_positions": torch.tensor(positions, dtype=torch.long),
         "fovea_box_indices": torch.arange(len(positions), dtype=torch.long),
         "fovea_boxes": torch.tensor(query_boxes, dtype=torch.float32),
-    }
-
-
-def empty_fovea_metadata() -> dict[str, torch.Tensor]:
-    return {
-        "fovea_positions": torch.empty((0,), dtype=torch.long),
-        "fovea_box_indices": torch.empty((0,), dtype=torch.long),
-        "fovea_boxes": torch.empty((0, 4), dtype=torch.float32),
     }
 
 
@@ -484,26 +503,6 @@ class VisionPacker:
         image_grid_thw = inputs["image_grid_thw"].to(torch.long)
         return pixel_values, image_grid_thw[0]
 
-    def _grid_boxes(self, grid_thw: torch.LongTensor) -> torch.Tensor:
-        _t, grid_h, grid_w = [int(v) for v in grid_thw.tolist()]
-        merge = max(int(self.spatial_merge_size), 1)
-        rows = torch.arange(0, grid_h, merge, dtype=torch.float32)
-        cols = torch.arange(0, grid_w, merge, dtype=torch.float32)
-        row_grid, col_grid = torch.meshgrid(rows, cols, indexing="ij")
-        return torch.stack(
-            [
-                col_grid / float(grid_w),
-                row_grid / float(grid_h),
-                (col_grid + merge).clamp_max(float(grid_w)) / float(grid_w),
-                (row_grid + merge).clamp_max(float(grid_h)) / float(grid_h),
-            ],
-            dim=-1,
-        ).reshape(-1, 4)
-
-    def pack_retrieve(self, image: Image.Image, max_image_tokens: int | None = None) -> tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
-        pixel_values, grid_thw = self._process(image, max_image_tokens=max_image_tokens)
-        return pixel_values, grid_thw, self._grid_boxes(grid_thw)
-
     def pack(self, image: Image.Image) -> tuple[torch.Tensor, torch.LongTensor]:
         return self._process(image, max_image_tokens=self.max_image_tokens)
 
@@ -536,7 +535,6 @@ class LazySupervisedDataset(Dataset):
         self.system_message = system_message
         self.fovea_crop_max_image_tokens = fovea_crop_max_image_tokens
         self.model_max_length = int(model_max_length or getattr(tokenizer, "model_max_length", 0) or 0)
-        self._printed_overlength_indices: set[int] = set()
 
     def __len__(self) -> int:
         return len(self.records)
@@ -555,9 +553,6 @@ class LazySupervisedDataset(Dataset):
         if not isinstance(image_value, str):
             raise ValueError(f"Unsupported image value type: {type(image_value)!r}")
         return Image.open(os.path.join(self.image_folder, image_value)).convert("RGB")
-
-    def _load_image(self, image_value: Any) -> Image.Image:
-        return self._open_image(image_value)
 
     def _build_instance(self, index: int) -> dict[str, Any]:
         """Build one training instance.
@@ -625,6 +620,12 @@ class LazySupervisedDataset(Dataset):
             image_token_counts=image_token_counts,
             system_message=self.system_message,
         )
+        fovea_metadata = build_fovea_metadata(
+            input_ids,
+            labels,
+            tokenizer=self.tokenizer,
+            query_boxes=query_boxes,
+        )
         labels = apply_selective_label_substrings(
             input_ids,
             labels,
@@ -632,12 +633,6 @@ class LazySupervisedDataset(Dataset):
             normalize_supervised_substrings(record.get("fovea_supervised_substrings")),
         )
         mm_token_type_ids = build_mm_token_type_ids(input_ids=input_ids, image_token_id=self.image_token_id)
-        fovea_metadata = build_fovea_metadata(
-            input_ids,
-            labels,
-            tokenizer=self.tokenizer,
-            query_boxes=query_boxes,
-        )
 
         return {
             "input_ids": input_ids,

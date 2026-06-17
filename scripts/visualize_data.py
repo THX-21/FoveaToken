@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize training data samples.")
     parser.add_argument("--data_path", default="data/vgr/preprocessed/vgr_shortcot.parquet")
-    parser.add_argument("--image_folder", default="data/llava_next/llava_next_raw_format")
+    parser.add_argument("--image_folder", default="data/vgr/llava_next_raw_format")
     parser.add_argument("--index", type=int, nargs="*", default=None)
     parser.add_argument("--num_samples", type=int, default=0, help="Randomly sample N records (overrides --index)")
     parser.add_argument("--output_dir", default="outputs/data_visualize")
@@ -45,8 +45,8 @@ def wrap_text(text: str, width: int = 100) -> str:
 
 
 def highlight_fovea(text: str) -> str:
-    """Replace <fovea> with a visible marker in the displayed text."""
-    return text.replace("<fovea>", " [FOVEA] ")
+    """Replace the built-in Fovea trigger with a visible marker."""
+    return text.replace("<|vision_start|>", " [FOVEA] ")
 
 
 def render_sample(sample: dict, image_folder: Path, args) -> np.ndarray | None:
@@ -89,7 +89,7 @@ def render_sample(sample: dict, image_folder: Path, args) -> np.ndarray | None:
         elif role in ("gpt", "assistant"):
             answer = value
 
-    n_fovea = answer.count("<fovea>")
+    n_fovea = answer.count("<|vision_start|>")
     n_boxes = len(boxes)
 
     source = sample.get("_source", "?")

@@ -38,11 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--data_path", default="data/vgr/preprocessed")
-    parser.add_argument("--image_folder", default="data/llava_next/llava_next_raw_format")
+    parser.add_argument("--image_folder", default="data/vgr/llava_next_raw_format")
     parser.add_argument("--disable_fovea_retrieval", type=lambda x: x.lower() == "true", default=False,
                         help="Disable fovea retrieval pipeline.")
-    parser.add_argument("--fovea_auto_retrieve_on_answer_start", type=lambda x: x.lower() == "true", default=False,
-                        help="Auto trigger fovea on answer start.")
     parser.add_argument("--crop", default="true", help="Crop the most-attended regions and save them.")
     parser.add_argument("--crop_threshold", type=float, default=0.35,
                         help="Threshold for cropping: boxes with weight > threshold * max_weight are cropped.")
@@ -179,13 +177,12 @@ def _init_train_state(args):
         return _TRAIN_STATE
 
     from fovea_token import FoveaForConditionalGeneration
-    from fovea_token.tokenizers.tokenization_fovea import add_fovea_tokens, sync_fovea_token_ids
+    from fovea_token.tokenizers.tokenization_fovea import sync_fovea_token_ids
     from fovea_token.train.data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
     from transformers import AutoProcessor, AutoTokenizer
 
     print("Loading model (once)...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
-    add_fovea_tokens(tokenizer)
     processor = AutoProcessor.from_pretrained(args.model_name_or_path)
     processor.tokenizer = tokenizer
 
@@ -195,7 +192,7 @@ def _init_train_state(args):
         device_map=args.device_map,
     )
     if len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
-        model.resize_token_embeddings(len(tokenizer))
+        raise ValueError("Tokenizer/model vocab mismatch: Fovea must not add or resize token rows.")
     sync_fovea_token_ids(model.config, tokenizer)
     model.config.image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
     model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
@@ -242,7 +239,7 @@ def load_train_sample(args, index: int):
                     "call_idx": call_idx,
                     "trigger_idx": trigger_idx,
                     "attn": attn,
-                    "boxes": batch["retrieve_patch_boxes"],
+                    "boxes": entry["retrieve_patch_boxes"],
                     "query_box": query_box,
                 }
             )
@@ -266,7 +263,6 @@ def load_lmms_eval_sample(args, index: int):
             "attn_implementation": args.attn_implementation,
             "enable_thinking": args.enable_thinking,
             "disable_fovea_retrieval": args.disable_fovea_retrieval,
-            "fovea_auto_retrieve_on_answer_start": args.fovea_auto_retrieve_on_answer_start,
         },
     )
     task = _init_task(args.task, resolved_model.model_id, resolved_model.model_type)
@@ -334,7 +330,7 @@ def save_visualizations(sample: dict, args) -> None:
             f"Q: {wrap_for_title(sample['question'])}\n\n"
             f"GT: {wrap_for_title(sample['answer'])}\n\n"
             f"Pred: {wrap_for_title(sample['prediction'])}\n\n"
-            "No <fovea> trigger was recorded for this sample."
+            "No Fovea trigger was recorded for this sample."
         )
         ax.set_title(title, fontsize=10, loc="left", pad=16)
         fig.tight_layout()

@@ -2,7 +2,8 @@
 """Offline VGR fovea-trigger preprocessing.
 
 This rewrites VGR parquet conversations from `<SOT>box<EOT><image>` into
-`<fovea>` and stores the matched boxes in `fovea_query_boxes` for training.
+Qwen's built-in `<|vision_start|>` trigger and stores the matched boxes in
+`fovea_query_boxes` for training.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from typing import Any
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FOVEA_TOKEN = "<fovea>"
+FOVEA_TOKEN = "<|vision_start|>"
 DEFAULT_IMAGE_TOKEN = "<image>"
 SOT_EOT_IMAGE_RE = re.compile(r"<SOT>\s*(\[[^\]]+\])\s*<EOT>\s*<image>")
 ORPHAN_VGR_TAG_RE = re.compile(r"<SOT>|<EOT>")
@@ -36,7 +37,7 @@ def parse_vgr_box(box_text: str) -> tuple[float, float, float, float]:
     return x1, y1, x2, y2
 
 
-def replace_vgr_regions_with_visual_queries(text: str, *, image_path: str | None = None, visual_codec: Any | None = None) -> tuple[str, list[dict[str, Any]]]:
+def replace_vgr_regions_with_fovea(text: str) -> tuple[str, list[dict[str, Any]]]:
     queries: list[dict[str, Any]] = []
     saw_vgr_markup = bool(SOT_EOT_IMAGE_RE.search(text) or ORPHAN_VGR_TAG_RE.search(text))
 
@@ -69,16 +70,12 @@ def preprocess_record(record: dict[str, Any], image_folder: Path) -> dict[str, A
     if len(image_names) != 1:
         raise ValueError("VGR preprocessing expects one image per sample.")
 
-    image_path = image_folder / image_names[0]
     conversations = copy.deepcopy(record["conversations"])
     query_boxes: list[list[float]] = []
     for sentence in conversations:
         if sentence.get("from") not in {"gpt", "assistant"}:
             continue
-        value, parsed_queries = replace_vgr_regions_with_visual_queries(
-            sentence["value"],
-            image_path=str(image_path),
-        )
+        value, parsed_queries = replace_vgr_regions_with_fovea(sentence["value"])
         sentence["value"] = value
         query_boxes.extend([list(query["box"]) for query in parsed_queries])
 

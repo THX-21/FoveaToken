@@ -24,15 +24,16 @@ export RANK=0
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
 RUN_NAME="${FT3_RUN_NAME:-fovea-vgr-qwen}"
 DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr/preprocessed}"
-IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/llava_next/llava_next_raw_format}"
+IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/vgr/llava_next_raw_format}"
 CKPT_PATH="${FT3_CKPT_PATH:-checkpoints/fovea-4B}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-50}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
 ATTN_IMPLEMENTATION="${FT3_ATTN_IMPLEMENTATION:-sdpa}"
-UNFREEZE_VISION="${FT3_UNFREEZE_VISION:-true}"
-FREEZE_EMBED_BASE="${FT3_FREEZE_EMBED_BASE:-false}"
 MAX_IMG_TOKENS="${FT3_MAX_IMG_TOKENS:-2048}"
+CROP_MAX_IMG_TOKENS="${FT3_FOVEA_CROP_MAX_IMG_TOKENS:-1024}"
+REPORT_TO="${FT3_REPORT_TO:-tensorboard}"
+WORKERS="${FT3_DATALOADER_NUM_WORKERS:-8}"
 
 echo "[ft3] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
 echo "[ft3] RUN_NAME=${RUN_NAME}"
@@ -42,19 +43,24 @@ echo "[ft3] CKPT_PATH=${CKPT_PATH}"
 echo "[ft3] OUTPUT_DIR=${OUTPUT_DIR}"
 echo "[ft3] SAVE_STEPS=${SAVE_STEPS}"
 echo "[ft3] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
-echo "[ft3] UNFREEZE_VISION=${UNFREEZE_VISION}"
-echo "[ft3] FREEZE_EMBED_BASE=${FREEZE_EMBED_BASE}"
 echo "[ft3] MAX_IMG_TOKENS=${MAX_IMG_TOKENS}"
+echo "[ft3] FOVEA_CROP_MAX_IMG_TOKENS=${CROP_MAX_IMG_TOKENS}"
+echo "[ft3] DATALOADER_NUM_WORKERS=${WORKERS}"
+echo "[ft3] REPORT_TO=${REPORT_TO}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
+PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    PYTHON_BIN="python"
+fi
 
-if python - <<'PY'
+if "${PYTHON_BIN}" - <<'PY'
 import torch
 raise SystemExit(0 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 1)
 PY
 then
     PRECISION_ARGS=(--bf16 true --fp16 false --tf32 true)
-elif python - <<'PY'
+elif "${PYTHON_BIN}" - <<'PY'
 import torch
 raise SystemExit(0 if torch.cuda.is_available() else 1)
 PY
@@ -66,7 +72,8 @@ fi
 # PRECISION_ARGS=(--bf16 false --fp16 false --tf32 true)
 
 LAUNCHER=(
-    torchrun
+    "${PYTHON_BIN}"
+    -m torch.distributed.run
     --nproc_per_node="${NUM_GPUS}"
     --nnodes="${NNODES}"
     --node_rank="${RANK}"
@@ -79,8 +86,7 @@ RESUME_ARGS=()
 LATEST_CHECKPOINT="$(find "${OUTPUT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' 2>/dev/null | sort -V | tail -n 1)"
 if [[ -n "${LATEST_CHECKPOINT}" ]]; then
     echo "[ft3] RESUME_CHECKPOINT=${LATEST_CHECKPOINT}"
-    echo "[ft3] Model weights will initialize from the resume checkpoint because lora_enable=false."
-    echo "[ft3] Trainer state will resume from the same checkpoint."
+    echo "[ft3] Model weights and Trainer state will resume from the same checkpoint."
     RESUME_ARGS=(--resume_from_checkpoint "${LATEST_CHECKPOINT}")
 fi
 
@@ -90,12 +96,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --data_path "${DATA_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
     --max_img_tokens "${MAX_IMG_TOKENS}" \
-    --lora_enable false \
-    --lora_r 64 \
-    --lora_alpha 16 \
-    --lora_dropout 0.05 \
-    --unfreeze_vision "${UNFREEZE_VISION}" \
-    --freeze_embed_base "${FREEZE_EMBED_BASE}" \
+    --fovea_crop_max_img_tokens "${CROP_MAX_IMG_TOKENS}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \
     --output_dir "${OUTPUT_DIR}" \
@@ -108,7 +109,6 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --save_steps "${SAVE_STEPS}" \
     --save_total_limit 2 \
     --learning_rate 2e-5 \
-    --vision_tower_lr 2e-6 \
     --max_grad_norm 1.0 \
     --weight_decay 0.0 \
     --warmup_ratio 0.03 \
@@ -117,8 +117,8 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --logging_steps 1 \
     --model_max_length 8096 \
     --gradient_checkpointing true \
-    --dataloader_num_workers "${FT3_DATALOADER_NUM_WORKERS:-8}" \
-    --report_to tensorboard \
+    --dataloader_num_workers "${WORKERS}" \
+    --report_to "${REPORT_TO}" \
     --remove_unused_columns false \
     --logging_nan_inf_filter false \
     "${RESUME_ARGS[@]}"

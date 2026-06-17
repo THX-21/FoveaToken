@@ -7,7 +7,6 @@ import torch
 from accelerate import Accelerator, DistributedType
 from loguru import logger as eval_logger
 from PIL import Image
-from safetensors.torch import load_file as safe_load_file
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -19,11 +18,9 @@ from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
 
 from fovea_token import FoveaForConditionalGeneration
 from fovea_token.train.data import VisionPacker
-from fovea_token.train.sft import get_visual_module
-from fovea_token.tokenizers.tokenization_fovea import add_fovea_tokens, sync_fovea_token_ids
+from fovea_token.tokenizers.tokenization_fovea import sync_fovea_token_ids
 
 
-VISION_TOWER_WEIGHTS_NAME = "vision_tower.safetensors"
 MODEL_WEIGHT_FILENAMES = {
     "pytorch_model.bin",
     "model.safetensors",
@@ -50,11 +47,6 @@ class Fovea(Qwen3_VL):
         return candidate if candidate.exists() else None
 
     @classmethod
-    def _is_peft_adapter_dir(cls, path: Optional[str]) -> bool:
-        candidate = cls._as_local_path(path)
-        return bool(candidate and (candidate / "adapter_config.json").exists())
-
-    @classmethod
     def _is_full_checkpoint_dir(cls, path: Optional[str]) -> bool:
         candidate = cls._as_local_path(path)
         if not candidate or not candidate.is_dir() or not (candidate / "config.json").exists():
@@ -62,21 +54,12 @@ class Fovea(Qwen3_VL):
         return any((candidate / filename).exists() for filename in MODEL_WEIGHT_FILENAMES)
 
     @classmethod
-    def _resolve_checkpoint_sources(cls, pretrained: str, peft: Optional[str]) -> tuple[str, Optional[str], str]:
-        if peft is not None:
-            return pretrained, peft, "peft"
-        if cls._is_peft_adapter_dir(pretrained):
-            raise ValueError(
-                "`pretrained` points to a PEFT adapter directory. Pass the base model as `pretrained` and the adapter path as `peft`."
-            )
-        if cls._is_full_checkpoint_dir(pretrained):
-            return pretrained, None, "full"
-        return pretrained, None, "base"
+    def _checkpoint_mode(cls, pretrained: str) -> str:
+        return "full" if cls._is_full_checkpoint_dir(pretrained) else "base"
 
     def __init__(
         self,
         pretrained: str = "Qwen/Qwen3.5-4B",
-        peft: Optional[str] = None,
         device: Optional[str] = "cuda",
         device_map: Optional[str] = "auto",
         batch_size: Optional[Union[int, str]] = 1,
@@ -89,7 +72,6 @@ class Fovea(Qwen3_VL):
         max_image_tokens: int | None = 512,
         fovea_crop_max_image_tokens: int | None = 1024,
         disable_fovea_retrieval: Optional[bool] = False,
-        fovea_auto_retrieve_on_answer_start: Optional[bool] = False,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -110,34 +92,23 @@ class Fovea(Qwen3_VL):
             self._device = torch.device(resolved_device)
             self.device_map = device_map if device_map else resolved_device
 
-        load_pretrained, load_peft, checkpoint_mode = self._resolve_checkpoint_sources(pretrained, peft)
-        eval_logger.info(f"Resolved Fovea checkpoint mode: {checkpoint_mode}")
+        eval_logger.info(f"Resolved Fovea checkpoint mode: {self._checkpoint_mode(pretrained)}")
         model_kwargs = {
             "torch_dtype": self._pick_torch_dtype(),
             "device_map": self.device_map,
         }
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
-        self._model = FoveaForConditionalGeneration.from_pretrained(load_pretrained, **model_kwargs)
-        tokenizer_source = load_pretrained
+        self._model = FoveaForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
+        tokenizer_source = pretrained
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
-        add_fovea_tokens(self._tokenizer)
         if len(self._tokenizer) != self._model.get_input_embeddings().weight.shape[0]:
-            self._model.resize_token_embeddings(len(self._tokenizer))
+            raise ValueError("Tokenizer/model vocab mismatch: Fovea must not add or resize token rows.")
         sync_fovea_token_ids(self._model.config, self._tokenizer)
         self._model.config.image_token_id = self._tokenizer.convert_tokens_to_ids("<|image_pad|>")
         self._model.config.video_token_id = self._tokenizer.convert_tokens_to_ids("<|video_pad|>")
         self._model.config.vision_start_token_id = self._tokenizer.convert_tokens_to_ids("<|vision_start|>")
         self._model.config.vision_end_token_id = self._tokenizer.convert_tokens_to_ids("<|vision_end|>")
-        if load_peft is not None:
-            from peft import PeftModel
-
-            self._load_deepspeed_trainables(load_peft)
-            self._model = PeftModel.from_pretrained(self._model, load_peft)
-            base_model = self._model.get_base_model()
-            if hasattr(base_model, "_repair_fovea_init"):
-                base_model._repair_fovea_init()
-            sync_fovea_token_ids(base_model.config, self._tokenizer)
         self._model = self._model.eval()
         self.processor = AutoProcessor.from_pretrained(tokenizer_source)
         self.processor.tokenizer = self._tokenizer
@@ -149,7 +120,6 @@ class Fovea(Qwen3_VL):
         self.vision_packer = vision_packer
         self._model.config.fovea_crop_max_image_tokens = int(fovea_crop_max_image_tokens)
         self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
-        self.fovea_auto_retrieve_on_answer_start = bool(fovea_auto_retrieve_on_answer_start)
 
         self.enable_thinking = enable_thinking
         if reasoning_prompt:
@@ -182,61 +152,8 @@ class Fovea(Qwen3_VL):
             self._rank = 0
             self._world_size = 1
 
-    def _load_deepspeed_trainables(self, checkpoint_path: str) -> None:
-        """Load legacy non-LoRA vision trainables saved alongside a LoRA checkpoint."""
-
-        checkpoint = Path(checkpoint_path)
-        if not checkpoint.is_dir():
-            return
-
-        safe_path = checkpoint / VISION_TOWER_WEIGHTS_NAME
-        if safe_path.exists():
-            eval_logger.info(f"Loading vision tower weights from {safe_path}")
-            vision_module = get_visual_module(self._model)
-            vision_state = safe_load_file(str(safe_path))
-            vision_module.load_state_dict(vision_state, strict=True)
-            eval_logger.info(f"Loaded {len(vision_state)} vision tensors from {safe_path}")
-            return
-
-        latest_file = checkpoint / "latest"
-        if latest_file.exists():
-            global_step_name = latest_file.read_text().strip()
-            global_step_dir = checkpoint / global_step_name
-        else:
-            global_steps = sorted(checkpoint.glob("global_step*"))
-            global_step_dir = global_steps[-1] if global_steps else None
-        if global_step_dir is None:
-            return
-
-        state_path = global_step_dir / "mp_rank_00_model_states.pt"
-        if not state_path.exists():
-            return
-
-        eval_logger.info(f"Loading non-LoRA trainables from {state_path}")
-        state = torch.load(state_path, map_location="cpu", weights_only=False)
-        module_state = state.get("module", {})
-        trainable_state = {}
-        prefix = "base_model.model."
-        for key, tensor in module_state.items():
-            if not key.startswith(prefix):
-                continue
-            raw_key = key[len(prefix) :]
-            if raw_key.startswith("model.visual"):
-                trainable_state[raw_key] = tensor
-
-        if not trainable_state:
-            eval_logger.warning(f"No vision trainables found in {state_path}")
-            return
-
-        incompatible = self._model.load_state_dict(trainable_state, strict=False)
-        unexpected = list(incompatible.unexpected_keys)
-        if unexpected:
-            eval_logger.warning(f"Unexpected non-LoRA trainable keys while loading {state_path}: {unexpected[:20]}")
-        eval_logger.info(f"Loaded {len(trainable_state) - len(unexpected)} vision tensors from Deepspeed checkpoint")
-
     def _build_generate_kwargs(self, gen_kwargs):
         generate_kwargs = super()._build_generate_kwargs(gen_kwargs)
-        generate_kwargs["fovea_auto_retrieve_on_answer_start"] = self.fovea_auto_retrieve_on_answer_start
         if self.disable_fovea_retrieval:
             generate_kwargs["disable_fovea_retrieval"] = True
         return generate_kwargs

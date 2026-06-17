@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="fovea", help="lmms-eval model name")
     parser.add_argument(
         "--model_args",
-        default="pretrained=checkpoints/fovea-vgr-qwen/checkpoint-666,device=cuda:4,device_map=cuda:4,attn_implementation=sdpa,enable_thinking=True, max_image_tokens=2048,disable_fovea_retrieval=False,fovea_auto_retrieve_on_answer_start=False",
+        default="pretrained=checkpoints/fovea-vgr-qwen/checkpoint-666,device=cuda:4,device_map=cuda:4,attn_implementation=sdpa,enable_thinking=True,max_image_tokens=2048,disable_fovea_retrieval=False",
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")

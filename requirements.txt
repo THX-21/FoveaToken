@@ -82,7 +82,6 @@ packaging
 pandas
 pathspec
 pathvalidate
-peft
 pillow
 platformdirs
 portalocker
