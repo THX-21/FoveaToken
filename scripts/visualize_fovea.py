@@ -23,7 +23,7 @@ from fovea_token.fovea_crop import crop_attended_regions, normalize_patch_boxes
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize Fovea attention.")
     parser.add_argument("--task", default="chartqa", help="`train` or an lmms-eval task like `mmstar`.")
-    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-qwen/checkpoint-666")
+    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-qwen-9b/checkpoint-200")
     parser.add_argument("--index", type=int, nargs="+", default=[0,1,2,3,4,5,6,7,8,9,10])
     parser.add_argument("--output_dir", default="outputs/fovea_visualize")
     parser.add_argument("--alpha", type=float, default=0.45)
@@ -41,6 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_folder", default="data/vgr/llava_next_raw_format")
     parser.add_argument("--disable_fovea_retrieval", type=lambda x: x.lower() == "true", default=False,
                         help="Disable fovea retrieval pipeline.")
+    parser.add_argument("--fovea_use_aux_head", type=lambda x: x.lower() == "true", default=True,
+                        help="Use fovea_aux_lm_head instead of frozen lm_head for token generation.")
     parser.add_argument("--crop", default="true", help="Crop the most-attended regions and save them.")
     parser.add_argument("--crop_threshold", type=float, default=0.35,
                         help="Threshold for cropping: boxes with weight > threshold * max_weight are cropped.")
@@ -198,6 +200,7 @@ def _init_train_state(args):
     model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
     model.config.vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
     model.config.vision_end_token_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    model.config.fovea_use_aux_head = args.fovea_use_aux_head
     model.eval()
 
     packer = VisionPacker(processor=processor, vision_config=model.config.vision_config)
@@ -227,6 +230,25 @@ def load_train_sample(args, index: int):
     image_name = record["image"]
     image = Image.open(Path(args.image_folder) / image_name).convert("RGB")
     question, answer = get_sample_qa(record)
+
+    # Insert <fovea> markers into answer at fovea_positions if not already present.
+    if "<fovea>" not in answer:
+        labels = batch["labels"][0]  # [seq_len]
+        answer_mask = labels != -100
+        answer_start = int(answer_mask.nonzero(as_tuple=True)[0][0].item())
+        fovea_positions = batch["fovea_positions"]  # [N, 2]: [batch_idx, position]
+        fovea_offsets = sorted(
+            (int(p[1].item()) - answer_start for p in fovea_positions if int(p[0].item()) == 0),
+            reverse=True,
+        )
+        answer_tokens = tokenizer.encode(answer, add_special_tokens=False)
+        for offset in fovea_offsets:
+            offset = max(0, min(offset, len(answer_tokens)))
+            prefix = tokenizer.decode(answer_tokens[:offset], skip_special_tokens=False)
+            suffix = tokenizer.decode(answer_tokens[offset:], skip_special_tokens=False)
+            answer = prefix + "<fovea>" + suffix
+            answer_tokens = tokenizer.encode(answer, add_special_tokens=False)
+
     history = []
     for call_idx, entry in enumerate(model._fovea_aux_history):
         attn_mean = entry["fovea_attn_mean"]
@@ -263,6 +285,7 @@ def load_lmms_eval_sample(args, index: int):
             "attn_implementation": args.attn_implementation,
             "enable_thinking": args.enable_thinking,
             "disable_fovea_retrieval": args.disable_fovea_retrieval,
+            "fovea_use_aux_head": args.fovea_use_aux_head,
         },
     )
     task = _init_task(args.task, resolved_model.model_id, resolved_model.model_type)
@@ -291,11 +314,28 @@ def load_lmms_eval_sample(args, index: int):
     with torch.no_grad():
         prediction, _token_counts = _run_simple_sample(lmms_model, task, index, question, gen_kwargs)
 
+    # Inject <fovea> markers into prediction text at trigger positions.
+    tokenizer = lmms_model._tokenizer
+    pred_token_ids = tokenizer.encode(prediction, add_special_tokens=False)
+    trigger_offsets = sorted(
+        [int(entry["trigger_offset"])
+         for entry in lmms_model.model._fovea_aux_history
+         if entry.get("trigger_offset") is not None],
+        reverse=True,  # process from end to keep earlier offsets valid
+    )
+    for offset in trigger_offsets:
+        offset = min(offset, len(pred_token_ids))
+        prefix = tokenizer.decode(pred_token_ids[:offset], skip_special_tokens=False)
+        suffix = tokenizer.decode(pred_token_ids[offset:], skip_special_tokens=False)
+        prediction = prefix + "<fovea>" + suffix
+        pred_token_ids = tokenizer.encode(prediction, add_special_tokens=False)
+
     history = []
     for call_idx, entry in enumerate(lmms_model.model._fovea_aux_history):
         attn_mean = entry["fovea_attn_mean"]
         if attn_mean.ndim == 2:
             attn_mean = attn_mean.unsqueeze(0)
+        trigger_offset = entry.get("trigger_offset", None)
         for trigger_idx, attn in enumerate(attn_mean):
             history.append(
                 {
@@ -304,6 +344,7 @@ def load_lmms_eval_sample(args, index: int):
                     "attn": attn,
                     "boxes": entry["retrieve_patch_boxes"],
                     "query_box": None,
+                    "trigger_offset": trigger_offset,
                 }
             )
     return {
@@ -364,7 +405,7 @@ def save_visualizations(sample: dict, args) -> None:
                 sample["image"], entry["boxes"], summary,
                 threshold=args.crop_threshold, margin=args.crop_margin, padding=args.crop_padding,
             )
-            for crop_idx, c in enumerate(crops[:2]):
+            for crop_idx, c in enumerate(crops[:1]):
                 crop_path = out_dir / f"{stem}_crop_{crop_idx:02d}.png"
                 c.crop.save(crop_path)
                 print(f"Saved crop: {crop_path}  box={c.box}  weight={c.weight:.4f}")

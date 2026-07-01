@@ -64,14 +64,12 @@ def hrbench_process_results(doc, results):
     pred = results[0].strip()
     gt = doc["answer"]
     options = hrbench_doc_to_options(doc)
-    question = doc["question"]
-    resp_dic = hrbench_evaluator.get_chat_response({"question": question, "options": options, "prediction": pred})
-    gpt_prediction = resp_dic["gpt_prediction"]
+    inferred_prediction = hrbench_evaluator.can_infer(pred, options)
     category = doc["category"]
     cycle_category = doc["cycle_category"]
 
     gpt_score = 0
-    if gt.lower() == gpt_prediction.lower():
+    if inferred_prediction and gt.lower() == str(inferred_prediction).lower():
         gpt_score = 1
 
     return {category: {"index": doc["index"], "cycle_category": cycle_category, "gpt_score": gpt_score}, "average": {"index": doc["index"], "cycle_category": cycle_category, "gpt_score": gpt_score}}

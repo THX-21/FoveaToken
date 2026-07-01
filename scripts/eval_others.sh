@@ -5,7 +5,7 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 # export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 # export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
-BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen3.5-4B}"
+BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen3.5-9B}"
 MODEL="${EVAL_MODEL:-qwen3_5}"
 TASKS="${EVAL_TASKS:-chartqa}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"

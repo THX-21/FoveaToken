@@ -19,9 +19,9 @@ import torch
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Merge a Fovea checkpoint with frozen Qwen base weights.")
-    parser.add_argument("--qwen_model", default="Qwen/Qwen3.5-4B", help="Base Qwen model id or local path.")
-    parser.add_argument("--fovea_ckpt", default="checkpoints/fovea-vgr-qwen/checkpoint-2300")
-    parser.add_argument("--output", default="checkpoints/fovea-vgr-qwen/checkpoint-2300-merged")
+    parser.add_argument("--qwen_model", default="Qwen/Qwen3.5-9B", help="Base Qwen model id or local path.")
+    parser.add_argument("--fovea_ckpt", default="checkpoints/fovea-vgr-qwen-9b/checkpoint-2300")
+    parser.add_argument("--output", default="checkpoints/fovea-vgr-qwen-9b/checkpoint-2300-merged")
     return parser.parse_args()
 
 

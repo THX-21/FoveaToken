@@ -49,9 +49,10 @@ def build_visual_placeholder(
 def build_visual_payload(
     num_image_tokens: int,
     image_token: str = DEFAULT_IMAGE_PAD,
+    vision_start_token: str = DEFAULT_VISION_START,
     vision_end_token: str = DEFAULT_VISION_END,
 ) -> str:
-    return f"{image_token * int(num_image_tokens)}{vision_end_token}"
+    return f"{vision_start_token}{image_token * int(num_image_tokens)}{vision_end_token}"
 
 
 def append_visual_placeholders_to_fovea(
@@ -132,7 +133,7 @@ def parse_vgr_box(box_text: str) -> tuple[float, float, float, float]:
 def replace_vgr_regions_with_fovea(
     text: str,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Convert VGR `<SOT>box<EOT><image>` tags to built-in Qwen vision-start triggers.
+    """Convert VGR `<SOT>box<EOT><image>` tags to dedicated `<fovea>` triggers.
 
     Assistant-side VGR data may also contain orphan `<SOT>/<EOT>` tags or stray
     plain `<image>` markers that do not correspond to a real extra image. Drop
@@ -333,7 +334,8 @@ def encode_chat_template_example(
 
     input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
     labels_tensor = torch.tensor(labels, dtype=torch.long)
-    return input_ids_tensor, mask_visual_placeholder_labels(input_ids_tensor, labels_tensor, tokenizer)
+    labels_tensor = mask_visual_placeholder_labels(input_ids_tensor, labels_tensor, tokenizer)
+    return input_ids_tensor, labels_tensor
 
 
 def mask_visual_placeholder_labels(
@@ -358,8 +360,8 @@ def mask_visual_placeholder_labels(
         while end < len(ids) and ids[end] == pad_id:
             end += 1
         if end < len(ids) and ids[end] == end_id:
-            # Keep <|vision_start|>: ignored on user image spans, supervised on
-            # assistant fovea spans, and used by build_fovea_metadata to split them.
+            # Keep <|vision_start|>: visual start marker for user-image or crop spans.
+            # Fovea retrieval triggers use the separate <fovea> token.
             masked[idx + 1 : end + 1] = IGNORE_INDEX
             idx = end + 1
             continue
@@ -426,12 +428,7 @@ def build_fovea_metadata(
     tokenizer: PreTrainedTokenizerBase,
     query_boxes: Sequence[Sequence[float]],
 ) -> dict[str, torch.Tensor]:
-    """Locate Fovea triggers.
-
-    Fovea reuses Qwen's built-in `<|vision_start|>` token. Only assistant-side
-    vision-start tokens are retrieval triggers; user-side image placeholders are
-    context and remain ignored in the labels.
-    """
+    """Locate Fovea triggers (<fovea> token) in the tokenized sequence."""
 
     fovea_id = tokenizer.convert_tokens_to_ids(FOVEA_TOKEN)
     if not query_boxes:
@@ -441,16 +438,16 @@ def build_fovea_metadata(
             "fovea_boxes": torch.empty((0, 4), dtype=torch.float32),
         }
     if fovea_id < 0:
-        raise ValueError("The built-in Qwen vision-start token must exist before encoding VGR.")
+        raise ValueError("The <fovea> token must be added to the tokenizer before encoding VGR.")
 
     ids = input_ids.tolist()
     positions = [idx for idx, token_id in enumerate(ids) if token_id == fovea_id and labels[idx].item() != IGNORE_INDEX]
     if len(positions) != len(query_boxes):
         raise ValueError(
-            "Assistant-side fovea triggers do not match parsed VGR boxes: "
+            "Assistant-side fovea triggers (<fovea>) do not match parsed VGR boxes: "
             f"boxes={len(query_boxes)}, triggers={len(positions)}. "
-            "Fovea reuses <|vision_start|>; user-side image starts must be ignored, "
-            "while assistant-side fovea starts must remain labeled before selective supervision."
+            "User-side <|vision_start|> image starts must be ignored, "
+            "while assistant-side <fovea> triggers must remain labeled."
         )
 
     return {

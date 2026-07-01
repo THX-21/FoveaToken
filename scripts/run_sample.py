@@ -16,11 +16,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="fovea", help="lmms-eval model name")
     parser.add_argument(
         "--model_args",
-        default="pretrained=checkpoints/fovea-vgr-qwen/checkpoint-666,device=cuda:4,device_map=cuda:4,attn_implementation=sdpa,enable_thinking=True,max_image_tokens=2048,disable_fovea_retrieval=False",
+        default="pretrained=checkpoints/fovea-vgr-qwen-9b/checkpoint-250,device=cuda:4,device_map=cuda:4,attn_implementation=sdpa,enable_thinking=True,max_image_tokens=2048,disable_fovea_retrieval=False,fovea_use_aux_head=True",
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")
-    parser.add_argument("--task", default="chartqa", help="lmms-eval task name")
+    parser.add_argument("--task", default="mmstar", help="lmms-eval task name")
     parser.add_argument("--index", type=int, default=0, help="Start index in the task docs")
     parser.add_argument("--num_samples", type=int, default=10, help="Number of consecutive samples to run")
     parser.add_argument("--max_new_tokens", type=int, default=None)
@@ -145,6 +145,34 @@ def _compact_text(text: str, limit: int) -> str:
     return text[: limit - 3] + "..."
 
 
+def _annotate_fovea_triggers(text: str, tokenizer, trigger_offsets: list[int]) -> str:
+    """Insert [FOVEA] markers at token offsets (relative to generation start)."""
+    if not trigger_offsets or tokenizer is None:
+        return text
+    offsets = sorted(set(trigger_offsets))
+    ids = tokenizer(text, add_special_tokens=False).input_ids
+    char_pos = [0]
+    for tid in ids:
+        char_pos.append(char_pos[-1] + len(tokenizer.decode([tid])))
+    # Skip prefilled <think> token(s) at the start so that trigger_offset=0
+    # maps to the first *generated* token, not the prefilled one.
+    gen_start = 0
+    if text.startswith("<think>"):
+        gen_start = len(tokenizer("<think>", add_special_tokens=False).input_ids)
+    result = []
+    oi = 0
+    for i, (s, e) in enumerate(zip(char_pos[:-1], char_pos[1:])):
+        if i >= gen_start:
+            while oi < len(offsets) and offsets[oi] == i - gen_start:
+                result.append("[FOVEA]")
+                oi += 1
+        result.append(text[s:e])
+    while oi < len(offsets):
+        result.append("[FOVEA]")
+        oi += 1
+    return "".join(result)
+
+
 def _print_block(title: str, text: str, limit: int) -> None:
     print(f"[{title}]")
     print(_compact_text(text, limit))
@@ -214,13 +242,16 @@ def main() -> None:
             fovea_hist = getattr(getattr(model, "model", None), "_fovea_aux_history", None) or []
             fovea_count = len(fovea_hist)
 
+        fovea_offsets = [e["trigger_offset"] for e in fovea_hist if "trigger_offset" in e]
+        display_annotated = _annotate_fovea_triggers(display_raw, getattr(model, "tokenizer", None), fovea_offsets) if fovea_offsets else display_raw
+
         print(f"\n{'=' * 80}")
         print(f"Sample {doc_idx}")
         print(f"Time: {elapsed:.1f}s | Tokens: {n_tok} | </think>: {has_think_end} | Fovea: {fovea_count} | Limit: {hit_limit}")
         print(f"GT: {answer}")
         print(f"Q: {question or context}")
         print(f"{'─' * 80}")
-        _print_block("OUTPUT", display_raw, args.preview_chars)
+        _print_block("OUTPUT", display_annotated, args.preview_chars)
         print(f"{'=' * 80}")
 
     print(f"\nTotal time: {total_time:.1f}s | Avg: {total_time / args.num_samples:.1f}s/sample")

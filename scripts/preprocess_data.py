@@ -2,7 +2,7 @@
 """Offline VGR fovea-trigger preprocessing.
 
 This rewrites VGR parquet conversations from `<SOT>box<EOT><image>` into
-Qwen's built-in `<|vision_start|>` trigger and stores the matched boxes in
+the dedicated `<fovea>` trigger and stores the matched boxes in
 `fovea_query_boxes` for training.
 """
 
@@ -19,10 +19,13 @@ from typing import Any
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FOVEA_TOKEN = "<|vision_start|>"
+FOVEA_TOKEN = "<fovea>"
 DEFAULT_IMAGE_TOKEN = "<image>"
 SOT_EOT_IMAGE_RE = re.compile(r"<SOT>\s*(\[[^\]]+\])\s*<EOT>\s*<image>")
 ORPHAN_VGR_TAG_RE = re.compile(r"<SOT>|<EOT>")
+THINK_START = "<think>"
+THINK_END = "</think>"
+LEADING_THINK_END_RE = re.compile(r"^\s*</think>\s*", re.IGNORECASE)
 
 
 def parse_vgr_box(box_text: str) -> tuple[float, float, float, float]:
@@ -52,6 +55,26 @@ def replace_vgr_regions_with_fovea(text: str) -> tuple[str, list[dict[str, Any]]
     return cleaned_text, queries
 
 
+def normalize_assistant_think_text(text: str) -> str:
+    text = text.replace("\\n", "\n")
+    text = LEADING_THINK_END_RE.sub("", text)
+    stripped = text.lstrip()
+    if not stripped.startswith(THINK_START):
+        return text
+    text = stripped
+    remainder = text[len(THINK_START) :]
+    if not remainder.startswith("\n"):
+        remainder = "\n" + remainder
+    if THINK_END not in remainder:
+        return THINK_START + remainder
+    think_body, suffix = remainder.split(THINK_END, 1)
+    think_body = think_body.rstrip("\n")
+    if suffix:
+        suffix = suffix.lstrip("\n")
+        return f"{THINK_START}{think_body}\n{THINK_END}\n\n{suffix}"
+    return f"{THINK_START}{think_body}\n{THINK_END}"
+
+
 def parquet_paths(path: Path) -> list[Path]:
     if path.is_file():
         return [path]
@@ -75,7 +98,8 @@ def preprocess_record(record: dict[str, Any], image_folder: Path) -> dict[str, A
     for sentence in conversations:
         if sentence.get("from") not in {"gpt", "assistant"}:
             continue
-        value, parsed_queries = replace_vgr_regions_with_fovea(sentence["value"])
+        value = normalize_assistant_think_text(str(sentence["value"]))
+        value, parsed_queries = replace_vgr_regions_with_fovea(value)
         sentence["value"] = value
         query_boxes.extend([list(query["box"]) for query in parsed_queries])
 

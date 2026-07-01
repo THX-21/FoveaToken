@@ -22,10 +22,10 @@ export WORLD_SIZE=$((NNODES * NUM_GPUS))
 export RANK=0
 
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
-RUN_NAME="${FT3_RUN_NAME:-fovea-vgr-qwen}"
+RUN_NAME="${FT3_RUN_NAME:-fovea-vgr-qwen-9b}"
 DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr/preprocessed}"
-IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/vgr/llava_next_raw_format}"
-CKPT_PATH="${FT3_CKPT_PATH:-checkpoints/fovea-4B}"
+IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/llava_next/llava_next_raw_format}"
+CKPT_PATH="${FT3_CKPT_PATH:-checkpoints/pretrain/fovea-vgr-qwen-9b/checkpoint-11250}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-50}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
@@ -34,6 +34,8 @@ MAX_IMG_TOKENS="${FT3_MAX_IMG_TOKENS:-2048}"
 CROP_MAX_IMG_TOKENS="${FT3_FOVEA_CROP_MAX_IMG_TOKENS:-1024}"
 REPORT_TO="${FT3_REPORT_TO:-tensorboard}"
 WORKERS="${FT3_DATALOADER_NUM_WORKERS:-8}"
+FREEZE_BASE_MODEL="${FT3_FREEZE_BASE_MODEL:-false}"
+TRAIN_MAIN_LM_HEAD_LOSS="${FT3_TRAIN_MAIN_LM_HEAD_LOSS:-true}"
 
 echo "[ft3] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
 echo "[ft3] RUN_NAME=${RUN_NAME}"
@@ -47,6 +49,8 @@ echo "[ft3] MAX_IMG_TOKENS=${MAX_IMG_TOKENS}"
 echo "[ft3] FOVEA_CROP_MAX_IMG_TOKENS=${CROP_MAX_IMG_TOKENS}"
 echo "[ft3] DATALOADER_NUM_WORKERS=${WORKERS}"
 echo "[ft3] REPORT_TO=${REPORT_TO}"
+echo "[ft3] FREEZE_BASE_MODEL=${FREEZE_BASE_MODEL}"
+echo "[ft3] TRAIN_MAIN_LM_HEAD_LOSS=${TRAIN_MAIN_LM_HEAD_LOSS}"
 
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
@@ -118,6 +122,8 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --model_max_length 8096 \
     --gradient_checkpointing true \
     --dataloader_num_workers "${WORKERS}" \
+    --freeze_base_model "${FREEZE_BASE_MODEL}" \
+    --train_main_lm_head_loss "${TRAIN_MAIN_LM_HEAD_LOSS}" \
     --report_to "${REPORT_TO}" \
     --remove_unused_columns false \
     --logging_nan_inf_filter false \

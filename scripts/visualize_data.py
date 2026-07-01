@@ -45,8 +45,8 @@ def wrap_text(text: str, width: int = 100) -> str:
 
 
 def highlight_fovea(text: str) -> str:
-    """Replace the built-in Fovea trigger with a visible marker."""
-    return text.replace("<|vision_start|>", " [FOVEA] ")
+    """Replace the current Fovea trigger with a visible marker."""
+    return text.replace("<fovea>", " [FOVEA] ")
 
 
 def render_sample(sample: dict, image_folder: Path, args) -> np.ndarray | None:
@@ -89,7 +89,7 @@ def render_sample(sample: dict, image_folder: Path, args) -> np.ndarray | None:
         elif role in ("gpt", "assistant"):
             answer = value
 
-    n_fovea = answer.count("<|vision_start|>")
+    n_fovea = answer.count("<fovea>")
     n_boxes = len(boxes)
 
     source = sample.get("_source", "?")

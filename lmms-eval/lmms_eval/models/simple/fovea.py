@@ -72,6 +72,7 @@ class Fovea(Qwen3_VL):
         max_image_tokens: int | None = 512,
         fovea_crop_max_image_tokens: int | None = 1024,
         disable_fovea_retrieval: Optional[bool] = False,
+        fovea_use_aux_head: Optional[bool] = False,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -102,9 +103,7 @@ class Fovea(Qwen3_VL):
         self._model = FoveaForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
         tokenizer_source = pretrained
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
-        if len(self._tokenizer) != self._model.get_input_embeddings().weight.shape[0]:
-            raise ValueError("Tokenizer/model vocab mismatch: Fovea must not add or resize token rows.")
-        sync_fovea_token_ids(self._model.config, self._tokenizer)
+        sync_fovea_token_ids(self._model.config, self._tokenizer, self._model)
         self._model.config.image_token_id = self._tokenizer.convert_tokens_to_ids("<|image_pad|>")
         self._model.config.video_token_id = self._tokenizer.convert_tokens_to_ids("<|video_pad|>")
         self._model.config.vision_start_token_id = self._tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -119,6 +118,7 @@ class Fovea(Qwen3_VL):
         )
         self.vision_packer = vision_packer
         self._model.config.fovea_crop_max_image_tokens = int(fovea_crop_max_image_tokens)
+        self._model.config.fovea_use_aux_head = bool(fovea_use_aux_head)
         self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
 
         self.enable_thinking = enable_thinking
