@@ -19,14 +19,12 @@ class FoveaConfig(_Qwen3_5Config):
         fovea_crop_threshold: float = 0.35,
         fovea_crop_margin: float = 1.0,
         fovea_crop_padding: float = 1.0,
-        fovea_trigger_ratio: float = 0.90,
         fovea_max_trigger_per_response: int = 4,
-        fovea_use_aux_head: bool = False,
-        fovea_train_main_lm_head: bool = False,
         fovea_token_id: int | None = None,
         **kwargs,
     ):
         kwargs.pop("model_type", None)
+        kwargs.pop("fovea_trigger_ratio", None)
         kwargs["tie_word_embeddings"] = False
         super().__init__(*args, **kwargs)
         self.fovea_num_tokens = int(fovea_num_tokens)
@@ -38,10 +36,7 @@ class FoveaConfig(_Qwen3_5Config):
         self.fovea_crop_threshold = float(fovea_crop_threshold)
         self.fovea_crop_margin = float(fovea_crop_margin)
         self.fovea_crop_padding = float(fovea_crop_padding)
-        self.fovea_trigger_ratio = float(fovea_trigger_ratio)
         self.fovea_max_trigger_per_response = int(fovea_max_trigger_per_response)
-        self.fovea_use_aux_head = bool(fovea_use_aux_head)
-        self.fovea_train_main_lm_head = bool(fovea_train_main_lm_head)
         self.fovea_token_id = fovea_token_id
 
 

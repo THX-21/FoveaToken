@@ -4,14 +4,14 @@ export NCCL_DEBUG=INFO
 # export DS_IGNORE_CUDA_DETECTION=1
 # export DS_SKIP_CUDA_CHECK=1
 
-export NCCL_P2P_DISABLE=1   # 分布式训练时禁用P2P通信，避免当前环境下的通信问题
-export NCCL_CUMEM_ENABLE=0
+# export NCCL_P2P_DISABLE=1   # 分布式训练时禁用P2P通信，避免当前环境下的通信问题
+# export NCCL_CUMEM_ENABLE=0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 export NNODES=1
-export NUM_GPUS="${FT3_NUM_GPUS:-1}"
+export NUM_GPUS="${FT3_NUM_GPUS:-4}"
 export MASTER_ADDR="127.0.0.1"
 if [[ -n "${FT3_MASTER_PORT:-}" ]]; then
     export MASTER_PORT="${FT3_MASTER_PORT}"
@@ -25,9 +25,9 @@ NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
 RUN_NAME="${FT3_RUN_NAME:-fovea-vgr-qwen-9b}"
 DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr/preprocessed}"
 IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/llava_next/llava_next_raw_format}"
-CKPT_PATH="${FT3_CKPT_PATH:-checkpoints/pretrain/fovea-vgr-qwen-9b/checkpoint-11250}"
+CKPT_PATH="${FT3_CKPT_PATH:-checkpoints/pretrain/fovea-vgr-qwen-9b}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
-SAVE_STEPS="${FT3_SAVE_STEPS:-50}"
+SAVE_STEPS="${FT3_SAVE_STEPS:-100}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
 ATTN_IMPLEMENTATION="${FT3_ATTN_IMPLEMENTATION:-sdpa}"
 MAX_IMG_TOKENS="${FT3_MAX_IMG_TOKENS:-2048}"
@@ -35,7 +35,10 @@ CROP_MAX_IMG_TOKENS="${FT3_FOVEA_CROP_MAX_IMG_TOKENS:-1024}"
 REPORT_TO="${FT3_REPORT_TO:-tensorboard}"
 WORKERS="${FT3_DATALOADER_NUM_WORKERS:-8}"
 FREEZE_BASE_MODEL="${FT3_FREEZE_BASE_MODEL:-false}"
-TRAIN_MAIN_LM_HEAD_LOSS="${FT3_TRAIN_MAIN_LM_HEAD_LOSS:-true}"
+USE_LORA="${FT3_USE_LORA:-true}"
+LORA_RANK="${FT3_LORA_RANK:-64}"
+LORA_ALPHA="${FT3_LORA_ALPHA:-128}"
+LORA_DROPOUT="${FT3_LORA_DROPOUT:-0.05}"
 
 echo "[ft3] NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}"
 echo "[ft3] RUN_NAME=${RUN_NAME}"
@@ -50,7 +53,13 @@ echo "[ft3] FOVEA_CROP_MAX_IMG_TOKENS=${CROP_MAX_IMG_TOKENS}"
 echo "[ft3] DATALOADER_NUM_WORKERS=${WORKERS}"
 echo "[ft3] REPORT_TO=${REPORT_TO}"
 echo "[ft3] FREEZE_BASE_MODEL=${FREEZE_BASE_MODEL}"
-echo "[ft3] TRAIN_MAIN_LM_HEAD_LOSS=${TRAIN_MAIN_LM_HEAD_LOSS}"
+echo "[ft3] USE_LORA=${USE_LORA}"
+echo "[ft3] LORA_RANK=${LORA_RANK}"
+echo "[ft3] LORA_ALPHA=${LORA_ALPHA}"
+echo "[ft3] LORA_DROPOUT=${LORA_DROPOUT}"
+if [[ "${FREEZE_BASE_MODEL}" == "true" && "${USE_LORA}" == "true" ]]; then
+    echo "[ft3] FREEZE_BASE_MODEL=true, so USE_LORA will be ignored."
+fi
 
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
@@ -112,7 +121,7 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --save_strategy steps \
     --save_steps "${SAVE_STEPS}" \
     --save_total_limit 2 \
-    --learning_rate 2e-5 \
+    --learning_rate 1e-5 \
     --max_grad_norm 1.0 \
     --weight_decay 0.0 \
     --warmup_ratio 0.03 \
@@ -123,7 +132,10 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --gradient_checkpointing true \
     --dataloader_num_workers "${WORKERS}" \
     --freeze_base_model "${FREEZE_BASE_MODEL}" \
-    --train_main_lm_head_loss "${TRAIN_MAIN_LM_HEAD_LOSS}" \
+    --use_lora "${USE_LORA}" \
+    --lora_rank "${LORA_RANK}" \
+    --lora_alpha "${LORA_ALPHA}" \
+    --lora_dropout "${LORA_DROPOUT}" \
     --report_to "${REPORT_TO}" \
     --remove_unused_columns false \
     --logging_nan_inf_filter false \

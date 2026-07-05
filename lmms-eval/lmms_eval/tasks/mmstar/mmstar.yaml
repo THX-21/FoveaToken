@@ -1,4 +1,7 @@
-dataset_path: Lin-Chen/MMStar
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    val: /data/workspace/FoveaToken/data/eval/mmstar/mmstar.parquet
 task: "mmstar"
 tag:
   - public_eval_qwen3_5_family

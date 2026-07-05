@@ -1,6 +1,4 @@
-dataset_path: initiacms/XLRS-Bench-lite
-dataset_kwargs:
-  cache_dir: /data108/user_thx/.cache/huggingface/datasets
+dataset_path: /data/workspace/FoveaToken/data/eval/xlrs-lite
 task: xlrs-lite
 process_docs: !function mcq_utils.xlrs_process_docs
 test_split: train

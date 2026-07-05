@@ -1,4 +1,7 @@
-dataset_path: lmms-lab/vstar-bench
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    test: /data/workspace/FoveaToken/data/eval/vstar-bench/data/test-*.parquet
 task: "vstar_bench"
 test_split: test
 output_type: generate_until

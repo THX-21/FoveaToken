@@ -5,21 +5,27 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 # export HF_HUB_OFFLINE=1
 
-FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr-qwen-9b/checkpoint-400}"
-TASKS="${EVAL_TASKS:-textvqa}"
+FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/pretrain/fovea-vgr-qwen-9b}"
+LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr-qwen-9b/checkpoint-1302}"
+TASKS="${EVAL_TASKS:-mmstar}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
+PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
+[[ -x "${PYTHON_BIN}" ]] || PYTHON_BIN="python"
 ATTN_IMPLEMENTATION="${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
-DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:4}"
+DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:0}"
 DEVICE="${EVAL_DEVICE:-${DEVICE_MAP}}"
 BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
+NUM_PROCESSES="${EVAL_NUM_PROCESSES:-2}"
+MAIN_PROCESS_PORT="${EVAL_MAIN_PROCESS_PORT:-12345}"
+BALANCED_LIMIT="${EVAL_BALANCED_LIMIT:-true}"
 MAX_IMG_TOKENS="${EVAL_MAX_IMG_TOKENS:-2048}"
 MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-10240}"
 DISABLE_FOVEA_RETRIEVAL="${EVAL_DISABLE_FOVEA_RETRIEVAL:-false}"
-FOVEA_USE_AUX_HEAD="${EVAL_FOVEA_USE_AUX_HEAD:-true}"
-TASK_BUDGET="${EVAL_TASK_BUDGET:-160}"
+TASK_BUDGET="${EVAL_TASK_BUDGET:-600}"
+EVAL_SUBSET_SEED="${EVAL_SUBSET_SEED:-42}"
 
-RESOLVED_CHECKPOINT="${FULL_CHECKPOINT}"
-MODEL_ARGS="pretrained=${FULL_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=True,disable_fovea_retrieval=${DISABLE_FOVEA_RETRIEVAL},fovea_use_aux_head=${FOVEA_USE_AUX_HEAD},max_image_tokens=${MAX_IMG_TOKENS}"
+RESOLVED_CHECKPOINT="${LORA_CHECKPOINT:-${FULL_CHECKPOINT}}"
+MODEL_ARGS="pretrained=${RESOLVED_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=True,disable_fovea_retrieval=${DISABLE_FOVEA_RETRIEVAL},max_image_tokens=${MAX_IMG_TOKENS}"
 LOG_SUFFIX_DEFAULT="$(basename "${RESOLVED_CHECKPOINT}")"
 LOG_SUFFIX="${EVAL_LOG_SUFFIX:-${LOG_SUFFIX_DEFAULT}}"
 ACCELERATE_BIN="$(command -v accelerate || true)"
@@ -28,20 +34,36 @@ ACCELERATE_BIN="${ACCELERATE_BIN:-${PROJECT_ROOT}/.venv/bin/accelerate}"
 
 echo "[eval] RESOLVED_CHECKPOINT=${RESOLVED_CHECKPOINT}"
 echo "[eval] FULL_CHECKPOINT=${FULL_CHECKPOINT}"
+echo "[eval] LORA_CHECKPOINT=${LORA_CHECKPOINT}"
 echo "[eval] TASKS=${TASKS}"
 echo "[eval] OUTPUT_PATH=${OUTPUT_PATH}"
 echo "[eval] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
 echo "[eval] DEVICE=${DEVICE}"
 echo "[eval] DEVICE_MAP=${DEVICE_MAP}"
 echo "[eval] BATCH_SIZE=${BATCH_SIZE}"
+echo "[eval] NUM_PROCESSES=${NUM_PROCESSES}"
+echo "[eval] MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT}"
+echo "[eval] BALANCED_LIMIT=${BALANCED_LIMIT}"
 echo "[eval] MAX_IMG_TOKENS=${MAX_IMG_TOKENS}"
 echo "[eval] MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
 echo "[eval] DISABLE_FOVEA_RETRIEVAL=${DISABLE_FOVEA_RETRIEVAL}"
-echo "[eval] FOVEA_USE_AUX_HEAD=${FOVEA_USE_AUX_HEAD}"
 echo "[eval] TASK_BUDGET=${TASK_BUDGET}"
+echo "[eval] EVAL_SUBSET_SEED=${EVAL_SUBSET_SEED}"
 echo "[eval] LOG_SUFFIX=${LOG_SUFFIX}"
 echo "[eval] ACCELERATE_BIN=${ACCELERATE_BIN}"
+echo "[eval] PYTHON_BIN=${PYTHON_BIN}"
 echo "[eval] MODEL_ARGS=${MODEL_ARGS}"
+
+case "${BALANCED_LIMIT}" in
+  true|TRUE|1|yes|YES)
+    export LMMS_EVAL_BALANCED_LIMIT=1
+    export LMMS_EVAL_BALANCED_SEED="${EVAL_SUBSET_SEED}"
+    ;;
+  *)
+    unset LMMS_EVAL_BALANCED_LIMIT
+    unset LMMS_EVAL_BALANCED_SEED
+    ;;
+esac
 
 IFS=',' read -r -a RAW_TASK_LIST <<< "${TASKS}"
 EXPANDED_TASKS=()
@@ -86,11 +108,11 @@ for idx in "${!EXPANDED_TASKS[@]}"; do
   echo "[eval] RUN_TASK=${CURRENT_TASK} LIMIT=${CURRENT_LIMIT} LOG_SUFFIX=${CURRENT_SUFFIX}"
 
   "${ACCELERATE_BIN}" launch \
-    --num_processes 1 \
+    --num_processes "${NUM_PROCESSES}" \
     --num_machines 1 \
     --mixed_precision bf16 \
     --dynamo_backend no \
-    --main_process_port 12345 \
+    --main_process_port "${MAIN_PROCESS_PORT}" \
     -m lmms_eval \
     --model fovea \
     --model_args "${MODEL_ARGS}" \

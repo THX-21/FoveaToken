@@ -4,6 +4,14 @@ from collections import defaultdict
 from loguru import logger as eval_logger
 
 
+def vstar_filter_direct_attributes(dataset):
+    return dataset.filter(lambda doc: doc.get("category") == "direct_attributes")
+
+
+def vstar_filter_relative_position(dataset):
+    return dataset.filter(lambda doc: doc.get("category") == "relative_position")
+
+
 def vstar_doc_to_visual(doc):
     """Convert document to visual input."""
     return [doc["image"].convert("RGB")]

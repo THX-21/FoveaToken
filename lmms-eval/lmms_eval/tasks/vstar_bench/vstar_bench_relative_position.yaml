@@ -1,7 +1,9 @@
 include: _default_template_yaml
 task: "vstar_bench_relative_position"
 dataset_kwargs:
-  category: "relative_position"
+  data_files:
+    test: /data/workspace/FoveaToken/data/eval/vstar-bench/data/test-*.parquet
+process_docs: !function utils.vstar_filter_relative_position
 metric_list:
   - metric: vstar_relative_position_acc
     aggregation: !function utils.vstar_aggregate_results

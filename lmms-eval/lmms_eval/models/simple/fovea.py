@@ -1,3 +1,4 @@
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,6 +19,7 @@ from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
 
 from fovea_token import FoveaForConditionalGeneration
 from fovea_token.train.data import VisionPacker
+from fovea_token.train.sft import FOVEA_EXTRA_WEIGHTS_NAME, load_fovea_extra
 from fovea_token.tokenizers.tokenization_fovea import sync_fovea_token_ids
 
 
@@ -54,8 +56,24 @@ class Fovea(Qwen3_VL):
         return any((candidate / filename).exists() for filename in MODEL_WEIGHT_FILENAMES)
 
     @classmethod
+    def _is_lora_checkpoint_dir(cls, path: Optional[str]) -> bool:
+        candidate = cls._as_local_path(path)
+        return bool(candidate and candidate.is_dir() and (candidate / "adapter_config.json").exists())
+
+    @classmethod
     def _checkpoint_mode(cls, pretrained: str) -> str:
+        if cls._is_lora_checkpoint_dir(pretrained):
+            return "lora"
         return "full" if cls._is_full_checkpoint_dir(pretrained) else "base"
+
+    @staticmethod
+    def _lora_base_model_name(adapter_path: str) -> str:
+        adapter_config = Path(adapter_path).expanduser() / "adapter_config.json"
+        data = json.loads(adapter_config.read_text())
+        base_model = data.get("base_model_name_or_path")
+        if not base_model:
+            raise ValueError(f"LoRA checkpoint {adapter_path} does not define base_model_name_or_path.")
+        return base_model
 
     def __init__(
         self,
@@ -72,7 +90,6 @@ class Fovea(Qwen3_VL):
         max_image_tokens: int | None = 512,
         fovea_crop_max_image_tokens: int | None = 1024,
         disable_fovea_retrieval: Optional[bool] = False,
-        fovea_use_aux_head: Optional[bool] = False,
         **kwargs,
     ) -> None:
         lmms.__init__(self)
@@ -93,32 +110,42 @@ class Fovea(Qwen3_VL):
             self._device = torch.device(resolved_device)
             self.device_map = device_map if device_map else resolved_device
 
-        eval_logger.info(f"Resolved Fovea checkpoint mode: {self._checkpoint_mode(pretrained)}")
+        checkpoint_mode = self._checkpoint_mode(pretrained)
+        eval_logger.info(f"Resolved Fovea checkpoint mode: {checkpoint_mode}")
         model_kwargs = {
             "torch_dtype": self._pick_torch_dtype(),
             "device_map": self.device_map,
         }
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
-        self._model = FoveaForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
         tokenizer_source = pretrained
+        if checkpoint_mode == "lora":
+            from peft import PeftModel
+
+            base_model_name = self._lora_base_model_name(pretrained)
+            self._model = FoveaForConditionalGeneration.from_pretrained(base_model_name, **model_kwargs)
+            if (Path(pretrained).expanduser() / FOVEA_EXTRA_WEIGHTS_NAME).exists():
+                load_fovea_extra(self._model, pretrained)
+            self._model = PeftModel.from_pretrained(self._model, pretrained)
+        else:
+            self._model = FoveaForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
-        sync_fovea_token_ids(self._model.config, self._tokenizer, self._model)
-        self._model.config.image_token_id = self._tokenizer.convert_tokens_to_ids("<|image_pad|>")
-        self._model.config.video_token_id = self._tokenizer.convert_tokens_to_ids("<|video_pad|>")
-        self._model.config.vision_start_token_id = self._tokenizer.convert_tokens_to_ids("<|vision_start|>")
-        self._model.config.vision_end_token_id = self._tokenizer.convert_tokens_to_ids("<|vision_end|>")
+        fovea_model = self._model.get_base_model() if checkpoint_mode == "lora" else self._model
+        sync_fovea_token_ids(fovea_model.config, self._tokenizer, fovea_model)
+        fovea_model.config.image_token_id = self._tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        fovea_model.config.video_token_id = self._tokenizer.convert_tokens_to_ids("<|video_pad|>")
+        fovea_model.config.vision_start_token_id = self._tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        fovea_model.config.vision_end_token_id = self._tokenizer.convert_tokens_to_ids("<|vision_end|>")
         self._model = self._model.eval()
         self.processor = AutoProcessor.from_pretrained(tokenizer_source)
         self.processor.tokenizer = self._tokenizer
         vision_packer = VisionPacker(
             processor=self.processor,
-            vision_config=self._model.config.vision_config,
+            vision_config=fovea_model.config.vision_config,
             max_image_tokens=max_image_tokens,
         )
         self.vision_packer = vision_packer
-        self._model.config.fovea_crop_max_image_tokens = int(fovea_crop_max_image_tokens)
-        self._model.config.fovea_use_aux_head = bool(fovea_use_aux_head)
+        fovea_model.config.fovea_crop_max_image_tokens = int(fovea_crop_max_image_tokens)
         self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
 
         self.enable_thinking = enable_thinking
@@ -129,7 +156,7 @@ class Fovea(Qwen3_VL):
 
         self.system_prompt = system_prompt
         self.interleave_visuals = interleave_visuals
-        self._config = self.model.config
+        self._config = fovea_model.config
         self._max_length = 2048
         self.batch_size_per_gpu = int(batch_size)
         self.use_cache = use_cache
@@ -253,7 +280,13 @@ class Fovea(Qwen3_VL):
             toks = self.tokenizer.encode(x[0])
             return -len(toks), x[0]
 
-        pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
+        pbar = tqdm(
+            total=len(requests),
+            disable=False,
+            desc=f"Rank {self.rank} Responding",
+            position=self.rank,
+            leave=True,
+        )
         re_ords = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
         chunks = list(re_ords.get_batched(n=1, batch_fn=None))
 

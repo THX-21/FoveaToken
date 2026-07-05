@@ -360,9 +360,8 @@ def mask_visual_placeholder_labels(
         while end < len(ids) and ids[end] == pad_id:
             end += 1
         if end < len(ids) and ids[end] == end_id:
-            # Keep <|vision_start|>: visual start marker for user-image or crop spans.
-            # Fovea retrieval triggers use the separate <fovea> token.
-            masked[idx + 1 : end + 1] = IGNORE_INDEX
+            # Mask the full visual placeholder span including <|vision_start|>.
+            masked[idx : end + 1] = IGNORE_INDEX
             idx = end + 1
             continue
         idx += 1

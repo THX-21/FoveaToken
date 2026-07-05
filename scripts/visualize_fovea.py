@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import textwrap
 from pathlib import Path
@@ -23,13 +24,13 @@ from fovea_token.fovea_crop import crop_attended_regions, normalize_patch_boxes
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize Fovea attention.")
     parser.add_argument("--task", default="chartqa", help="`train` or an lmms-eval task like `mmstar`.")
-    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-qwen-9b/checkpoint-200")
+    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-qwen-9b/checkpoint-1302")
     parser.add_argument("--index", type=int, nargs="+", default=[0,1,2,3,4,5,6,7,8,9,10])
     parser.add_argument("--output_dir", default="outputs/fovea_visualize")
     parser.add_argument("--alpha", type=float, default=0.45)
     parser.add_argument("--cmap", default="magma")
-    parser.add_argument("--device", default="cuda:4")
-    parser.add_argument("--device_map", default="cuda:4")
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--device_map", default="cuda:0")
     parser.add_argument("--attn_implementation", default="sdpa")
     parser.add_argument("--enable_thinking", type=lambda x: x.lower() == "true", default=True)
     parser.add_argument("--force_simple", action="store_true")
@@ -41,10 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_folder", default="data/vgr/llava_next_raw_format")
     parser.add_argument("--disable_fovea_retrieval", type=lambda x: x.lower() == "true", default=False,
                         help="Disable fovea retrieval pipeline.")
-    parser.add_argument("--fovea_use_aux_head", type=lambda x: x.lower() == "true", default=True,
-                        help="Use fovea_aux_lm_head instead of frozen lm_head for token generation.")
     parser.add_argument("--crop", default="true", help="Crop the most-attended regions and save them.")
-    parser.add_argument("--crop_threshold", type=float, default=0.35,
+    parser.add_argument("--crop_threshold", type=float, default=0.2,
                         help="Threshold for cropping: boxes with weight > threshold * max_weight are cropped.")
     parser.add_argument("--crop_margin", type=float, default=1.0,
                         help="Patch count tolerance for connectivity. 0 = strictly adjacent, 1 = one-patch gap allowed.")
@@ -170,7 +169,66 @@ def _run_simple_sample(model, task, doc_idx: int, context: str, gen_kwargs: dict
     return text, token_counts
 
 
+def _fovea_metrics_history_from_lmms(lmms_model) -> list:
+    model = getattr(lmms_model, "model", None)
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        model = get_base_model()
+    return getattr(model, "_fovea_metrics_history", None) or []
+
+
+def _fovea_metrics_history_from_model(model) -> list:
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        model = get_base_model()
+    return getattr(model, "_fovea_metrics_history", None) or []
+
+
 _TRAIN_STATE = None  # singleton: (model, tokenizer, processor, dataset, collator)
+
+MODEL_WEIGHT_FILENAMES = {
+    "pytorch_model.bin",
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+}
+
+
+def _as_local_path(path: str | None) -> Path | None:
+    if not path:
+        return None
+    candidate = Path(path).expanduser()
+    return candidate if candidate.exists() else None
+
+
+def _is_lora_checkpoint_dir(path: str | None) -> bool:
+    candidate = _as_local_path(path)
+    return bool(candidate and candidate.is_dir() and (candidate / "adapter_config.json").exists())
+
+
+def _is_full_checkpoint_dir(path: str | None) -> bool:
+    candidate = _as_local_path(path)
+    if not candidate or not candidate.is_dir() or not (candidate / "config.json").exists():
+        return False
+    return any((candidate / name).exists() for name in MODEL_WEIGHT_FILENAMES)
+
+
+def _lora_base_model_name(adapter_path: str) -> str:
+    adapter_config = Path(adapter_path).expanduser() / "adapter_config.json"
+    data = json.loads(adapter_config.read_text())
+    base_model = data.get("base_model_name_or_path")
+    if not base_model:
+        raise ValueError(f"LoRA checkpoint {adapter_path} does not define base_model_name_or_path.")
+    return base_model
+
+
+def _load_auto_resource(factory, preferred_source: str, fallback_source: str | None = None, **kwargs):
+    try:
+        return factory.from_pretrained(preferred_source, **kwargs)
+    except Exception:
+        if fallback_source is None or fallback_source == preferred_source:
+            raise
+        return factory.from_pretrained(fallback_source, **kwargs)
 
 
 def _init_train_state(args):
@@ -179,38 +237,52 @@ def _init_train_state(args):
         return _TRAIN_STATE
 
     from fovea_token import FoveaForConditionalGeneration
+    from fovea_token.train.sft import FOVEA_EXTRA_WEIGHTS_NAME, load_fovea_extra
     from fovea_token.tokenizers.tokenization_fovea import sync_fovea_token_ids
     from fovea_token.train.data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
     from transformers import AutoProcessor, AutoTokenizer
 
     print("Loading model (once)...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
-    processor = AutoProcessor.from_pretrained(args.model_name_or_path)
+    checkpoint = args.model_name_or_path
+    is_lora = _is_lora_checkpoint_dir(checkpoint)
+    model_source = _lora_base_model_name(checkpoint) if is_lora else checkpoint
+    tokenizer = _load_auto_resource(AutoTokenizer, checkpoint, model_source, use_fast=True)
+    processor = _load_auto_resource(AutoProcessor, checkpoint, model_source)
     processor.tokenizer = tokenizer
 
     model = FoveaForConditionalGeneration.from_pretrained(
-        args.model_name_or_path,
+        model_source,
         torch_dtype="auto",
         device_map=args.device_map,
     )
-    if len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
+    if is_lora:
+        from peft import PeftModel
+
+        if (Path(checkpoint).expanduser() / FOVEA_EXTRA_WEIGHTS_NAME).exists():
+            load_fovea_extra(model, checkpoint)
+        model = PeftModel.from_pretrained(model, checkpoint)
+        fovea_model = model.get_base_model()
+    else:
+        if _is_full_checkpoint_dir(checkpoint):
+            load_fovea_extra(model, checkpoint)
+        fovea_model = model
+    if len(tokenizer) != fovea_model.get_input_embeddings().weight.shape[0]:
         raise ValueError("Tokenizer/model vocab mismatch: Fovea must not add or resize token rows.")
-    sync_fovea_token_ids(model.config, tokenizer)
-    model.config.image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
-    model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
-    model.config.vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
-    model.config.vision_end_token_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
-    model.config.fovea_use_aux_head = args.fovea_use_aux_head
+    sync_fovea_token_ids(fovea_model.config, tokenizer, fovea_model)
+    fovea_model.config.image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    fovea_model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
+    fovea_model.config.vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    fovea_model.config.vision_end_token_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
     model.eval()
 
-    packer = VisionPacker(processor=processor, vision_config=model.config.vision_config)
+    packer = VisionPacker(processor=processor, vision_config=fovea_model.config.vision_config)
     dataset = LazySupervisedDataset(
         data_path=args.data_path,
         image_folder=args.image_folder,
         processor=processor,
         tokenizer=tokenizer,
         vision_packer=packer,
-        image_token_id=model.config.image_token_id,
+        image_token_id=fovea_model.config.image_token_id,
     )
     collator = DataCollatorForQwen3_5SFT(tokenizer=tokenizer, model_max_length=32768)
     _TRAIN_STATE = (model, tokenizer, processor, dataset, collator)
@@ -250,7 +322,7 @@ def load_train_sample(args, index: int):
             answer_tokens = tokenizer.encode(answer, add_special_tokens=False)
 
     history = []
-    for call_idx, entry in enumerate(model._fovea_aux_history):
+    for call_idx, entry in enumerate(_fovea_metrics_history_from_model(model)):
         attn_mean = entry["fovea_attn_mean"]
         if attn_mean.ndim == 2:
             attn_mean = attn_mean.unsqueeze(0)
@@ -285,7 +357,6 @@ def load_lmms_eval_sample(args, index: int):
             "attn_implementation": args.attn_implementation,
             "enable_thinking": args.enable_thinking,
             "disable_fovea_retrieval": args.disable_fovea_retrieval,
-            "fovea_use_aux_head": args.fovea_use_aux_head,
         },
     )
     task = _init_task(args.task, resolved_model.model_id, resolved_model.model_type)
@@ -317,9 +388,10 @@ def load_lmms_eval_sample(args, index: int):
     # Inject <fovea> markers into prediction text at trigger positions.
     tokenizer = lmms_model._tokenizer
     pred_token_ids = tokenizer.encode(prediction, add_special_tokens=False)
+    fovea_history = _fovea_metrics_history_from_lmms(lmms_model)
     trigger_offsets = sorted(
         [int(entry["trigger_offset"])
-         for entry in lmms_model.model._fovea_aux_history
+         for entry in fovea_history
          if entry.get("trigger_offset") is not None],
         reverse=True,  # process from end to keep earlier offsets valid
     )
@@ -331,7 +403,7 @@ def load_lmms_eval_sample(args, index: int):
         pred_token_ids = tokenizer.encode(prediction, add_special_tokens=False)
 
     history = []
-    for call_idx, entry in enumerate(lmms_model.model._fovea_aux_history):
+    for call_idx, entry in enumerate(fovea_history):
         attn_mean = entry["fovea_attn_mean"]
         if attn_mean.ndim == 2:
             attn_mean = attn_mean.unsqueeze(0)

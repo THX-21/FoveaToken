@@ -1,6 +1,7 @@
-dataset_path: lmms-lab/ChartQA
+dataset_path: parquet
 dataset_kwargs:
-  token: True
+  data_files:
+    test: /data/workspace/FoveaToken/data/eval/chartqa/data/test-*.parquet
 task: "chartqa"
 test_split: test
 output_type: generate_until

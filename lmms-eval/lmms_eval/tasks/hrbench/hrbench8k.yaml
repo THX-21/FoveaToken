@@ -1,4 +1,4 @@
-dataset_path: DreamMr/HR-Bench
+dataset_path: /data/workspace/FoveaToken/data/eval/hrbench
 dataset_name: hrbench_version_split
 dataset_kwargs:
   token: True

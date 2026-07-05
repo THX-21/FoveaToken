@@ -418,6 +418,104 @@ class Task(abc.ABC):
     def doc_to_target(self, doc):
         pass
 
+    @staticmethod
+    def _allocate_capped(counts: dict[Any, int], total: int) -> dict[Any, int]:
+        total = min(int(total), sum(int(v) for v in counts.values()))
+        alloc = {key: 0 for key in counts}
+        active = [key for key, value in counts.items() if int(value) > 0]
+        remaining = total
+        while active and remaining > 0:
+            share, extra = divmod(remaining, len(active))
+            if share == 0:
+                for key in active[:extra]:
+                    alloc[key] += 1
+                break
+            next_active = []
+            used = 0
+            for idx, key in enumerate(active):
+                want = share + (1 if idx < extra else 0)
+                room = int(counts[key]) - alloc[key]
+                take = min(room, want)
+                alloc[key] += take
+                used += take
+                if alloc[key] < int(counts[key]):
+                    next_active.append(key)
+            if used == 0:
+                break
+            remaining -= used
+            active = next_active
+        return alloc
+
+    def _balanced_limited_doc_ids(self, limit: int, offset: int = 0):
+        if os.getenv("LMMS_EVAL_BALANCED_LIMIT", "").lower() not in {"1", "true", "yes"}:
+            return None
+        docs = self.eval_docs_no_media
+        total_docs = len(docs)
+        limit = min(int(limit), total_docs)
+        if limit <= 0 or limit >= total_docs:
+            return None
+
+        column_names = set(getattr(docs, "column_names", []) or [])
+        if not column_names and total_docs > 0 and isinstance(docs[0], dict):
+            column_names = set(docs[0].keys())
+        primary_key = next(
+            (key for key in ("category", "type", "question_type", "task", "set_name") if key in column_names),
+            None,
+        )
+        secondary_key = "l2_category" if "l2_category" in column_names else None
+        if secondary_key == primary_key:
+            secondary_key = None
+        if primary_key is None and secondary_key is None:
+            return None
+
+        seed = int(os.getenv("LMMS_EVAL_BALANCED_SEED", "42"))
+        rng = random.Random(seed)
+        start = max(int(offset), 0)
+        doc_ids = list(range(start, total_docs))
+        groups: dict[Any, dict[Any, list[int]]] = {}
+        for doc_id in doc_ids:
+            doc = docs[doc_id]
+            primary = doc.get(primary_key, "default") if primary_key is not None else doc.get(secondary_key, "default")
+            secondary = doc.get(secondary_key, "default") if secondary_key is not None else "default"
+            groups.setdefault(primary, {}).setdefault(secondary, []).append(doc_id)
+
+        primary_counts = {key: sum(len(ids) for ids in secondary.values()) for key, secondary in groups.items()}
+        primary_alloc = self._allocate_capped(primary_counts, limit)
+        selected: list[int] = []
+        for primary, primary_budget in primary_alloc.items():
+            if primary_budget <= 0:
+                continue
+            secondary_groups = groups[primary]
+            secondary_counts = {key: len(ids) for key, ids in secondary_groups.items()}
+            secondary_alloc = self._allocate_capped(secondary_counts, primary_budget)
+            for secondary, secondary_budget in secondary_alloc.items():
+                if secondary_budget <= 0:
+                    continue
+                candidates = list(secondary_groups[secondary])
+                rng.shuffle(candidates)
+                selected.extend(candidates[:secondary_budget])
+
+        selected = sorted(selected)
+        if len(selected) != limit:
+            eval_logger.warning(
+                f"Balanced limit for {self.config.task} selected {len(selected)} docs, expected {limit}; "
+                "falling back to regular limiting."
+            )
+            return None
+        eval_logger.info(
+            f"Using balanced limit for {self.config.task}: {limit} docs "
+            f"grouped by {primary_key or secondary_key}"
+            f"{('/' + secondary_key) if secondary_key and primary_key else ''}."
+        )
+        return selected
+
+    def _balanced_limited_doc_id_docs(self, limit: int, offset: int = 0, *, with_media: bool = False):
+        selected = self._balanced_limited_doc_ids(limit, offset)
+        if selected is None:
+            return None
+        docs = self.eval_docs if with_media else self.eval_docs_no_media
+        return [(doc_id, docs[doc_id]) for doc_id in selected]
+
     # @profile
     def build_all_requests(
         self,
@@ -473,30 +571,55 @@ class Task(abc.ABC):
         if cache_requests and (not cached_instances or rewrite_requests_cache) and limit is not None:
             limit = None
 
-        doc_id_docs = utils.create_iterator(
-            enumerate(self.eval_docs_no_media),
-            rank=rank,
-            limit=int(limit) if limit else None,
-            world_size=world_size,
-            offset=offset,
+        self._balanced_limited_doc_ids_cache = None
+        balanced_doc_ids = self._balanced_limited_doc_ids(limit, offset) if limit else None
+        if balanced_doc_ids is not None:
+            self._balanced_limited_doc_ids_cache = balanced_doc_ids
+        balanced_doc_id_docs = (
+            [(doc_id, self.eval_docs_no_media[doc_id]) for doc_id in balanced_doc_ids]
+            if balanced_doc_ids is not None
+            else None
         )
-        doc_iterator_for_counting = (
-            utils.create_iterator(
-                range(len(self.test_docs())),
+        if balanced_doc_id_docs is not None:
+            doc_id_docs = utils.create_iterator(
+                balanced_doc_id_docs,
                 rank=rank,
-                limit=limit,
+                limit=None,
+                world_size=world_size,
+                offset=0,
+            )
+            doc_iterator_for_counting = utils.create_iterator(
+                range(len(balanced_doc_id_docs)),
+                rank=rank,
+                limit=None,
+                world_size=world_size,
+                offset=0,
+            )
+        else:
+            doc_id_docs = utils.create_iterator(
+                enumerate(self.eval_docs_no_media),
+                rank=rank,
+                limit=int(limit) if limit else None,
                 world_size=world_size,
                 offset=offset,
             )
-            if self.has_test_docs()
-            else utils.create_iterator(
-                range(len(self.validation_docs())),
-                rank=rank,
-                limit=limit,
-                world_size=world_size,
-                offset=offset,
+            doc_iterator_for_counting = (
+                utils.create_iterator(
+                    range(len(self.test_docs())),
+                    rank=rank,
+                    limit=limit,
+                    world_size=world_size,
+                    offset=offset,
+                )
+                if self.has_test_docs()
+                else utils.create_iterator(
+                    range(len(self.validation_docs())),
+                    rank=rank,
+                    limit=limit,
+                    world_size=world_size,
+                    offset=offset,
+                )
             )
-        )
 
         num_docs = sum(1 for _ in doc_iterator_for_counting)
 
@@ -750,6 +873,17 @@ class Task(abc.ABC):
 
     def doc_iterator(self, *, rank: int = 0, limit: Union[int, None] = None, world_size: int = 1, offset: int = 0) -> Iterator[Tuple[int, Any]]:
         limit = int(limit) if limit else None
+        balanced_doc_ids = getattr(self, "_balanced_limited_doc_ids_cache", None)
+        if balanced_doc_ids is None and limit:
+            balanced_doc_ids = self._balanced_limited_doc_ids(limit, offset)
+        if balanced_doc_ids is not None:
+            return utils.create_iterator(
+                [(doc_id, self.eval_docs[doc_id]) for doc_id in balanced_doc_ids],
+                rank=int(rank),
+                limit=None,
+                world_size=int(world_size),
+                offset=0,
+            )
         doc_iterator = utils.create_iterator(
             enumerate(self.eval_docs),
             rank=int(rank),

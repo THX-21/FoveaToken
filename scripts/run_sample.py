@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="fovea", help="lmms-eval model name")
     parser.add_argument(
         "--model_args",
-        default="pretrained=checkpoints/fovea-vgr-qwen-9b/checkpoint-250,device=cuda:4,device_map=cuda:4,attn_implementation=sdpa,enable_thinking=True,max_image_tokens=2048,disable_fovea_retrieval=False,fovea_use_aux_head=True",
+        default="pretrained=checkpoints/fovea-vgr-qwen-9b/checkpoint-1302,device=cuda:0,device_map=cuda:0,attn_implementation=sdpa,enable_thinking=True,max_image_tokens=2048,disable_fovea_retrieval=False",
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")
@@ -137,6 +137,14 @@ def _restore_logged_output(model, text: str) -> str:
     )
 
 
+def _fovea_metrics_history(model) -> list:
+    inner = getattr(model, "model", None)
+    get_base_model = getattr(inner, "get_base_model", None)
+    if callable(get_base_model):
+        inner = get_base_model()
+    return getattr(inner, "_fovea_metrics_history", None) or []
+
+
 def _compact_text(text: str, limit: int) -> str:
     text = re.sub(r"(?:<image>){4,}", lambda m: f"<image>x{len(m.group(0)) // 7}", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -226,7 +234,7 @@ def main() -> None:
             max_new_tokens = sample_gen_kwargs.get("max_new_tokens")
             hit_limit = n_tok != "n/a" and max_new_tokens is not None and int(n_tok) >= int(max_new_tokens)
             has_think_end = "</think>" in display_raw
-            fovea_hist = getattr(getattr(model, "model", None), "_fovea_aux_history", None) or []
+            fovea_hist = _fovea_metrics_history(model)
             fovea_count = len(fovea_hist)
         else:
             t0 = time.time()
@@ -239,7 +247,7 @@ def main() -> None:
             max_new_tokens = sample_gen_kwargs.get("max_new_tokens")
             hit_limit = n_tok != "n/a" and max_new_tokens is not None and int(n_tok) >= int(max_new_tokens)
             has_think_end = "</think>" in display_raw
-            fovea_hist = getattr(getattr(model, "model", None), "_fovea_aux_history", None) or []
+            fovea_hist = _fovea_metrics_history(model)
             fovea_count = len(fovea_hist)
 
         fovea_offsets = [e["trigger_offset"] for e in fovea_hist if "trigger_offset" in e]

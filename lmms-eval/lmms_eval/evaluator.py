@@ -1094,13 +1094,25 @@ def evaluate(
             reasoning_tags = parse_reasoning_tags_config(cli_value=cli_reasoning_tags, task_value=task_reasoning_tags)
 
             if cli_args is not None and not cli_args.process_with_media:
-                doc_iterator = create_iterator(
-                    enumerate(task.eval_docs_no_media),
-                    rank=RANK,
-                    limit=int(limit) if limit else None,
-                    world_size=WORLD_SIZE,
-                    offset=offset,
-                )
+                balanced_doc_ids = getattr(task, "_balanced_limited_doc_ids_cache", None)
+                if balanced_doc_ids is None and limit:
+                    balanced_doc_ids = task._balanced_limited_doc_ids(limit, offset)
+                if balanced_doc_ids is not None:
+                    doc_iterator = create_iterator(
+                        [(doc_id, task.eval_docs_no_media[doc_id]) for doc_id in balanced_doc_ids],
+                        rank=RANK,
+                        limit=None,
+                        world_size=WORLD_SIZE,
+                        offset=0,
+                    )
+                else:
+                    doc_iterator = create_iterator(
+                        enumerate(task.eval_docs_no_media),
+                        rank=RANK,
+                        limit=int(limit) if limit else None,
+                        world_size=WORLD_SIZE,
+                        offset=offset,
+                    )
             else:
                 doc_iterator = task.doc_iterator(rank=RANK, limit=limit, world_size=WORLD_SIZE, offset=offset)
             doc_iterator_for_counting = (

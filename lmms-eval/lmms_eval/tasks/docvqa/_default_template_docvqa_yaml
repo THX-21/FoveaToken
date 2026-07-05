@@ -1,7 +1,9 @@
-dataset_path: lmms-lab/DocVQA
-dataset_name: DocVQA
+dataset_path: parquet
 dataset_kwargs:
-  token: True
+  data_files:
+    train: /data/workspace/FoveaToken/data/eval/docvqa/DocVQA/train-*.parquet
+    validation: /data/workspace/FoveaToken/data/eval/docvqa/DocVQA/validation-*.parquet
+    test: /data/workspace/FoveaToken/data/eval/docvqa/DocVQA/test-*.parquet
 output_type: generate_until
 doc_to_visual: !function utils.docvqa_doc_to_visual
 doc_to_text: !function utils.docvqa_doc_to_text
