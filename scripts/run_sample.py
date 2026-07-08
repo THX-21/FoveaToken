@@ -20,10 +20,10 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")
-    parser.add_argument("--task", default="mmstar", help="lmms-eval task name")
+    parser.add_argument("--task", default="docvqa_val", help="lmms-eval task name")
     parser.add_argument("--index", type=int, default=0, help="Start index in the task docs")
     parser.add_argument("--num_samples", type=int, default=10, help="Number of consecutive samples to run")
-    parser.add_argument("--max_new_tokens", type=int, default=None)
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
@@ -228,7 +228,7 @@ def main() -> None:
             raw, token_counts = _run_chat_sample(model, task, doc_idx, question, sample_gen_kwargs)
             elapsed = time.time() - t0
             total_time += elapsed
-            display_raw = _restore_logged_output(model, raw)
+            display_raw = raw
 
             n_tok = token_counts.output_tokens if token_counts is not None else "n/a"
             max_new_tokens = sample_gen_kwargs.get("max_new_tokens")
@@ -241,7 +241,7 @@ def main() -> None:
             raw, token_counts = _run_simple_sample(model, task, doc_idx, question, sample_gen_kwargs)
             elapsed = time.time() - t0
             total_time += elapsed
-            display_raw = _restore_logged_output(model, raw)
+            display_raw = raw
 
             n_tok = token_counts.output_tokens if token_counts is not None else "n/a"
             max_new_tokens = sample_gen_kwargs.get("max_new_tokens")
@@ -255,7 +255,10 @@ def main() -> None:
 
         print(f"\n{'=' * 80}")
         print(f"Sample {doc_idx}")
-        print(f"Time: {elapsed:.1f}s | Tokens: {n_tok} | </think>: {has_think_end} | Fovea: {fovea_count} | Limit: {hit_limit}")
+        print(
+            f"Time: {elapsed:.1f}s | Tokens: {n_tok} | MaxNew: {sample_gen_kwargs.get('max_new_tokens')} "
+            f"| </think>: {has_think_end} | Fovea: {fovea_count} | Limit: {hit_limit}"
+        )
         print(f"GT: {answer}")
         print(f"Q: {question or context}")
         print(f"{'─' * 80}")

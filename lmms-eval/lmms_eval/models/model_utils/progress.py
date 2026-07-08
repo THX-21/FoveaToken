@@ -14,6 +14,7 @@ Usage (drop-in tqdm replacement):
 """
 
 import os
+import shutil
 import sys
 import time
 
@@ -42,6 +43,19 @@ def _format_time(seconds: float) -> str:
     h, remainder = divmod(int(seconds), 3600)
     m, s = divmod(remainder, 60)
     return f"{h}h{m:02d}m"
+
+
+def _interactive_ncols() -> int:
+    """Choose a conservative tqdm width to avoid terminal wrapping."""
+    env_ncols = os.environ.get("LMMS_EVAL_PROGRESS_NCOLS")
+    if env_ncols:
+        try:
+            return max(40, int(env_ncols))
+        except ValueError:
+            pass
+
+    terminal_width = shutil.get_terminal_size(fallback=(100, 20)).columns
+    return max(40, min(terminal_width - 4, 100))
 
 
 class SlurmProgress:
@@ -112,4 +126,11 @@ def make_progress(
     """
     if _is_batch_mode():
         return SlurmProgress(total=total, desc=desc, disable=disable, log_interval=log_interval)
-    return tqdm(total=total, desc=desc, disable=disable)
+    return tqdm(
+        total=total,
+        desc=desc,
+        disable=disable,
+        dynamic_ncols=False,
+        ncols=_interactive_ncols(),
+        bar_format="{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    )

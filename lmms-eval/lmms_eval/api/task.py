@@ -446,6 +446,46 @@ class Task(abc.ABC):
             active = next_active
         return alloc
 
+    @staticmethod
+    def _should_log_balanced_limit_details() -> bool:
+        verbose = os.getenv("LMMS_EVAL_BALANCED_LIMIT_VERBOSE", "1").lower()
+        if verbose in {"0", "false", "no"}:
+            return False
+        for rank_key in ("RANK", "LOCAL_RANK", "PROCESS_RANK"):
+            rank_value = os.getenv(rank_key)
+            if rank_value not in (None, "", "0"):
+                return False
+        return True
+
+    def _log_balanced_limit_details(self, primary_key, secondary_key, groups, primary_alloc, secondary_allocs) -> None:
+        if not self._should_log_balanced_limit_details():
+            return
+
+        primary_label = primary_key or secondary_key or "default"
+        secondary_label = secondary_key if secondary_key and secondary_key != primary_key else None
+        eval_logger.info(
+            f"Balanced categories for {self.config.task}: primary={primary_label}"
+            f"{f', secondary={secondary_label}' if secondary_label else ''}, "
+            f"primary_groups={len(groups)}"
+        )
+
+        for primary in sorted(groups, key=lambda value: str(value)):
+            secondary_groups = groups[primary]
+            primary_total = sum(len(doc_ids) for doc_ids in secondary_groups.values())
+            primary_selected = primary_alloc.get(primary, 0)
+            eval_logger.info(
+                f"  [{primary_label}] {primary}: total={primary_total}, "
+                f"selected={primary_selected}, subgroups={len(secondary_groups)}"
+            )
+            if not secondary_label:
+                continue
+            for secondary in sorted(secondary_groups, key=lambda value: str(value)):
+                secondary_total = len(secondary_groups[secondary])
+                secondary_selected = secondary_allocs.get(primary, {}).get(secondary, 0)
+                eval_logger.info(
+                    f"    [{secondary_label}] {secondary}: total={secondary_total}, selected={secondary_selected}"
+                )
+
     def _balanced_limited_doc_ids(self, limit: int, offset: int = 0):
         if os.getenv("LMMS_EVAL_BALANCED_LIMIT", "").lower() not in {"1", "true", "yes"}:
             return None
@@ -462,7 +502,10 @@ class Task(abc.ABC):
             (key for key in ("category", "type", "question_type", "task", "set_name") if key in column_names),
             None,
         )
-        secondary_key = "l2_category" if "l2_category" in column_names else None
+        secondary_key = next(
+            (key for key in ("l2_category", "l2-category", "sub_category", "subcategory") if key in column_names),
+            None,
+        )
         if secondary_key == primary_key:
             secondary_key = None
         if primary_key is None and secondary_key is None:
@@ -481,6 +524,7 @@ class Task(abc.ABC):
 
         primary_counts = {key: sum(len(ids) for ids in secondary.values()) for key, secondary in groups.items()}
         primary_alloc = self._allocate_capped(primary_counts, limit)
+        secondary_allocs = {}
         selected: list[int] = []
         for primary, primary_budget in primary_alloc.items():
             if primary_budget <= 0:
@@ -488,12 +532,15 @@ class Task(abc.ABC):
             secondary_groups = groups[primary]
             secondary_counts = {key: len(ids) for key, ids in secondary_groups.items()}
             secondary_alloc = self._allocate_capped(secondary_counts, primary_budget)
+            secondary_allocs[primary] = secondary_alloc
             for secondary, secondary_budget in secondary_alloc.items():
                 if secondary_budget <= 0:
                     continue
                 candidates = list(secondary_groups[secondary])
                 rng.shuffle(candidates)
                 selected.extend(candidates[:secondary_budget])
+
+        self._log_balanced_limit_details(primary_key, secondary_key, groups, primary_alloc, secondary_allocs)
 
         selected = sorted(selected)
         if len(selected) != limit:

@@ -1,5 +1,7 @@
 import json
+import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional, Union
@@ -8,13 +10,13 @@ import torch
 from accelerate import Accelerator, DistributedType
 from loguru import logger as eval_logger
 from PIL import Image
-from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 
 from lmms_eval import utils
-from lmms_eval.api.instance import Instance
+from lmms_eval.api.instance import GenerationResult, Instance, TokenCounts
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
+from lmms_eval.models.model_utils.progress import make_progress
 from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
 
 from fovea_token import FoveaForConditionalGeneration
@@ -160,6 +162,8 @@ class Fovea(Qwen3_VL):
         self._max_length = 2048
         self.batch_size_per_gpu = int(batch_size)
         self.use_cache = use_cache
+        self.log_responses = os.environ.get("LMMS_EVAL_FOVEA_LOG_RESPONSES", "").lower() in {"1", "true", "yes"}
+        self.log_response_chars = int(os.environ.get("LMMS_EVAL_FOVEA_LOG_RESPONSE_CHARS", "500"))
 
         if accelerator.num_processes > 1:
             assert accelerator.distributed_type in [
@@ -184,6 +188,28 @@ class Fovea(Qwen3_VL):
         if self.disable_fovea_retrieval:
             generate_kwargs["disable_fovea_retrieval"] = True
         return generate_kwargs
+
+    def _build_processor_image_kwargs(self):
+        max_image_tokens = getattr(self.vision_packer, "max_image_tokens", None)
+        if max_image_tokens is None:
+            return {}
+
+        image_processor = self.processor.image_processor
+        processor_kwargs = {
+            "max_pixels": (
+                int(max_image_tokens)
+                * int(self.vision_packer.spatial_merge_size) ** 2
+                * int(self.vision_packer.patch_size) ** 2
+            )
+        }
+        min_pixels = getattr(image_processor, "min_pixels", None)
+        if min_pixels is None:
+            size = getattr(image_processor, "size", None)
+            if size is not None:
+                min_pixels = size.get("shortest_edge")
+        if min_pixels is not None:
+            processor_kwargs["min_pixels"] = int(min_pixels)
+        return processor_kwargs
 
     def _preprocess_chunk(self, chunk):
         """Build prompts and local processor inputs without HF image processing."""
@@ -268,10 +294,11 @@ class Fovea(Qwen3_VL):
             "return_mm_token_type_ids": True,
             "return_tensors": "pt",
         }
+        processor_kwargs.update(self._build_processor_image_kwargs())
         if self.batch_size > 1:
             processor_kwargs.update({"padding": True, "padding_side": "left"})
         inputs = self.processor(**processor_kwargs)
-        return inputs, contexts, gen_kwargs, until, image_inputs
+        return inputs, contexts, gen_kwargs, until, image_inputs, doc_id, task, split
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
@@ -280,12 +307,10 @@ class Fovea(Qwen3_VL):
             toks = self.tokenizer.encode(x[0])
             return -len(toks), x[0]
 
-        pbar = tqdm(
+        pbar = make_progress(
             total=len(requests),
-            disable=False,
+            disable=(self.rank != 0),
             desc=f"Rank {self.rank} Responding",
-            position=self.rank,
-            leave=True,
         )
         re_ords = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
         chunks = list(re_ords.get_batched(n=1, batch_fn=None))
@@ -294,7 +319,7 @@ class Fovea(Qwen3_VL):
             future = executor.submit(self._preprocess_chunk, chunks[0]) if chunks else None
 
             for idx in range(len(chunks)):
-                inputs, contexts, gen_kwargs, until, image_inputs = future.result()
+                inputs, contexts, gen_kwargs, until, image_inputs, doc_ids, tasks, splits = future.result()
                 if idx + 1 < len(chunks):
                     future = executor.submit(self._preprocess_chunk, chunks[idx + 1])
 
@@ -304,12 +329,14 @@ class Fovea(Qwen3_VL):
                     inputs = inputs.to(self.device)
 
                 generate_kwargs = self._build_generate_kwargs(gen_kwargs)
+                started_at = time.perf_counter()
                 cont = self.model.generate(
                     **inputs,
                     **generate_kwargs,
                     source_images=image_inputs,
                     image_processor=self.processor.image_processor,
                 )
+                elapsed = time.perf_counter() - started_at
                 generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
                 answers = self.processor.batch_decode(
                     generated_ids_trimmed,
@@ -322,8 +349,27 @@ class Fovea(Qwen3_VL):
                             ans = ans.split(term)[0]
                     answers[i] = ans
 
-                for ans, context in zip(answers, contexts):
-                    res.append(ans)
+                for ans, context, generated_ids, doc_id, task, split in zip(answers, contexts, generated_ids_trimmed, doc_ids, tasks, splits):
+                    if self.log_responses:
+                        snippet = ans.replace("\n", "\\n")[: self.log_response_chars]
+                        eval_logger.info(
+                            "Rank {} doc={} task={} split={} response_tokens={} chars={} fovea_count={} elapsed={:.2f}s text={}",
+                            self.rank,
+                            doc_id,
+                            task,
+                            split,
+                            int(generated_ids.numel()),
+                            len(ans),
+                            ans.count("<fovea>"),
+                            elapsed,
+                            snippet,
+                        )
+                    res.append(
+                        GenerationResult(
+                            text=ans,
+                            token_counts=TokenCounts(output_tokens=len(generated_ids)),
+                        )
+                    )
                     self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
                     pbar.update(1)
 

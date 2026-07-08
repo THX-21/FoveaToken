@@ -440,23 +440,27 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if image_hidden_states is None or image_grid_thw is None:
             raise ValueError("Fovea retrieval requires image_hidden_states and image_grid_thw.")
         memories = [hidden.to(device=device, dtype=dtype) for hidden in image_hidden_states]
-        max_len = max(max(1, mem.shape[0]) for mem in memories)
+        max_len = sum(max(1, int(mem.shape[0])) for mem in memories)
         hidden = int(self.config.text_config.hidden_size)
         memory = torch.zeros((batch_size, max_len, hidden), device=device, dtype=dtype)
         mask = torch.zeros((batch_size, max_len), device=device, dtype=torch.bool)
         boxes = torch.zeros((batch_size, max_len, 4), device=device, dtype=torch.float32)
-        for batch_idx, mem in enumerate(memories):
+        image_indices = torch.full((batch_size, max_len), -1, device=device, dtype=torch.long)
+        cursor = 0
+        for image_idx, mem in enumerate(memories):
             count = int(mem.shape[0])
             if count > 0:
-                memory[batch_idx, :count] = mem
-                mask[batch_idx, :count] = True
-                sample_boxes = self._grid_boxes(image_grid_thw[batch_idx], device=device)
+                memory[0, cursor : cursor + count] = mem
+                mask[0, cursor : cursor + count] = True
+                sample_boxes = self._grid_boxes(image_grid_thw[image_idx], device=device)
                 if sample_boxes.shape[0] != count:
                     raise ValueError(f"Patch box count {sample_boxes.shape[0]} does not match image memory length {count}.")
-                boxes[batch_idx, :count] = sample_boxes
-        return memory, mask, boxes
+                boxes[0, cursor : cursor + count] = sample_boxes
+                image_indices[0, cursor : cursor + count] = image_idx
+                cursor += count
+        return memory, mask, boxes, image_indices
 
-    def _retrieve_fovea_from_memory(self, fovea_queries, trigger_batch, memory, memory_mask, patch_boxes, fovea_box_indices=None, fovea_boxes=None):
+    def _retrieve_fovea_from_memory(self, fovea_queries, trigger_batch, memory, memory_mask, patch_boxes, patch_image_indices=None, fovea_box_indices=None, fovea_boxes=None):
         device = fovea_queries.device
         dtype = fovea_queries.dtype
         num_triggers = int(fovea_queries.shape[0])
@@ -540,6 +544,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             "trigger_batch": trigger_batch.detach(),
             "retrieve_patch_boxes": patch_boxes.detach(),
         }
+        if patch_image_indices is not None:
+            entry["retrieve_patch_image_indices"] = patch_image_indices.detach()
         self._fovea_metrics = entry
         self._fovea_metrics_history.append(entry)
         return align_loss
@@ -618,11 +624,46 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             padding=float(self.config.fovea_crop_padding),
         )
 
+    def _select_source_image_for_crop(
+        self,
+        source_images: list[Image.Image],
+        patch_boxes: torch.Tensor,
+        patch_image_indices: torch.Tensor | None,
+        attn_mean: torch.Tensor,
+    ):
+        if not source_images:
+            return None, None, None
+        if len(source_images) == 1 or patch_image_indices is None:
+            return 0, patch_boxes, attn_mean
+
+        patch_image_indices = patch_image_indices.to(device=attn_mean.device, dtype=torch.long)
+        valid = patch_image_indices.ge(0)
+        if not valid.any():
+            return 0, patch_boxes, attn_mean
+
+        summary = attn_mean.mean(dim=0)
+        best_image_idx = 0
+        best_score = None
+        for image_idx in range(len(source_images)):
+            image_mask = valid & patch_image_indices.eq(image_idx)
+            if not image_mask.any():
+                continue
+            score = summary[image_mask].sum()
+            if best_score is None or score > best_score:
+                best_score = score
+                best_image_idx = image_idx
+
+        selected_mask = valid & patch_image_indices.eq(best_image_idx)
+        if not selected_mask.any():
+            return best_image_idx, patch_boxes, attn_mean
+        return best_image_idx, patch_boxes[selected_mask], attn_mean[:, selected_mask]
+
     def _run_crop_injection(
         self,
-        source_image: Image.Image,
+        source_images: list[Image.Image],
         image_processor,
         patch_boxes: torch.Tensor,
+        patch_image_indices: torch.Tensor | None,
         attn_mean: torch.Tensor,
         attention_mask: torch.Tensor,
         past_key_values,
@@ -632,7 +673,20 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         text_input_id_history: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
     ):
-        regions = self._select_crop_regions(source_image, patch_boxes, attn_mean)
+        selected_image_idx, selected_patch_boxes, selected_attn_mean = self._select_source_image_for_crop(
+            source_images,
+            patch_boxes,
+            patch_image_indices,
+            attn_mean,
+        )
+        if selected_image_idx is None:
+            return attention_mask, past_key_values, None, None, None
+        source_image = source_images[selected_image_idx]
+        entry = self._fovea_metrics_history[-1] if self._fovea_metrics_history else None
+        if entry is not None:
+            entry["selected_source_image_index"] = int(selected_image_idx)
+
+        regions = self._select_crop_regions(source_image, selected_patch_boxes, selected_attn_mean)
         if not regions:
             return attention_mask, past_key_values, None, None, None
         regions = regions[:1]
@@ -731,8 +785,8 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             raise ValueError("Fovea generation currently expects batch_size=1.")
         if int(num_beams) != 1:
             raise ValueError("Fovea generation currently supports num_beams=1 only.")
-        if not source_images or len(source_images) != 1:
-            raise ValueError("Fovea generation currently expects exactly one source image.")
+        if not source_images:
+            raise ValueError("Fovea generation requires at least one source image.")
         if image_processor is None:
             raise ValueError("Fovea generation requires image_processor for crop re-encoding.")
         if attention_mask is None:
@@ -799,9 +853,10 @@ class FoveaForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             entry = self._fovea_metrics_history[-1]
             entry["trigger_offset"] = output_input_ids.shape[1] - input_ids.shape[1]
             attention_mask, past_key_values, crop_outputs, crop_input_ids, crop_grid_thw = self._run_crop_injection(
-                source_image=source_images[0],
+                source_images=source_images,
                 image_processor=image_processor,
                 patch_boxes=entry["retrieve_patch_boxes"][0],
+                patch_image_indices=entry["retrieve_patch_image_indices"][0] if "retrieve_patch_image_indices" in entry else None,
                 attn_mean=entry["fovea_attn_mean"][0],
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,

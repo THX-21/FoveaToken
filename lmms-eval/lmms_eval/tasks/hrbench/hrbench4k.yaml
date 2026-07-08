@@ -1,7 +1,6 @@
 dataset_path: /data/workspace/FoveaToken/data/eval/hrbench
-dataset_name: hrbench_version_split
 dataset_kwargs:
-  token: True
+  load_from_disk: true
 task: "hrbench4k"
 test_split: hrbench_4k
 output_type: generate_until

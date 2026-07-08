@@ -1,7 +1,6 @@
-dataset_path: parquet
+dataset_path: /data/workspace/FoveaToken/data/eval/chartqa
 dataset_kwargs:
-  data_files:
-    test: /data/workspace/FoveaToken/data/eval/chartqa/data/test-*.parquet
+  load_from_disk: true
 task: "chartqa"
 test_split: test
 output_type: generate_until

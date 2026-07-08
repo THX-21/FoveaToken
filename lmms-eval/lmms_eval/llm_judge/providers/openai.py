@@ -116,6 +116,7 @@ class OpenAIProvider(ServerInterface):
         response.raise_for_status()
         return response.json()
 
+
     def _add_images_to_messages(self, messages: List[Dict], images: List[Union[str, bytes]]) -> List[Dict]:
         """Add images to the last user message"""
         # Find the last user message

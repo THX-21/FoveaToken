@@ -57,10 +57,33 @@ def xlrs_doc_to_text(doc, lmms_eval_specific_kwargs=None):
 # The best answer is:
 
 
+def _clean_xlrs_prediction(text):
+    text = str(text).strip()
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1]
+    else:
+        text = text.removeprefix("<think>")
+    text = text.replace("<|im_end|>", " ").replace("<|endoftext|>", " ")
+    answer_markers = [
+        r"final answer\s*:",
+        r"the correct answer is\s*:?",
+        r"the best answer is\s*:?",
+        r"the answer is\s*:?",
+        r"answer\s*:",
+    ]
+    for marker in answer_markers:
+        matches = list(re.finditer(marker, text, re.IGNORECASE))
+        if matches:
+            text = text[matches[-1].end() :]
+            break
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def extract_characters_regex(s, choices=["(A)", "(B)", "(C)", "(D)", "(E)"]):
     if type(s) is dict:
         s = ""
-    s = s.strip()
+    s = _clean_xlrs_prediction(s)
     answer_prefixes = [
         "The best answer is",
         "The correct answer is",
@@ -74,6 +97,9 @@ def extract_characters_regex(s, choices=["(A)", "(B)", "(C)", "(D)", "(E)"]):
 
     if not re.search("[ABCDE]", s):
         return ""
+    direct_match = re.match(r"^\(?([A-E])\)?(?:[\s,.]|$)", s, re.IGNORECASE)
+    if direct_match:
+        return direct_match.group(1).upper()
     matches = re.findall(r"\(([a-eA-E])\)", s)
     if len(matches) == 0:
         matches = re.findall(r"(?:^|\s)?([a-eA-E])(?:$|[\s,.])?", s)

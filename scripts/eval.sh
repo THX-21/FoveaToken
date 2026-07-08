@@ -5,9 +5,30 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 # export HF_HUB_OFFLINE=1
 
+export OPENAI_API_KEY="sk-41b71552d6744c3ab5fd5b1bfadb3512"
+export OPENAI_API_URL="https://api.deepseek.com/v1"
+export API_TYPE="openai"
+export MODEL_VERSION="deepseek-v4-flash"
+
 FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/pretrain/fovea-vgr-qwen-9b}"
 LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr-qwen-9b/checkpoint-1302}"
-TASKS="${EVAL_TASKS:-mmstar}"
+# Common eval task names:
+#   hrbench8k      -> single task
+#   xlrs-lite      -> single task
+#   textvqa        -> group task, expands to textvqa_val + textvqa_test
+#   chartqa        -> single task
+#   vstar_bench    -> single task with internal categories: direct_attributes / relative_position
+#   mmstar         -> single task
+#   docvqa         -> group task, expands to docvqa_val + docvqa_test
+# MathVista has multiple variants; pick one explicitly before running:
+#   mathvista                -> group, expands to mathvista_testmini + mathvista_test
+#   mathvista_testmini       -> group, expands to mathvista_testmini_cot / _solution / _format
+#   mathvista_test           -> submission-style test split
+#   mathvista_testmini_cot   -> public mini eval, step-by-step prompt
+#   mathvista_testmini_solution
+#   mathvista_testmini_format
+# Note: `charvqa` was not found in the current repo. If you meant chart QA, use `chartqa`.
+TASKS="${EVAL_TASKS:-mathvista_testmini_solution}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
 [[ -x "${PYTHON_BIN}" ]] || PYTHON_BIN="python"
@@ -15,11 +36,11 @@ ATTN_IMPLEMENTATION="${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
 DEVICE_MAP="${EVAL_DEVICE_MAP:-cuda:0}"
 DEVICE="${EVAL_DEVICE:-${DEVICE_MAP}}"
 BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
-NUM_PROCESSES="${EVAL_NUM_PROCESSES:-2}"
+NUM_PROCESSES="${EVAL_NUM_PROCESSES:-1}"
 MAIN_PROCESS_PORT="${EVAL_MAIN_PROCESS_PORT:-12345}"
 BALANCED_LIMIT="${EVAL_BALANCED_LIMIT:-true}"
 MAX_IMG_TOKENS="${EVAL_MAX_IMG_TOKENS:-2048}"
-MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-10240}"
+MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-1024}"
 DISABLE_FOVEA_RETRIEVAL="${EVAL_DISABLE_FOVEA_RETRIEVAL:-false}"
 TASK_BUDGET="${EVAL_TASK_BUDGET:-600}"
 EVAL_SUBSET_SEED="${EVAL_SUBSET_SEED:-42}"
@@ -69,30 +90,61 @@ IFS=',' read -r -a RAW_TASK_LIST <<< "${TASKS}"
 EXPANDED_TASKS=()
 EXPANDED_LIMITS=()
 
+resolve_group_tasks() {
+  "${PYTHON_BIN}" - "$1" "${PROJECT_ROOT}/lmms-eval/lmms_eval/tasks" <<'PY'
+from pathlib import Path
+import sys
+
+import yaml
+
+
+def flatten_tasks(value):
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            out.extend(flatten_tasks(item))
+        return out
+    if isinstance(value, dict):
+        return flatten_tasks(value.get("task", []))
+    return []
+
+
+group_name = sys.argv[1]
+tasks_root = Path(sys.argv[2])
+
+for path in sorted(tasks_root.rglob("*.yaml")):
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception:
+        continue
+    if not isinstance(data, dict) or data.get("group") != group_name:
+        continue
+    leaf_tasks = flatten_tasks(data.get("task", []))
+    if leaf_tasks:
+        print("\n".join(leaf_tasks))
+        break
+PY
+}
+
 expand_eval_task() {
   local task_name="$1"
-  case "${task_name}" in
-    textvqa)
-      EXPANDED_TASKS+=("textvqa_val" "textvqa_test")
-      EXPANDED_LIMITS+=("$((TASK_BUDGET / 2))" "$((TASK_BUDGET - TASK_BUDGET / 2))")
-      ;;
-    vstar_bench)
-      EXPANDED_TASKS+=("vstar_bench_direct_attributes" "vstar_bench_relative_position")
-      EXPANDED_LIMITS+=("$((TASK_BUDGET / 2))" "$((TASK_BUDGET - TASK_BUDGET / 2))")
-      ;;
-    vsibench)
-      EXPANDED_TASKS+=("vsibench" "vsibench_debiased" "vsibench_pruned")
-      EXPANDED_LIMITS+=("$((TASK_BUDGET / 3))" "$((TASK_BUDGET / 3))" "$((TASK_BUDGET - 2 * (TASK_BUDGET / 3)))")
-      ;;
-    chartqa|textvqa_val|textvqa_test|hrbench8k|mmstar|vsibench_debiased|vsibench_pruned|vstar_bench_direct_attributes|vstar_bench_relative_position)
-      EXPANDED_TASKS+=("${task_name}")
+  mapfile -t group_tasks < <(resolve_group_tasks "${task_name}")
+  if ((${#group_tasks[@]} > 1)); then
+    echo "[eval] EXPAND_TASK=${task_name} LEAF_TASKS=${#group_tasks[@]} BUDGET_PER_LEAF=${TASK_BUDGET}"
+    local idx
+    for idx in "${!group_tasks[@]}"; do
+      echo "[eval]   LEAF[$idx]=${group_tasks[$idx]} LIMIT=${TASK_BUDGET}"
+      EXPANDED_TASKS+=("${group_tasks[$idx]}")
       EXPANDED_LIMITS+=("${TASK_BUDGET}")
-      ;;
-    *)
-      EXPANDED_TASKS+=("${task_name}")
-      EXPANDED_LIMITS+=("${TASK_BUDGET}")
-      ;;
-  esac
+    done
+    return
+  fi
+
+  echo "[eval] EXPAND_TASK=${task_name} LEAF_TASKS=1 BUDGET_PER_LEAF=${TASK_BUDGET}"
+  EXPANDED_TASKS+=("${task_name}")
+  EXPANDED_LIMITS+=("${TASK_BUDGET}")
 }
 
 for raw_task in "${RAW_TASK_LIST[@]}"; do
@@ -100,6 +152,8 @@ for raw_task in "${RAW_TASK_LIST[@]}"; do
   [[ -n "${task}" ]] || continue
   expand_eval_task "${task}"
 done
+
+echo "[eval] TOTAL_EXPANDED_TASKS=${#EXPANDED_TASKS[@]}"
 
 for idx in "${!EXPANDED_TASKS[@]}"; do
   CURRENT_TASK="${EXPANDED_TASKS[$idx]}"
