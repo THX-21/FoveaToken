@@ -1,8 +1,3 @@
-import re
-
-from lmms_eval.api.filter import Filter
-
-
 def chartqa_doc_to_visual(doc):
     return [doc["image"].convert("RGB")]
 
@@ -65,41 +60,3 @@ def relaxed_correctness(prediction, target, max_relative_change: float = 0.05) -
         return relative_change <= max_relative_change
     else:
         return prediction.lower() == target.lower()
-
-
-class FinalAnswerFilter(Filter):
-    def _extract_final_answer(self, text: str) -> str:
-        text = str(text).strip()
-        if not text:
-            return ""
-
-        # Strip special tokens like <|im_end|>, <|endoftext|>
-        text = re.sub(r"<\|[^<>|]+\|>", "", text)
-
-        answer_tags = re.findall(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.IGNORECASE | re.DOTALL)
-        if answer_tags:
-            text = answer_tags[-1].strip()
-        elif "</think>" in text:
-            text = text.rsplit("</think>", 1)[-1].strip()
-        elif "</analysis>" in text:
-            text = text.rsplit("</analysis>", 1)[-1].strip()
-
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if lines:
-            text = lines[-1]
-
-        match = re.search(r"(?i)(?:final answer|answer)\s*(?:is|:)\s*(.+)$", text)
-        if match:
-            text = match.group(1).strip()
-
-        text = text.strip().strip("`").strip("*").strip()
-        text = re.sub(r"\s+", " ", text)
-        text = re.sub(r"[ \t]+([,.;:!?])$", r"\1", text)
-        text = re.sub(r"[.;:,!?]+$", "", text).strip()
-        return text
-
-    def apply(self, resps, docs):
-        filtered_resps = []
-        for inst in resps:
-            filtered_resps.append([self._extract_final_answer(resp) for resp in inst])
-        return filtered_resps

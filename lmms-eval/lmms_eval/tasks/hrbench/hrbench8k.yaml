@@ -1,6 +1,7 @@
-dataset_path: /data/workspace/FoveaToken/data/eval/hrbench
+dataset_path: DreamMr/HR-Bench
+dataset_name: hrbench_version_split
 dataset_kwargs:
-  load_from_disk: true
+  token: True
 task: "hrbench8k"
 test_split: hrbench_8k
 output_type: generate_until

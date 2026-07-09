@@ -1,7 +1,6 @@
 import base64
 import io
 import os
-import re
 import string
 from collections import defaultdict
 from pathlib import Path
@@ -54,18 +53,6 @@ def hrbench_doc_to_text(doc, lmms_eval_specific_kwargs=None):
     return prompt
 
 
-def _clean_hrbench_prediction(text):
-    text = str(text).strip()
-    if "</think>" in text:
-        text = text.split("</think>", 1)[1]
-    else:
-        text = text.removeprefix("<think>")
-    text = text.replace("<|im_end|>", " ").replace("<|endoftext|>", " ")
-    text = re.sub(r"(?i)^\s*(final answer|answer)\s*:\s*", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
 def hrbench_process_results(doc, results):
     """
     Args:
@@ -75,15 +62,16 @@ def hrbench_process_results(doc, results):
         a dictionary with key: metric name, value: metric value
     """
     pred = results[0].strip()
-    cleaned_pred = _clean_hrbench_prediction(pred)
     gt = doc["answer"]
     options = hrbench_doc_to_options(doc)
-    inferred_prediction = hrbench_evaluator.can_infer(cleaned_pred, options) or hrbench_evaluator.can_infer(pred, options)
+    question = doc["question"]
+    resp_dic = hrbench_evaluator.get_chat_response({"question": question, "options": options, "prediction": pred})
+    gpt_prediction = resp_dic["gpt_prediction"]
     category = doc["category"]
     cycle_category = doc["cycle_category"]
 
     gpt_score = 0
-    if inferred_prediction and gt.lower() == str(inferred_prediction).lower():
+    if gt.lower() == gpt_prediction.lower():
         gpt_score = 1
 
     return {category: {"index": doc["index"], "cycle_category": cycle_category, "gpt_score": gpt_score}, "average": {"index": doc["index"], "cycle_category": cycle_category, "gpt_score": gpt_score}}

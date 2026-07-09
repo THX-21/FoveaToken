@@ -1,4 +1,5 @@
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -61,7 +62,7 @@ class Qwen3_VL(lmms):
     """
 
     DEFAULT_GEN_KWARGS = {
-        "max_new_tokens": 4096,
+        "max_new_tokens": 128,
         "temperature": 0.0,
         "top_p": None,
         "num_beams": 1,
@@ -70,12 +71,10 @@ class Qwen3_VL(lmms):
     def __init__(
         self,
         pretrained: str = "Qwen/Qwen3-VL-4B-Instruct",
-        peft: Optional[str] = None,
         device: Optional[str] = "cuda",
         device_map: Optional[str] = "auto",
         batch_size: Optional[Union[int, str]] = 1,
         use_cache=True,
-        torch_dtype: Optional[Union[str, torch.dtype]] = None,
         attn_implementation: Optional[str] = None,
         min_pixels: int = 256 * 28 * 28,
         max_pixels: int = 1605632,
@@ -108,23 +107,14 @@ class Qwen3_VL(lmms):
         is_moe = bool(re.search(r"A\d+B", pretrained))
         model_cls, dtype_key = _resolve_model_class(pretrained, is_moe)
 
-        dtype_value = torch_dtype if torch_dtype is not None else "bfloat16"
-        if isinstance(dtype_value, str) and dtype_value != "auto":
-            dtype_value = getattr(torch, dtype_value)
-
         model_kwargs = {
-            dtype_key: dtype_value,
+            dtype_key: "bfloat16",
             "device_map": self.device_map,
         }
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
 
-        self._model = model_cls.from_pretrained(pretrained, **model_kwargs)
-        if peft is not None:
-            from peft import PeftModel
-
-            self._model = PeftModel.from_pretrained(self._model, peft)
-        self._model = self._model.eval()
+        self._model = model_cls.from_pretrained(pretrained, **model_kwargs).eval()
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.total_pixels = total_pixels
@@ -241,17 +231,6 @@ class Qwen3_VL(lmms):
         template_kwargs.update(kwargs)
         return self.processor.apply_chat_template(batched_messages, tokenize=False, add_generation_prompt=True, **template_kwargs)
 
-    def _build_eos_token_ids(self):
-        eos_token_ids = []
-        for token_id in (
-            self.tokenizer.eos_token_id,
-            self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
-        ):
-            if token_id is None or token_id < 0 or token_id in eos_token_ids:
-                continue
-            eos_token_ids.append(int(token_id))
-        return eos_token_ids[0] if len(eos_token_ids) == 1 else eos_token_ids
-
     def _build_generate_kwargs(self, gen_kwargs):
         """Build model.generate() kwargs from user gen_kwargs merged with defaults."""
         current = {**self.DEFAULT_GEN_KWARGS, **gen_kwargs}
@@ -266,7 +245,7 @@ class Qwen3_VL(lmms):
             current.pop("top_k", None)
 
         generate_kwargs = {
-            "eos_token_id": self._build_eos_token_ids(),
+            "eos_token_id": self.tokenizer.eos_token_id,
             "pad_token_id": pad_token_id,
             "max_new_tokens": current["max_new_tokens"],
             "use_cache": self.use_cache,
@@ -283,11 +262,8 @@ class Qwen3_VL(lmms):
         """Strip <think>...</think> content from model output if enable_thinking is set."""
         if self.enable_thinking:
             _, _, remaining = answer.partition("</think>")
-            answer = remaining.strip()
-        # Remove EOS/IM_END tokens that may appear after special-token-inclusive decoding
-        for tok in ("<|im_end|>", "<|endoftext|>"):
-            answer = answer.replace(tok, "")
-        return answer.strip()
+            return remaining.strip()
+        return answer
 
     def _preprocess_chunk(self, chunk):
         """Preprocess a batch chunk on CPU: message building, video decoding, tokenization.
@@ -424,33 +400,40 @@ class Qwen3_VL(lmms):
         re_ords = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
         chunks = list(re_ords.get_batched(n=self.batch_size, batch_fn=None))
 
-        for idx in range(len(chunks)):
-            inputs, contexts, gen_kwargs, until = self._preprocess_chunk(chunks[idx])
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._preprocess_chunk, chunks[0]) if chunks else None
 
-            if self.device_map == "auto":
-                inputs = inputs.to("cuda")
-            else:
-                inputs = inputs.to(self.device)
+            for idx in range(len(chunks)):
+                inputs, contexts, gen_kwargs, until = future.result()
 
-            generate_kwargs = self._build_generate_kwargs(gen_kwargs)
-            cont = self.model.generate(**inputs, **generate_kwargs)
+                if idx + 1 < len(chunks):
+                    future = executor.submit(self._preprocess_chunk, chunks[idx + 1])
 
-            generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
-            answers = self.processor.batch_decode(
-                generated_ids_trimmed,
-                skip_special_tokens=False,
-                clean_up_tokenization_spaces=False,
-            )
-            for i, ans in enumerate(answers):
-                for term in until:
-                    if len(term) > 0:
-                        ans = ans.split(term)[0]
-                answers[i] = ans
+                if self.device_map == "auto":
+                    inputs = inputs.to("cuda")
+                else:
+                    inputs = inputs.to(self.device)
 
-            for ans, context in zip(answers, contexts):
-                res.append(ans)
-                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
-                pbar.update(1)
+                generate_kwargs = self._build_generate_kwargs(gen_kwargs)
+                cont = self.model.generate(**inputs, **generate_kwargs)
+
+                generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
+                answers = self.processor.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+                for i, ans in enumerate(answers):
+                    for term in until:
+                        if len(term) > 0:
+                            ans = ans.split(term)[0]
+                    answers[i] = ans
+
+                for ans, context in zip(answers, contexts):
+                    ans = self._strip_thinking(ans)
+                    res.append(ans)
+                    self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
+                    pbar.update(1)
 
         res = re_ords.get_original(res)
         pbar.close()

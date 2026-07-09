@@ -1,6 +1,4 @@
-dataset_path: /data/workspace/FoveaToken/data/eval/mmstar
-dataset_kwargs:
-  load_from_disk: true
+dataset_path: Lin-Chen/MMStar
 task: "mmstar"
 tag:
   - public_eval_qwen3_5_family

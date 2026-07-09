@@ -1,6 +1,6 @@
-dataset_path: /data/workspace/FoveaToken/data/eval/chartqa
+dataset_path: lmms-lab/ChartQA
 dataset_kwargs:
-  load_from_disk: true
+  token: True
 task: "chartqa"
 test_split: test
 output_type: generate_until
@@ -8,15 +8,9 @@ doc_to_visual: !function utils.chartqa_doc_to_visual
 doc_to_text: !function utils.chartqa_doc_to_text
 doc_to_target: "answer"
 generation_kwargs:
-  max_new_tokens: 768
+  max_new_tokens: 16
   temperature: 0
   do_sample: False
-  until: []
-filter_list:
-  - name: "final-answer"
-    filter:
-      - function: !function utils.FinalAnswerFilter
-      - function: "take_first"
 process_results: !function utils.chartqa_process_results
 metric_list:
   - metric: relaxed_overall
@@ -37,3 +31,4 @@ lmms_eval_specific_kwargs:
   qwen_vl:
     pre_prompt: ""
     post_prompt: " Answer:"
+

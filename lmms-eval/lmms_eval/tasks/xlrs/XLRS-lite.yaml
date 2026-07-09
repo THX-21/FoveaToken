@@ -1,15 +1,12 @@
-dataset_path: /data/workspace/FoveaToken/data/eval/xlrs-lite
-dataset_kwargs:
-  load_from_disk: true
+dataset_path: initiacms/XLRS-Bench-lite
 task: xlrs-lite
-process_docs: !function mcq_utils.xlrs_process_docs
 test_split: train
 output_type: generate_until
 doc_to_visual: !function mcq_utils.xlrs_doc_to_visual
 doc_to_text: !function mcq_utils.xlrs_doc_to_text
 doc_to_target: "answer"
 generation_kwargs:
-  max_new_tokens: 16
+  max_new_tokens: 64
   temperature: 0
   top_p: 1.0
   num_beams: 1

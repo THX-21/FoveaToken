@@ -277,6 +277,10 @@ class EvaluationTracker:
                     if isinstance(sample["filtered_resps"], list) and len(sample["filtered_resps"]) == 1:
                         sample["filtered_resps"] = sample["filtered_resps"][0]
 
+                    if sample["resps"] == sample["filtered_resps"]:
+                        sample.pop("resps")
+                    elif isinstance(sample["resps"], list) and len(sample["resps"]) == 1 and sample["resps"][0] == sample["filtered_resps"]:
+                        sample.pop("resps")
                     sample["target"] = str(sample["target"])
                     sample.pop("arguments")
                     sample.pop("doc")

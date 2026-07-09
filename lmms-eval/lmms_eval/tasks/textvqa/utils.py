@@ -1,6 +1,5 @@
 import datetime
 import json
-import re
 import statistics
 
 from loguru import logger as eval_logger
@@ -13,20 +12,10 @@ def textvqa_doc_to_visual(doc):
     return [doc["image"].convert("RGB")]
 
 
-def _clean_textvqa_prediction(text: str) -> str:
-    text = str(text)
-    text = re.sub(r"<think>.*?</think>", " ", text, flags=re.IGNORECASE | re.DOTALL)
-    text = text.replace("<|im_end|>", " ")
-    text = text.replace("<|endoftext|>", " ")
-    text = re.sub(r"^\s*final answer\s*:\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
 def textvqa_process_results(doc, result):
     eval_ai_processor = EvalAIAnswerProcessor()
     assert len(result) == 1, f"The result should be a list of length 1, but got {len(result)}."
-    resAns = eval_ai_processor(_clean_textvqa_prediction(result[0]))
+    resAns = eval_ai_processor(result[0])
     accuracy = 0
 
     if "answers" in doc and doc["answers"] is not None:

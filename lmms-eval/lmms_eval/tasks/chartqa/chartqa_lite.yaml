@@ -12,7 +12,6 @@ generation_kwargs:
   max_new_tokens: 16
   temperature: 0
   do_sample: False
-  until: []
 process_results: !function utils.chartqa_process_results
 metric_list:
   - metric: relaxed_overall

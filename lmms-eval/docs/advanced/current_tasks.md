@@ -271,6 +271,8 @@ python -m lmms_eval --tasks list_with_num
 - [EgoPlan](https://github.com/ChenYi99/EgoPlan) (egoplan)
 - [EgoTempo](https://github.com/google-research-datasets/egotempo) (egotempo)
 - [EgoThink](https://github.com/AdaCheng/EgoThink) (egothink)
+- [IntPhys2](https://arxiv.org/abs/2506.09849) (intphys2)
+  - intphys2_debug
 - [MLVU](https://github.com/JUNJIE99/MLVU) (mlvu)
 - [MMT-Bench](https://mmt-bench.github.io/) (mmt)
   - MMT Validation (mmt_val)
@@ -323,6 +325,7 @@ python -m lmms_eval --tasks list_with_num
 - [PLM VideoBench](https://github.com/PLM-VideoBench/PLM-VideoBench) (plm_videobench)
 - [SciVideoBench](https://scivideobench.github.io/) (scivideobench)
 - [MINERVA](https://arxiv.org/abs/2505.00681) (minerva)
+- [VANTAGE-Bench](https://huggingface.co/datasets/nvidia/PhysicalAI-VANTAGE-Bench) (vantage_vqa) - Physical AI video VQA
 - [Video-ChatGPT](https://github.com/mbzuai-oryx/Video-ChatGPT) (videochatgpt)
   - Video-ChatGPT Generic (videochatgpt_gen)
   - Video-ChatGPT Temporal (videochatgpt_temporal)

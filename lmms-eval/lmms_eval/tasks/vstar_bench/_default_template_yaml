@@ -1,6 +1,4 @@
-dataset_path: /data/workspace/FoveaToken/data/eval/vstar-bench
-dataset_kwargs:
-  load_from_disk: true
+dataset_path: lmms-lab/vstar-bench
 task: "vstar_bench"
 test_split: test
 output_type: generate_until

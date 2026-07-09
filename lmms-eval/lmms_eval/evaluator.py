@@ -28,7 +28,7 @@ import lmms_eval.api.registry
 from lmms_eval import models
 from lmms_eval.api.instance import Instance, unwrap_generation_output
 from lmms_eval.api.model import lmms
-from lmms_eval.api.reasoning import parse_reasoning_tags_config, restore_prefilled_reasoning_prefix, strip_reasoning_tags
+from lmms_eval.api.reasoning import parse_reasoning_tags_config, strip_reasoning_tags
 from lmms_eval.api.task import Task
 from lmms_eval.baselines import (
     BASELINE_REGISTRY,
@@ -73,6 +73,43 @@ from lmms_eval.utils import (
 )
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+_SENSITIVE_CONFIG_KEYS = {
+    "api_key",
+    "client_secret",
+    "hf_token",
+    "huggingface_hub_token",
+    "huggingfacehub_api_token",
+    "token",
+}
+# Suffixes also catch prefixed variants: openai_api_key, github_token, my_secret, db_password.
+_SENSITIVE_KEY_SUFFIXES = ("api_key", "_token", "_secret", "password")
+_SECRET_ASSIGNMENT_RE = re.compile(r"(?i)(^|[,\s])(\w*(?:api_key|token|secret|password))=([^,\s]+)")
+_HF_TOKEN_VALUE_RE = re.compile(r"\bhf_[A-Za-z0-9]{20,}\b")
+
+
+def _is_sensitive_config_key(key) -> bool:
+    key_lower = str(key).lower()
+    return key_lower in _SENSITIVE_CONFIG_KEYS or key_lower.endswith(_SENSITIVE_KEY_SUFFIXES)
+
+
+def _redact_eval_config_secrets(value):
+    if isinstance(value, dict):
+        return {key: ("[REDACTED]" if _is_sensitive_config_key(key) else _redact_eval_config_secrets(item)) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_redact_eval_config_secrets(item) for item in value)
+    if isinstance(value, str):
+        value = _SECRET_ASSIGNMENT_RE.sub(r"\1\2=[REDACTED]", value)
+        return _HF_TOKEN_VALUE_RE.sub("[REDACTED]", value)
+    return value
+
+
+def _clone_padding_request(pad_source: Instance) -> Instance:
+    pad_instance = copy.copy(pad_source)
+    pad_instance.metadata = dict(pad_source.metadata or {})
+    pad_instance.metadata["__padding_only__"] = True
+    pad_instance.resps = []
+    pad_instance.token_counts = []
+    return pad_instance
 
 
 def _enable_reentrant_filelocks() -> None:
@@ -531,6 +568,7 @@ def simple_evaluate(
         # add info about execution
         results["config"].update(
             {
+                "model_backend": f"{type(lm).__module__}.{type(lm).__name__} ({task_type})",
                 "batch_size": batch_size,
                 "batch_sizes": (list(lm.batch_sizes.values()) if hasattr(lm, "batch_sizes") else []),
                 "device": device,
@@ -555,6 +593,8 @@ def simple_evaluate(
                 except (TypeError, ValueError):
                     resolved[key] = str(value)
             results["config"]["resolved_cli_args"] = resolved
+
+        results["config"] = _redact_eval_config_secrets(results["config"])
 
         results["git_hash"] = get_git_commit_hash()
         results["git_branch"] = get_git_branch_name()
@@ -862,6 +902,7 @@ def evaluate(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     global_rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
+
     eval_logger.info(f"Running on rank {global_rank} (local rank {local_rank})")
 
     def _infer_task_request_type(task_obj: Task) -> Optional[str]:
@@ -882,8 +923,32 @@ def evaluate(
         if not all("bypass" not in getattr(task_output.task, "_metric_fn_list", {}).keys() for task_output in eval_tasks):
             raise ValueError("log_samples must be True for 'bypass' metric-only tasks")
 
-    if distributed_executor_backend == "accelerate" and not hasattr(lm, "accelerator"):
-        lm.accelerator = Accelerator()
+    if distributed_executor_backend == "accelerate":
+        if not hasattr(lm, "accelerator"):
+            lm.accelerator = Accelerator()
+    else:
+        # Torchrun/native path: auto-init a process group for multi-rank runs
+        # whose model backend never called init_process_group (e.g. diffusers
+        # video-gen models), so evaluator collectives don't crash. gloo needs no
+        # GPU. Gated out of the accelerate path on purpose: pre-initializing here
+        # would make Accelerator() adopt this gloo group instead of building NCCL,
+        # silently running GPU collectives on CPU.
+        if world_size > 1 and dist.is_available() and not dist.is_initialized():
+            if os.environ.get("MASTER_ADDR") and os.environ.get("MASTER_PORT"):
+                dist.init_process_group(backend="gloo")
+                eval_logger.info(f"evaluator: auto-initialized gloo process group (world={world_size})")
+            else:
+                eval_logger.warning(
+                    f"evaluator: WORLD_SIZE={world_size} but MASTER_ADDR/MASTER_PORT are unset; skipping torch.distributed auto-init. Distributed collectives will fail unless the model backend initializes the process group itself."
+                )
+
+    # Inject rank/world_size into the model so that logging (tqdm disable)
+    # and rank-conditional logic work on non-zero ranks.  Many simple models
+    # only read LOCAL_RANK for device binding and leave _rank/_world_size
+    # at their defaults (0, 1).
+    if world_size > 1:
+        lm._rank = global_rank
+        lm._world_size = world_size
 
     for task_output in eval_tasks:
         task = task_output.task
@@ -950,8 +1015,8 @@ def evaluate(
                 instances_rnk = torch.tensor(len(task._instances), device=lm.device)
                 gathered_item = lm.accelerator.gather(instances_rnk).cpu().detach().numpy().tolist()
             elif distributed_executor_backend == "torchrun":
-                instances_rnk = torch.tensor(len(task._instances), device=lm.device)
-                gathered_item = torch.zeros(world_size * 1, dtype=instances_rnk.dtype, device=lm.device)
+                instances_rnk = torch.tensor([len(task._instances)], device=lm.device)
+                gathered_item = torch.zeros(world_size, dtype=instances_rnk.dtype, device=lm.device)
                 dist.all_gather_into_tensor(gathered_item, instances_rnk)
                 gathered_item = gathered_item.cpu().detach().numpy().tolist()
             else:
@@ -1003,7 +1068,8 @@ def evaluate(
                 eval_logger.warning(f"Running {reqtype} requests but could not find a pad source request on rank {global_rank}; skipping rank padding.")
             else:
                 for _ in range(padding_requests[reqtype]):
-                    cloned_reqs.extend([pad_source] * pad_source.repeats)
+                    pad_instance = _clone_padding_request(pad_source)
+                    cloned_reqs.extend([pad_instance] * pad_instance.repeats)
 
         # run requests through model (with optional response cache)
         if reqtype == "generate_until_agentic":
@@ -1136,6 +1202,12 @@ def evaluate(
             pbar = tqdm(total=total_docs, desc="Postprocessing", disable=(RANK != 0))
             for doc_id, doc in doc_iterator:
                 requests = instances_by_doc_id[doc_id]
+                # Defensive skip: if a doc landed in this rank's shard but has
+                # no requests (e.g. a split mismatch during a partial rerun),
+                # skip rather than crashing at `requests[0].doc` below.
+                if not requests:
+                    pbar.update(1)
+                    continue
 
                 # Strip reasoning tags before scoring
                 if reasoning_tags is not None:
@@ -1189,39 +1261,12 @@ def evaluate(
                         else:
                             per_sample_tc.append(None)
 
-                    logged_resps = []
-                    for req in requests:
-                        raw_resp = req.resps
-                        if isinstance(raw_resp, list):
-                            logged_resps.append(
-                                [
-                                    restore_prefilled_reasoning_prefix(
-                                        resp,
-                                        reasoning_tags,
-                                        getattr(lm, "enable_thinking", None),
-                                    )
-                                    if isinstance(resp, str)
-                                    else resp
-                                    for resp in raw_resp
-                                ]
-                            )
-                        elif isinstance(raw_resp, str):
-                            logged_resps.append(
-                                restore_prefilled_reasoning_prefix(
-                                    raw_resp,
-                                    reasoning_tags,
-                                    getattr(lm, "enable_thinking", None),
-                                )
-                            )
-                        else:
-                            logged_resps.append(raw_resp)
-
                     example = {
                         "doc_id": doc_id,
                         "doc": saved_doc,
                         "target": target,
                         "arguments": filtered_arguments,
-                        "resps": logged_resps,
+                        "resps": [req.resps for req in requests],
                         "filtered_resps": [req.filtered_resps[filter_key] for req in requests],
                         "token_counts": per_sample_tc,
                         "doc_hash": hash_string(

@@ -1,8 +1,6 @@
-dataset_path: parquet
+dataset_path: AI4Math/MathVista
 dataset_kwargs:
-  data_files:
-    testmini: /data/workspace/FoveaToken/data/eval/MathVista/data/testmini-*.parquet
-    test: /data/workspace/FoveaToken/data/eval/MathVista/data/test-*.parquet
+  token: True
 task: "mathvista_testmini_cot_reasoning"
 test_split: testmini
 output_type: generate_until

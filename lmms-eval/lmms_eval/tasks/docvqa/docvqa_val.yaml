@@ -1,6 +1,5 @@
 task: "docvqa_val"
 test_split: validation
-process_results: !function utils.docvqa_val_process_results
 metric_list:
   - metric: anls
     aggregation: mean

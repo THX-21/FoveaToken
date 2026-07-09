@@ -1,10 +1,9 @@
-dataset_path: parquet
+dataset_path: lmms-lab/ai2d
 task: "ai2d"
 tag:
   - public_eval_qwen3_5_family
 dataset_kwargs:
-  data_files:
-    test: /root/.cache/modelscope/datasets/lmms-lab--ai2d/snapshots/master/data/test-*.parquet
+  token: True
 test_split: test
 output_type: generate_until
 doc_to_visual: !function utils.ai2d_doc_to_visual

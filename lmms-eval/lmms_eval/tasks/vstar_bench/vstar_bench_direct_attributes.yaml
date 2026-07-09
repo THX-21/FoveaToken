@@ -1,9 +1,7 @@
 include: _default_template_yaml
 task: "vstar_bench_direct_attributes"
 dataset_kwargs:
-  data_files:
-    test: /data/workspace/FoveaToken/data/eval/vstar-bench/data/test-*.parquet
-process_docs: !function utils.vstar_filter_direct_attributes
+  category: "direct_attributes"
 metric_list:
   - metric: vstar_direct_attributes_acc
     aggregation: !function utils.vstar_aggregate_results

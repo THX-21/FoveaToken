@@ -46,7 +46,6 @@ def _format_time(seconds: float) -> str:
 
 
 def _interactive_ncols() -> int:
-    """Choose a conservative tqdm width to avoid terminal wrapping."""
     env_ncols = os.environ.get("LMMS_EVAL_PROGRESS_NCOLS")
     if env_ncols:
         try:
