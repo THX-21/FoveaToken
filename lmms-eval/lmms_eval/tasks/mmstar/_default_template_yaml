@@ -1,5 +1,6 @@
 dataset_kwargs:
   token: True
+  load_from_disk: true
 test_split: val
 output_type: generate_until
 doc_to_target: "answer"

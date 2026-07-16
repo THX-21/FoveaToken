@@ -20,10 +20,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize training data samples.")
-    parser.add_argument("--data_path", default="data/vgr/preprocessed/vgr_shortcot.parquet")
-    parser.add_argument("--image_folder", default="data/vgr/llava_next_raw_format")
+    parser.add_argument("--data_path", default="data/VLM-R3-data/preprocessed/vlir_sft_12k.parquet")
+    parser.add_argument("--image_folder", default="data/VLM-R3-data/preprocessed")
     parser.add_argument("--index", type=int, nargs="*", default=None)
-    parser.add_argument("--num_samples", type=int, default=0, help="Randomly sample N records (overrides --index)")
+    parser.add_argument("--num_samples", type=int, default=10, help="Randomly sample N records (overrides --index)")
     parser.add_argument("--output_dir", default="outputs/data_visualize")
     parser.add_argument("--box_color", default="#FF4444")
     parser.add_argument("--box_alpha", type=float, default=0.3)
@@ -46,7 +46,7 @@ def wrap_text(text: str, width: int = 100) -> str:
 
 def highlight_fovea(text: str) -> str:
     """Replace the current Fovea trigger with a visible marker."""
-    return text.replace("<fovea>", " [FOVEA] ")
+    return text.replace('{"fovea"}', " [FOVEA] ")
 
 
 def render_sample(sample: dict, image_folder: Path, args) -> np.ndarray | None:
@@ -89,7 +89,7 @@ def render_sample(sample: dict, image_folder: Path, args) -> np.ndarray | None:
         elif role in ("gpt", "assistant"):
             answer = value
 
-    n_fovea = answer.count("<fovea>")
+    n_fovea = answer.count('{"fovea"}')
     n_boxes = len(boxes)
 
     source = sample.get("_source", "?")
@@ -119,7 +119,7 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load index file for source tracing (vgr_merged_index.json next to the parquet)
+    # Load an optional index file for source tracing.
     data_path = Path(args.data_path)
     index_path = data_path.parent / data_path.name.replace(".parquet", "_index.json")
     index_map: list[dict] | None = None

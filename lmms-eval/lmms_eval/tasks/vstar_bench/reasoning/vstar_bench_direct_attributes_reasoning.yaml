@@ -1,7 +1,8 @@
 include: ../_default_template_yaml
 task: "vstar_bench_direct_attributes_reasoning"
+dataset_path: data/eval/vstar-bench-direct-attributes
 dataset_kwargs:
-  category: "direct_attributes"
+  load_from_disk: true
 doc_to_messages: !function utils.vstar_reasoning_doc_to_messages
 process_results: !function utils.vstar_reasoning_process_results
 generation_kwargs:

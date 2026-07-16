@@ -12,4 +12,4 @@ docs/
 *.egg-info/
 data/
 outputs/
-PLAN.md
+VLM-R3/

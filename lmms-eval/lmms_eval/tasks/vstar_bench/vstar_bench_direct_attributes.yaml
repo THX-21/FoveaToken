@@ -1,7 +1,8 @@
 include: _default_template_yaml
 task: "vstar_bench_direct_attributes"
+dataset_path: data/eval/vstar-bench-direct-attributes
 dataset_kwargs:
-  category: "direct_attributes"
+  load_from_disk: true
 metric_list:
   - metric: vstar_direct_attributes_acc
     aggregation: !function utils.vstar_aggregate_results

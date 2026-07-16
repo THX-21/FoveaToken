@@ -1,4 +1,4 @@
-dataset_path: Lin-Chen/MMStar
+dataset_path: data/eval/mmstar
 task: "mmstar"
 tag:
   - public_eval_qwen3_5_family

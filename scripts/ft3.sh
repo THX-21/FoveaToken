@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 export NNODES=1
-export NUM_GPUS="${FT3_NUM_GPUS:-4}"
+export NUM_GPUS="${FT3_NUM_GPUS:-1}"
 export MASTER_ADDR="127.0.0.1"
 if [[ -n "${FT3_MASTER_PORT:-}" ]]; then
     export MASTER_PORT="${FT3_MASTER_PORT}"
@@ -22,16 +22,17 @@ export WORLD_SIZE=$((NNODES * NUM_GPUS))
 export RANK=0
 
 NUM_TRAIN_EPOCHS="${FT3_NUM_TRAIN_EPOCHS:-1}"
-RUN_NAME="${FT3_RUN_NAME:-fovea-vgr-qwen-9b}"
-DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/vgr/preprocessed}"
-IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/llava_next/llava_next_raw_format}"
-CKPT_PATH="${FT3_CKPT_PATH:-checkpoints/pretrain/fovea-vgr-qwen-9b}"
+RUN_NAME="${FT3_RUN_NAME:-fovea-vlmr3-json-qwen2.5-vl-7b}"
+DATA_PATH="${FT3_DATA_PATH:-${PROJECT_ROOT}/data/VLM-R3-data/preprocessed/vlir_sft_12k.parquet}"
+IMAGE_FOLDER="${FT3_IMAGE_FOLDER:-${PROJECT_ROOT}/data/VLM-R3-data/preprocessed}"
+CKPT_PATH="${FT3_CKPT_PATH:-Qwen/Qwen2.5-VL-7B-Instruct}"
 OUTPUT_DIR="${FT3_OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints/${RUN_NAME}}"
 SAVE_STEPS="${FT3_SAVE_STEPS:-100}"
 MAX_STEPS="${FT3_MAX_STEPS:--1}"
 ATTN_IMPLEMENTATION="${FT3_ATTN_IMPLEMENTATION:-sdpa}"
 MAX_IMG_TOKENS="${FT3_MAX_IMG_TOKENS:-2048}"
 CROP_MAX_IMG_TOKENS="${FT3_FOVEA_CROP_MAX_IMG_TOKENS:-1024}"
+CROP_MIN_IMG_TOKENS="${FT3_FOVEA_CROP_MIN_IMG_TOKENS:-64}"
 REPORT_TO="${FT3_REPORT_TO:-tensorboard}"
 WORKERS="${FT3_DATALOADER_NUM_WORKERS:-8}"
 FREEZE_BASE_MODEL="${FT3_FREEZE_BASE_MODEL:-false}"
@@ -50,6 +51,7 @@ echo "[ft3] SAVE_STEPS=${SAVE_STEPS}"
 echo "[ft3] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
 echo "[ft3] MAX_IMG_TOKENS=${MAX_IMG_TOKENS}"
 echo "[ft3] FOVEA_CROP_MAX_IMG_TOKENS=${CROP_MAX_IMG_TOKENS}"
+echo "[ft3] FOVEA_CROP_MIN_IMG_TOKENS=${CROP_MIN_IMG_TOKENS}"
 echo "[ft3] DATALOADER_NUM_WORKERS=${WORKERS}"
 echo "[ft3] REPORT_TO=${REPORT_TO}"
 echo "[ft3] FREEZE_BASE_MODEL=${FREEZE_BASE_MODEL}"
@@ -108,7 +110,9 @@ ACCELERATE_CPU_AFFINITY=1 "${LAUNCHER[@]}" \
     --model_name_or_path "${CKPT_PATH}" \
     --data_path "${DATA_PATH}" \
     --image_folder "${IMAGE_FOLDER}" \
+    --system_message "" \
     --max_img_tokens "${MAX_IMG_TOKENS}" \
+    --fovea_crop_min_img_tokens "${CROP_MIN_IMG_TOKENS}" \
     --fovea_crop_max_img_tokens "${CROP_MAX_IMG_TOKENS}" \
     "${PRECISION_ARGS[@]}" \
     --run_name "${RUN_NAME}" \

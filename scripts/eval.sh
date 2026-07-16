@@ -10,8 +10,8 @@ export OPENAI_API_URL="https://api.deepseek.com/v1"
 export API_TYPE="openai"
 export MODEL_VERSION="deepseek-v4-flash"
 
-FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/pretrain/fovea-vgr-qwen-9b}"
-LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vgr-qwen-9b/checkpoint-1302}"
+FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vlmr3-json-qwen2.5-vl-7b}"
+LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-}"
 # Common eval task names:
 #   hrbench8k      -> single task
 #   xlrs-lite      -> single task
@@ -46,7 +46,7 @@ TASK_BUDGET="${EVAL_TASK_BUDGET:-600}"
 EVAL_SUBSET_SEED="${EVAL_SUBSET_SEED:-42}"
 
 RESOLVED_CHECKPOINT="${LORA_CHECKPOINT:-${FULL_CHECKPOINT}}"
-MODEL_ARGS="pretrained=${RESOLVED_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},enable_thinking=True,disable_fovea_retrieval=${DISABLE_FOVEA_RETRIEVAL},max_image_tokens=${MAX_IMG_TOKENS}"
+MODEL_ARGS="pretrained=${RESOLVED_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},disable_fovea_retrieval=${DISABLE_FOVEA_RETRIEVAL},max_image_tokens=${MAX_IMG_TOKENS}"
 LOG_SUFFIX_DEFAULT="$(basename "${RESOLVED_CHECKPOINT}")"
 LOG_SUFFIX="${EVAL_LOG_SUFFIX:-${LOG_SUFFIX_DEFAULT}}"
 ACCELERATE_BIN="$(command -v accelerate || true)"

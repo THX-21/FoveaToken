@@ -7,14 +7,14 @@ import torch
 import transformers
 
 from fovea_token import FoveaForConditionalGeneration
-from fovea_token.tokenizers.tokenization_fovea import sync_fovea_token_ids
+from fovea_token.tokenizers.tokenization_fovea import sync_fovea_trigger_ids
 
-from .data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
+from .data import DataCollatorForFoveaSFT, LazySupervisedDataset, VisionPacker
 
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: str = field(default="Qwen/Qwen3.5-9B")
+    model_name_or_path: str = field(default="Qwen/Qwen2.5-VL-7B-Instruct")
 
 
 @dataclass
@@ -23,6 +23,7 @@ class DataArguments:
     image_folder: str = field(default=None)
     system_message: str = field(default="You are a helpful assistant.")
     max_img_tokens: int = field(default=2048)
+    fovea_crop_min_img_tokens: int = field(default=64)
     fovea_crop_max_img_tokens: int = field(default=1024)
 
 
@@ -67,70 +68,24 @@ def is_lora_excluded_module(name: str) -> bool:
     return is_fovea_extra_key(name) or name == "lm_head" or name.endswith("embed_tokens")
 
 
-def clear_fovea_token_row_hooks(model: FoveaForConditionalGeneration) -> None:
-    if hasattr(model, "_fovea_input_embedding_hook") and model._fovea_input_embedding_hook is not None:
-        model._fovea_input_embedding_hook.remove()
-        model._fovea_input_embedding_hook = None
-    if hasattr(model, "_fovea_lm_head_hook") and model._fovea_lm_head_hook is not None:
-        model._fovea_lm_head_hook.remove()
-        model._fovea_lm_head_hook = None
-
-
 def configure_low_contamination_training(model: FoveaForConditionalGeneration) -> None:
-    """Freeze Qwen and train only Fovea retrieval plus the added token rows."""
+    """Freeze Qwen and train only Fovea retrieval modules."""
 
     model.requires_grad_(False)
-    configure_fovea_extra_training(model, token_rows_only=True)
+    configure_fovea_extra_training(model)
 
 
-def configure_fovea_extra_training(
-    model: FoveaForConditionalGeneration,
-    token_rows_only: bool,
-    train_token_rows: bool = True,
-) -> None:
-    """Train Fovea modules plus either full token matrices or only the added token rows."""
+def configure_fovea_extra_training(model: FoveaForConditionalGeneration) -> None:
+    """Train Fovea retrieval modules."""
 
     for name, param in model.named_parameters():
         if name.startswith("fovea_"):
             param.requires_grad_(True)
 
-    clear_fovea_token_row_hooks(model)
-    model._fovea_save_full_token_matrices = not token_rows_only
-
-    if not train_token_rows:
-        return
-
-    fovea_token_id = getattr(model.config, "fovea_token_id", None)
-    if fovea_token_id is None or int(fovea_token_id) < 0:
-        raise ValueError("Frozen-base Fovea training requires a valid fovea_token_id.")
-
-    input_embedding_weight = model.get_input_embeddings().weight
-    input_embedding_weight.requires_grad_(True)
-    model.lm_head.weight.requires_grad_(True)
-
-    if not token_rows_only:
-        return
-
-    allowed_row = int(fovea_token_id)
-
-    def keep_only_fovea_row(grad):
-        if grad is None:
-            return grad
-        masked = grad.new_zeros(grad.shape)
-        masked[allowed_row].copy_(grad[allowed_row])
-        return masked
-
-    model._fovea_input_embedding_hook = input_embedding_weight.register_hook(keep_only_fovea_row)
-
-    model._fovea_lm_head_hook = model.lm_head.weight.register_hook(keep_only_fovea_row)
-
-
 def configure_training_mode(model: FoveaForConditionalGeneration, freeze_base_model: bool) -> None:
-    clear_fovea_token_row_hooks(model)
     if freeze_base_model:
         configure_low_contamination_training(model)
         return
-    model._fovea_save_full_token_matrices = True
     model.requires_grad_(True)
 
 
@@ -153,17 +108,10 @@ def configure_lora_training(model: FoveaForConditionalGeneration, training_args:
         raise ImportError("LoRA training requires peft. Install project train dependencies or `pip install peft`.") from exc
 
     model.requires_grad_(False)
-    clear_fovea_token_row_hooks(model)
-
     target_modules = resolve_lora_target_modules(model)
     print("=== LoRA Target Modules ===")
     for name in target_modules:
         print(name)
-
-    fovea_token_id = getattr(model.config, "fovea_token_id", None)
-    if fovea_token_id is None or int(fovea_token_id) < 0:
-        raise ValueError("LoRA Fovea training requires a valid fovea_token_id.")
-    fovea_token_id = int(fovea_token_id)
 
     peft_config = LoraConfig(
         r=training_args.lora_rank,
@@ -172,13 +120,9 @@ def configure_lora_training(model: FoveaForConditionalGeneration, training_args:
         bias="none",
         task_type=TaskType.CAUSAL_LM,
         target_modules=target_modules,
-        trainable_token_indices={
-            "model.language_model.embed_tokens": [fovea_token_id],
-            "lm_head": [fovea_token_id],
-        },
     )
     peft_model = get_peft_model(model, peft_config)
-    configure_fovea_extra_training(model, token_rows_only=True, train_token_rows=False)
+    configure_fovea_extra_training(model)
     return peft_model
 
 
@@ -188,14 +132,6 @@ def collect_fovea_extra_state(model: FoveaForConditionalGeneration) -> dict[str,
         if is_fovea_extra_key(name):
             state[name] = tensor.detach().cpu()
 
-    token_id = getattr(model.config, "fovea_token_id", None)
-    if getattr(model, "_fovea_save_full_token_matrices", False):
-        state["model.embed_tokens.weight"] = model.get_input_embeddings().weight.detach().cpu()
-        state["lm_head.weight"] = model.lm_head.weight.detach().cpu()
-    elif token_id is not None and int(token_id) >= 0:
-        token_id = int(token_id)
-        state["model.embed_tokens.weight.fovea_row"] = model.get_input_embeddings().weight[token_id].detach().cpu()
-        state["lm_head.weight.fovea_row"] = model.lm_head.weight[token_id].detach().cpu()
     return state
 
 
@@ -206,7 +142,6 @@ def save_fovea_extra(model: FoveaForConditionalGeneration, output_dir: str) -> N
     root.mkdir(parents=True, exist_ok=True)
     save_file(collect_fovea_extra_state(model), str(root / FOVEA_EXTRA_WEIGHTS_NAME))
     extra_config = {
-        "fovea_token_id": getattr(model.config, "fovea_token_id", None),
         "base_model_name_or_path": getattr(model, "name_or_path", None),
     }
     (root / FOVEA_EXTRA_CONFIG_NAME).write_text(json.dumps(extra_config, indent=2, sort_keys=True) + "\n")
@@ -219,29 +154,21 @@ def load_fovea_extra(model: FoveaForConditionalGeneration, checkpoint_dir: str) 
     from safetensors.torch import load_file
 
     state = load_file(str(weights_path), device="cpu")
-    row_keys = {
+    legacy_token_rows = {
         "model.embed_tokens.weight.fovea_row",
         "lm_head.weight.fovea_row",
-    }
-    module_state = {key: value for key, value in state.items() if key not in row_keys}
-    missing, unexpected = model.load_state_dict(module_state, strict=False)
+    } & state.keys()
+    if legacy_token_rows:
+        raise ValueError(
+            "This checkpoint uses the removed dedicated vocabulary row and cannot be loaded: "
+            f"{sorted(legacy_token_rows)}"
+        )
+    missing, unexpected = model.load_state_dict(state, strict=False)
     relevant_missing = [key for key in missing if is_fovea_extra_key(key)]
     if relevant_missing:
         print(f"Warning: missing Fovea extra keys while loading {weights_path}: {relevant_missing}")
     if unexpected:
         print(f"Warning: unexpected Fovea extra keys while loading {weights_path}: {unexpected}")
-
-    token_id = getattr(model.config, "fovea_token_id", None)
-    if token_id is not None and int(token_id) >= 0:
-        token_id = int(token_id)
-        with torch.no_grad():
-            if "model.embed_tokens.weight.fovea_row" in state:
-                row = state["model.embed_tokens.weight.fovea_row"].to(model.get_input_embeddings().weight)
-                model.get_input_embeddings().weight[token_id].copy_(row)
-            if "lm_head.weight.fovea_row" in state:
-                row = state["lm_head.weight.fovea_row"].to(model.lm_head.weight)
-                model.lm_head.weight[token_id].copy_(row)
-
 
 def print_parameter_summary(model) -> None:
     total = trainable = 0
@@ -259,12 +186,6 @@ def print_parameter_summary(model) -> None:
     print("=== Trainable Parameter Names ===")
     for name in trainable_names:
         print(name)
-    fovea_token_id = getattr(model.config, "fovea_token_id", None)
-    if getattr(model, "_fovea_input_embedding_hook", None) is not None and fovea_token_id is not None:
-        print("=== Partially Trainable Input Embedding Weight ===")
-        print(f"model.language_model.embed_tokens.weight[row {int(fovea_token_id)} only]")
-
-
 def sync_tokenizer_special_tokens_with_model(tokenizer, model: FoveaForConditionalGeneration) -> None:
     """Keep tokenizer, text config, top-level config, and generation config aligned."""
 
@@ -294,7 +215,7 @@ def sync_tokenizer_special_tokens_with_model(tokenizer, model: FoveaForCondition
 
 
 def set_multimodal_token_ids(model: FoveaForConditionalGeneration, tokenizer) -> None:
-    sync_fovea_token_ids(model.config, tokenizer, model)
+    sync_fovea_trigger_ids(model.config, tokenizer)
     model.config.image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
     model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
     model.config.vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -458,6 +379,7 @@ def main() -> None:
     load_fovea_extra(model, fovea_extra_path)
     set_multimodal_token_ids(model, tokenizer)
     model.config.fovea_crop_max_image_tokens = data_args.fovea_crop_max_img_tokens
+    model.config.fovea_crop_min_image_tokens = data_args.fovea_crop_min_img_tokens
     sync_tokenizer_special_tokens_with_model(tokenizer, model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
@@ -490,10 +412,11 @@ def main() -> None:
         vision_packer=vision_packer,
         image_token_id=fovea_model.config.image_token_id,
         system_message=data_args.system_message,
+        fovea_crop_min_image_tokens=data_args.fovea_crop_min_img_tokens,
         fovea_crop_max_image_tokens=data_args.fovea_crop_max_img_tokens,
         model_max_length=training_args.model_max_length,
     )
-    data_collator = DataCollatorForQwen3_5SFT(
+    data_collator = DataCollatorForFoveaSFT(
         tokenizer=tokenizer,
         model_max_length=training_args.model_max_length,
     )

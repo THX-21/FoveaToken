@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
 from ..fovea_crop import crop_from_normalized_box
-from ..tokenizers.tokenization_fovea import FOVEA_TOKEN
+from ..tokenizers.tokenization_fovea import FOVEA_TOOL_CALL
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -63,22 +63,22 @@ def append_visual_placeholders_to_fovea(
     crop_cursor = 0
     for sentence in updated:
         value = str(sentence.get("value", ""))
-        if FOVEA_TOKEN not in value:
+        if sentence.get("from") not in {"gpt", "assistant"} or FOVEA_TOOL_CALL not in value:
             sentence["value"] = value
             continue
         pieces: list[str] = []
         start = 0
         while True:
-            idx = value.find(FOVEA_TOKEN, start)
+            idx = value.find(FOVEA_TOOL_CALL, start)
             if idx < 0:
                 pieces.append(value[start:])
                 break
-            pieces.append(value[start : idx + len(FOVEA_TOKEN)])
+            pieces.append(value[start : idx + len(FOVEA_TOOL_CALL)])
             if crop_cursor >= len(crop_token_counts):
                 raise ValueError("Missing crop token counts for Fovea placeholders.")
-            pieces.append(build_visual_payload(crop_token_counts[crop_cursor]))
+            pieces.append("\n" + build_visual_payload(crop_token_counts[crop_cursor]))
             crop_cursor += 1
-            start = idx + len(FOVEA_TOKEN)
+            start = idx + len(FOVEA_TOOL_CALL)
         sentence["value"] = "".join(pieces)
     if crop_cursor != len(crop_token_counts):
         raise ValueError("Unused crop token counts remain after expanding Fovea placeholders.")
@@ -94,7 +94,7 @@ def build_mm_token_type_ids(input_ids, image_token_id: int, video_token_id: int 
 
 
 def load_training_records(data_path: str) -> list[dict[str, Any]]:
-    """Load VGR parquet records from a file or `data/vgr` directory."""
+    """Load preprocessed training parquet records from a file or directory."""
 
     path = Path(data_path)
     if path.is_dir():
@@ -110,11 +110,11 @@ def load_training_records(data_path: str) -> list[dict[str, Any]]:
             try:
                 import pandas as pd
             except ImportError as exc:
-                raise ImportError("Reading VGR parquet requires pandas and pyarrow.") from exc
+                raise ImportError("Reading training parquet requires pandas and pyarrow.") from exc
             frame = pd.read_parquet(item)
             records.extend(frame.to_dict("records"))
         else:
-            raise ValueError(f"Only VGR parquet training files are supported: {item}")
+            raise ValueError(f"Only parquet training files are supported: {item}")
     return records
 
 
@@ -133,7 +133,7 @@ def parse_vgr_box(box_text: str) -> tuple[float, float, float, float]:
 def replace_vgr_regions_with_fovea(
     text: str,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Convert VGR `<SOT>box<EOT><image>` tags to dedicated `<fovea>` triggers.
+    """Convert VGR `<SOT>box<EOT><image>` tags to Fovea JSON tool calls.
 
     Assistant-side VGR data may also contain orphan `<SOT>/<EOT>` tags or stray
     plain `<image>` markers that do not correspond to a real extra image. Drop
@@ -147,7 +147,7 @@ def replace_vgr_regions_with_fovea(
     def replace(match: re.Match) -> str:
         box = parse_vgr_box(match.group(1))
         queries.append({"box": box})
-        return FOVEA_TOKEN
+        return FOVEA_TOOL_CALL
 
     cleaned_text = ORPHAN_VGR_TAG_RE.sub("", SOT_EOT_IMAGE_RE.sub(replace, text))
     if saw_vgr_markup:
@@ -286,7 +286,9 @@ def encode_chat_template_example(
     """
 
     prompt_conversations = replace_image_tokens_in_conversations(list(conversations), image_token_counts)
-    messages: list[dict[str, Any]] = [{"role": "system", "content": system_message}]
+    messages: list[dict[str, Any]] = []
+    if system_message:
+        messages.append({"role": "system", "content": system_message})
     messages.extend(
         {"role": _conversation_role(sentence["from"]), "content": str(sentence["value"])}
         for sentence in prompt_conversations
@@ -427,26 +429,26 @@ def build_fovea_metadata(
     tokenizer: PreTrainedTokenizerBase,
     query_boxes: Sequence[Sequence[float]],
 ) -> dict[str, torch.Tensor]:
-    """Locate Fovea triggers (<fovea> token) in the tokenized sequence."""
+    """Locate Fovea JSON tool calls in the tokenized sequence."""
 
-    fovea_id = tokenizer.convert_tokens_to_ids(FOVEA_TOKEN)
     if not query_boxes:
         return {
             "fovea_positions": torch.empty((0,), dtype=torch.long),
             "fovea_box_indices": torch.empty((0,), dtype=torch.long),
             "fovea_boxes": torch.empty((0, 4), dtype=torch.float32),
         }
-    if fovea_id < 0:
-        raise ValueError("The <fovea> token must be added to the tokenizer before encoding VGR.")
-
     ids = input_ids.tolist()
-    positions = [idx for idx, token_id in enumerate(ids) if token_id == fovea_id and labels[idx].item() != IGNORE_INDEX]
+    trigger_ids = tokenize_text(tokenizer, FOVEA_TOOL_CALL + "\n")
+    positions = []
+    for start in range(0, len(ids) - len(trigger_ids) + 1):
+        end = start + len(trigger_ids)
+        if ids[start:end] == trigger_ids and all(labels[index].item() != IGNORE_INDEX for index in range(start, end)):
+            positions.append(end - 1)
     if len(positions) != len(query_boxes):
         raise ValueError(
-            "Assistant-side fovea triggers (<fovea>) do not match parsed VGR boxes: "
+            "Assistant-side Fovea tool calls do not match parsed query boxes: "
             f"boxes={len(query_boxes)}, triggers={len(positions)}. "
-            "User-side <|vision_start|> image starts must be ignored, "
-            "while assistant-side <fovea> triggers must remain labeled."
+            "Fovea tool calls must be in supervised assistant text."
         )
 
     return {
@@ -477,16 +479,32 @@ class VisionPacker:
             patch_size = patch_size[-1]
         self.patch_size = int(patch_size)
 
-    def _process(self, image: Image.Image, max_image_tokens: int | None = None) -> tuple[torch.Tensor, torch.LongTensor]:
+    def _process(
+        self,
+        image: Image.Image,
+        max_image_tokens: int | None = None,
+        min_image_tokens: int | None = None,
+    ) -> tuple[torch.Tensor, torch.LongTensor]:
         kwargs = {}
+        if min_image_tokens is not None and max_image_tokens is not None and min_image_tokens > max_image_tokens:
+            raise ValueError("min_image_tokens cannot exceed max_image_tokens.")
+        if min_image_tokens is not None:
+            kwargs["min_pixels"] = (
+                int(min_image_tokens)
+                * self.spatial_merge_size
+                * self.spatial_merge_size
+                * self.patch_size
+                * self.patch_size
+            )
         if max_image_tokens is not None:
-            min_pixels = getattr(self.image_processor, "min_pixels", None)
-            if min_pixels is None:
-                size = getattr(self.image_processor, "size", None)
-                if size is not None:
-                    min_pixels = size.get("shortest_edge")
-            if min_pixels is not None:
-                kwargs["min_pixels"] = int(min_pixels)
+            if "min_pixels" not in kwargs:
+                min_pixels = getattr(self.image_processor, "min_pixels", None)
+                if min_pixels is None:
+                    size = getattr(self.image_processor, "size", None)
+                    if size is not None:
+                        min_pixels = size.get("shortest_edge")
+                if min_pixels is not None:
+                    kwargs["min_pixels"] = int(min_pixels)
             kwargs["max_pixels"] = (
                 int(max_image_tokens)
                 * self.spatial_merge_size
@@ -520,6 +538,7 @@ class LazySupervisedDataset(Dataset):
         image_token_id: int,
         system_message: str = DEFAULT_SYSTEM_MESSAGE,
         fovea_crop_max_image_tokens: int | None = 1024,
+        fovea_crop_min_image_tokens: int | None = 64,
         model_max_length: int | None = None,
     ) -> None:
         self.records = load_training_records(data_path)
@@ -530,6 +549,7 @@ class LazySupervisedDataset(Dataset):
         self.image_token_id = image_token_id
         self.system_message = system_message
         self.fovea_crop_max_image_tokens = fovea_crop_max_image_tokens
+        self.fovea_crop_min_image_tokens = fovea_crop_min_image_tokens
         self.model_max_length = int(model_max_length or getattr(tokenizer, "model_max_length", 0) or 0)
 
     def __len__(self) -> int:
@@ -600,7 +620,11 @@ class LazySupervisedDataset(Dataset):
             crop_grid_list = []
             for box in query_boxes:
                 crop_image = crop_from_normalized_box(source_images[0], box)
-                crop_pixels, crop_grid = self.vision_packer._process(crop_image, max_image_tokens=self.fovea_crop_max_image_tokens)
+                crop_pixels, crop_grid = self.vision_packer._process(
+                    crop_image,
+                    max_image_tokens=self.fovea_crop_max_image_tokens,
+                    min_image_tokens=self.fovea_crop_min_image_tokens,
+                )
                 crop_pixel_values_list.append(crop_pixels)
                 crop_grid_list.append(crop_grid)
                 crop_token_counts.append(image_token_count_from_grid(crop_grid, self.vision_packer.spatial_merge_size))
@@ -653,7 +677,7 @@ class LazySupervisedDataset(Dataset):
 
 
 @dataclass
-class DataCollatorForQwen3_5SFT:
+class DataCollatorForFoveaSFT:
     """Pad text fields and concatenate image fields into a trainer batch."""
 
     tokenizer: PreTrainedTokenizerBase

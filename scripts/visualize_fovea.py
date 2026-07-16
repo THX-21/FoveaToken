@@ -19,12 +19,13 @@ import torch
 from PIL import Image
 
 from fovea_token.fovea_crop import crop_attended_regions, normalize_patch_boxes
+from fovea_token.tokenizers.tokenization_fovea import FOVEA_TOOL_CALL
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize Fovea attention.")
     parser.add_argument("--task", default="chartqa", help="`train` or an lmms-eval task like `mmstar`.")
-    parser.add_argument("--model_name_or_path", default="checkpoints/fovea-vgr-qwen-9b/checkpoint-1302")
+    parser.add_argument("--model_name_or_path", default="Qwen/Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--index", type=int, nargs="+", default=[0,1,2,3,4,5,6,7,8,9,10])
     parser.add_argument("--output_dir", default="outputs/fovea_visualize")
     parser.add_argument("--alpha", type=float, default=0.45)
@@ -32,14 +33,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--device_map", default="cuda:0")
     parser.add_argument("--attn_implementation", default="sdpa")
-    parser.add_argument("--enable_thinking", type=lambda x: x.lower() == "true", default=True)
     parser.add_argument("--force_simple", action="store_true")
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
-    parser.add_argument("--data_path", default="data/vgr/preprocessed")
-    parser.add_argument("--image_folder", default="data/vgr/llava_next_raw_format")
+    parser.add_argument("--data_path", default="data/VLM-R3-data/preprocessed/vlir_sft_12k.parquet")
+    parser.add_argument("--image_folder", default="data/VLM-R3-data/preprocessed")
     parser.add_argument("--disable_fovea_retrieval", type=lambda x: x.lower() == "true", default=False,
                         help="Disable fovea retrieval pipeline.")
     parser.add_argument("--crop", default="true", help="Crop the most-attended regions and save them.")
@@ -238,8 +238,8 @@ def _init_train_state(args):
 
     from fovea_token import FoveaForConditionalGeneration
     from fovea_token.train.sft import FOVEA_EXTRA_WEIGHTS_NAME, load_fovea_extra
-    from fovea_token.tokenizers.tokenization_fovea import sync_fovea_token_ids
-    from fovea_token.train.data import DataCollatorForQwen3_5SFT, LazySupervisedDataset, VisionPacker
+    from fovea_token.tokenizers.tokenization_fovea import sync_fovea_trigger_ids
+    from fovea_token.train.data import DataCollatorForFoveaSFT, LazySupervisedDataset, VisionPacker
     from transformers import AutoProcessor, AutoTokenizer
 
     print("Loading model (once)...")
@@ -268,7 +268,7 @@ def _init_train_state(args):
         fovea_model = model
     if len(tokenizer) != fovea_model.get_input_embeddings().weight.shape[0]:
         raise ValueError("Tokenizer/model vocab mismatch: Fovea must not add or resize token rows.")
-    sync_fovea_token_ids(fovea_model.config, tokenizer, fovea_model)
+    sync_fovea_trigger_ids(fovea_model.config, tokenizer)
     fovea_model.config.image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
     fovea_model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
     fovea_model.config.vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -284,7 +284,7 @@ def _init_train_state(args):
         vision_packer=packer,
         image_token_id=fovea_model.config.image_token_id,
     )
-    collator = DataCollatorForQwen3_5SFT(tokenizer=tokenizer, model_max_length=32768)
+    collator = DataCollatorForFoveaSFT(tokenizer=tokenizer, model_max_length=32768)
     _TRAIN_STATE = (model, tokenizer, processor, dataset, collator)
     return _TRAIN_STATE
 
@@ -303,8 +303,8 @@ def load_train_sample(args, index: int):
     image = Image.open(Path(args.image_folder) / image_name).convert("RGB")
     question, answer = get_sample_qa(record)
 
-    # Insert <fovea> markers into answer at fovea_positions if not already present.
-    if "<fovea>" not in answer:
+    # Insert Fovea tool calls into answer at trigger positions if not already present.
+    if FOVEA_TOOL_CALL not in answer:
         labels = batch["labels"][0]  # [seq_len]
         answer_mask = labels != -100
         answer_start = int(answer_mask.nonzero(as_tuple=True)[0][0].item())
@@ -318,7 +318,7 @@ def load_train_sample(args, index: int):
             offset = max(0, min(offset, len(answer_tokens)))
             prefix = tokenizer.decode(answer_tokens[:offset], skip_special_tokens=False)
             suffix = tokenizer.decode(answer_tokens[offset:], skip_special_tokens=False)
-            answer = prefix + "<fovea>" + suffix
+            answer = prefix + FOVEA_TOOL_CALL + suffix
             answer_tokens = tokenizer.encode(answer, add_special_tokens=False)
 
     history = []
@@ -355,7 +355,6 @@ def load_lmms_eval_sample(args, index: int):
             "device": args.device,
             "device_map": args.device_map,
             "attn_implementation": args.attn_implementation,
-            "enable_thinking": args.enable_thinking,
             "disable_fovea_retrieval": args.disable_fovea_retrieval,
         },
     )
@@ -385,23 +384,7 @@ def load_lmms_eval_sample(args, index: int):
     with torch.no_grad():
         prediction, _token_counts = _run_simple_sample(lmms_model, task, index, question, gen_kwargs)
 
-    # Inject <fovea> markers into prediction text at trigger positions.
-    tokenizer = lmms_model._tokenizer
-    pred_token_ids = tokenizer.encode(prediction, add_special_tokens=False)
     fovea_history = _fovea_metrics_history_from_lmms(lmms_model)
-    trigger_offsets = sorted(
-        [int(entry["trigger_offset"])
-         for entry in fovea_history
-         if entry.get("trigger_offset") is not None],
-        reverse=True,  # process from end to keep earlier offsets valid
-    )
-    for offset in trigger_offsets:
-        offset = min(offset, len(pred_token_ids))
-        prefix = tokenizer.decode(pred_token_ids[:offset], skip_special_tokens=False)
-        suffix = tokenizer.decode(pred_token_ids[offset:], skip_special_tokens=False)
-        prediction = prefix + "<fovea>" + suffix
-        pred_token_ids = tokenizer.encode(prediction, add_special_tokens=False)
-
     history = []
     for call_idx, entry in enumerate(fovea_history):
         attn_mean = entry["fovea_attn_mean"]

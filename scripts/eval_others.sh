@@ -29,7 +29,7 @@ MODEL="${EVAL_MODEL:-qwen2_5_vl}"
 #   mathvista_testmini_solution
 #   mathvista_testmini_format
 # Note: `charvqa` was not found in the current repo. If you meant chart QA, use `chartqa`.
-TASKS="${EVAL_TASKS:-mathvista_testmini_solution}"
+TASKS="${EVAL_TASKS:-hrbench8k,xlrs-lite,textvqa_val,chartqa,vstar_bench,mmstar,mathvista_testmini_solution}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
 [[ -x "${PYTHON_BIN}" ]] || PYTHON_BIN="python"
@@ -41,7 +41,7 @@ NUM_PROCESSES="${EVAL_NUM_PROCESSES:-1}"
 MAIN_PROCESS_PORT="${EVAL_MAIN_PROCESS_PORT:-12345}"
 BALANCED_LIMIT="${EVAL_BALANCED_LIMIT:-true}"
 MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-1024}"
-TASK_BUDGET="${EVAL_TASK_BUDGET:-30}"
+TASK_BUDGET="${EVAL_TASK_BUDGET:-600}"
 EVAL_SUBSET_SEED="${EVAL_SUBSET_SEED:-42}"
 
 MODEL_ARGS_DEFAULT="pretrained=${BASE_MODEL},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION}"

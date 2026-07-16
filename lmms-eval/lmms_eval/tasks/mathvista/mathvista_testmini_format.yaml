@@ -1,6 +1,7 @@
-dataset_path: AI4Math/MathVista
+dataset_path: data/eval/MathVista
 dataset_kwargs:
   token: True
+  load_from_disk: true
 task: "mathvista_testmini_format"
 test_split: testmini
 tag:

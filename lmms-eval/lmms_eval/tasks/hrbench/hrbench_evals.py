@@ -12,6 +12,8 @@ class HRBenchEval:
 
     if API_TYPE == "openai":
         API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
+        if API_URL.rstrip("/").endswith("/v1"):
+            API_URL = API_URL.rstrip("/") + "/chat/completions"
         API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_API_KEY")
         headers = {
             "Authorization": f"Bearer {API_KEY}",

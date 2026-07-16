@@ -1,4 +1,6 @@
-dataset_path: lmms-lab/textvqa
+dataset_path: data/eval/textvqa
+dataset_kwargs:
+  load_from_disk: true
 output_type: generate_until
 doc_to_visual: !function utils.textvqa_doc_to_visual
 doc_to_text: !function utils.textvqa_doc_to_text

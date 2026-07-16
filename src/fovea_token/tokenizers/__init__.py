@@ -1,9 +1,9 @@
 from .tokenization_fovea import (
-    FOVEA_TOKEN,
-    sync_fovea_token_ids,
+    FOVEA_TOOL_CALL,
+    sync_fovea_trigger_ids,
 )
 
 __all__ = [
-    "FOVEA_TOKEN",
-    "sync_fovea_token_ids",
+    "FOVEA_TOOL_CALL",
+    "sync_fovea_trigger_ids",
 ]

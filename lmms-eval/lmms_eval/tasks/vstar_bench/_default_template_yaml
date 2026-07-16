@@ -1,4 +1,7 @@
-dataset_path: lmms-lab/vstar-bench
+dataset_path: data/eval/vstar-bench
+dataset_kwargs:
+  token: True
+  load_from_disk: true
 task: "vstar_bench"
 test_split: test
 output_type: generate_until

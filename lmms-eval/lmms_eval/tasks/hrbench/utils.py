@@ -66,7 +66,9 @@ def hrbench_process_results(doc, results):
     options = hrbench_doc_to_options(doc)
     question = doc["question"]
     resp_dic = hrbench_evaluator.get_chat_response({"question": question, "options": options, "prediction": pred})
-    gpt_prediction = resp_dic["gpt_prediction"]
+    gpt_prediction = resp_dic.get("gpt_prediction")
+    if gpt_prediction is None:
+        raise RuntimeError("HRBench judge did not return an option after retries. Check the judge API endpoint and credentials.")
     category = doc["category"]
     cycle_category = doc["cycle_category"]
 

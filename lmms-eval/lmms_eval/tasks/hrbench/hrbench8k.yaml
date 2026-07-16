@@ -1,7 +1,6 @@
-dataset_path: DreamMr/HR-Bench
-dataset_name: hrbench_version_split
+dataset_path: data/eval/hrbench
 dataset_kwargs:
-  token: True
+  load_from_disk: true
 task: "hrbench8k"
 test_split: hrbench_8k
 output_type: generate_until

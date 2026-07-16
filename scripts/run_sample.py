@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="fovea", help="lmms-eval model name")
     parser.add_argument(
         "--model_args",
-        default="pretrained=checkpoints/fovea-vgr-qwen-9b/checkpoint-1302,device=cuda:0,device_map=cuda:0,attn_implementation=sdpa,enable_thinking=True,max_image_tokens=2048,disable_fovea_retrieval=False",
+        default="pretrained=Qwen/Qwen2.5-VL-7B-Instruct,device=cuda:0,device_map=cuda:0,attn_implementation=sdpa,max_image_tokens=2048,disable_fovea_retrieval=False",
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")
@@ -127,16 +127,6 @@ def _run_simple_sample(model, task, doc_idx: int, context: str, gen_kwargs: dict
     return text, token_counts
 
 
-def _restore_logged_output(model, text: str) -> str:
-    from lmms_eval.api.reasoning import restore_prefilled_reasoning_prefix
-
-    return restore_prefilled_reasoning_prefix(
-        text,
-        [["<think>", "</think>"]],
-        getattr(model, "enable_thinking", None),
-    )
-
-
 def _fovea_metrics_history(model) -> list:
     inner = getattr(model, "model", None)
     get_base_model = getattr(inner, "get_base_model", None)
@@ -162,18 +152,12 @@ def _annotate_fovea_triggers(text: str, tokenizer, trigger_offsets: list[int]) -
     char_pos = [0]
     for tid in ids:
         char_pos.append(char_pos[-1] + len(tokenizer.decode([tid])))
-    # Skip prefilled <think> token(s) at the start so that trigger_offset=0
-    # maps to the first *generated* token, not the prefilled one.
-    gen_start = 0
-    if text.startswith("<think>"):
-        gen_start = len(tokenizer("<think>", add_special_tokens=False).input_ids)
     result = []
     oi = 0
     for i, (s, e) in enumerate(zip(char_pos[:-1], char_pos[1:])):
-        if i >= gen_start:
-            while oi < len(offsets) and offsets[oi] == i - gen_start:
-                result.append("[FOVEA]")
-                oi += 1
+        while oi < len(offsets) and offsets[oi] == i:
+            result.append("[FOVEA]")
+            oi += 1
         result.append(text[s:e])
     while oi < len(offsets):
         result.append("[FOVEA]")

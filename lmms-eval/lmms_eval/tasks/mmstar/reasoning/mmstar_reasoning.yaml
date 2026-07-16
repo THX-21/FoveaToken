@@ -1,7 +1,8 @@
-dataset_path: Lin-Chen/MMStar
+dataset_path: data/eval/mmstar
 task: "mmstar_reasoning"
 dataset_kwargs:
   token: True
+  load_from_disk: true
 test_split: val
 output_type: generate_until
 doc_to_visual: !function utils.mmstar_doc_to_visual

@@ -17,12 +17,12 @@ from lmms_eval.api.instance import GenerationResult, Instance, TokenCounts
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.model_utils.progress import make_progress
-from lmms_eval.models.simple.qwen3_vl import Qwen3_VL
+from lmms_eval.models.simple.qwen2_5_vl import Qwen2_5_VL
 
 from fovea_token import FoveaForConditionalGeneration
 from fovea_token.train.data import VisionPacker
 from fovea_token.train.sft import FOVEA_EXTRA_WEIGHTS_NAME, load_fovea_extra
-from fovea_token.tokenizers.tokenization_fovea import sync_fovea_token_ids
+from fovea_token.tokenizers.tokenization_fovea import FOVEA_TOOL_CALL, sync_fovea_trigger_ids
 
 
 MODEL_WEIGHT_FILENAMES = {
@@ -34,7 +34,7 @@ MODEL_WEIGHT_FILENAMES = {
 
 
 @register_model("fovea")
-class Fovea(Qwen3_VL):
+class Fovea(Qwen2_5_VL):
     """lmms-eval adapter for the local Fovea implementation."""
 
     @staticmethod
@@ -79,7 +79,7 @@ class Fovea(Qwen3_VL):
 
     def __init__(
         self,
-        pretrained: str = "Qwen/Qwen3.5-4B",
+        pretrained: str = "Qwen/Qwen2.5-VL-7B-Instruct",
         device: Optional[str] = "cuda",
         device_map: Optional[str] = "auto",
         batch_size: Optional[Union[int, str]] = 1,
@@ -87,9 +87,9 @@ class Fovea(Qwen3_VL):
         attn_implementation: Optional[str] = "sdpa",
         system_prompt: Optional[str] = "You are a helpful assistant.",
         interleave_visuals: Optional[bool] = False,
-        enable_thinking: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
         max_image_tokens: int | None = 512,
+        fovea_crop_min_image_tokens: int | None = 64,
         fovea_crop_max_image_tokens: int | None = 1024,
         disable_fovea_retrieval: Optional[bool] = False,
         **kwargs,
@@ -125,6 +125,7 @@ class Fovea(Qwen3_VL):
             from peft import PeftModel
 
             base_model_name = self._lora_base_model_name(pretrained)
+            tokenizer_source = base_model_name
             self._model = FoveaForConditionalGeneration.from_pretrained(base_model_name, **model_kwargs)
             if (Path(pretrained).expanduser() / FOVEA_EXTRA_WEIGHTS_NAME).exists():
                 load_fovea_extra(self._model, pretrained)
@@ -133,7 +134,7 @@ class Fovea(Qwen3_VL):
             self._model = FoveaForConditionalGeneration.from_pretrained(pretrained, **model_kwargs)
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
         fovea_model = self._model.get_base_model() if checkpoint_mode == "lora" else self._model
-        sync_fovea_token_ids(fovea_model.config, self._tokenizer, fovea_model)
+        sync_fovea_trigger_ids(fovea_model.config, self._tokenizer)
         fovea_model.config.image_token_id = self._tokenizer.convert_tokens_to_ids("<|image_pad|>")
         fovea_model.config.video_token_id = self._tokenizer.convert_tokens_to_ids("<|video_pad|>")
         fovea_model.config.vision_start_token_id = self._tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -148,9 +149,9 @@ class Fovea(Qwen3_VL):
         )
         self.vision_packer = vision_packer
         fovea_model.config.fovea_crop_max_image_tokens = int(fovea_crop_max_image_tokens)
+        fovea_model.config.fovea_crop_min_image_tokens = int(fovea_crop_min_image_tokens)
         self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
 
-        self.enable_thinking = enable_thinking
         if reasoning_prompt:
             self.reasoning_prompt = reasoning_prompt.replace("\\n", "\n")
         else:
@@ -184,10 +185,35 @@ class Fovea(Qwen3_VL):
             self._world_size = 1
 
     def _build_generate_kwargs(self, gen_kwargs):
-        generate_kwargs = super()._build_generate_kwargs(gen_kwargs)
+        current = {
+            "max_new_tokens": 128,
+            "temperature": 0.0,
+            "top_p": None,
+            "num_beams": 1,
+            **gen_kwargs,
+        }
+        do_sample = current.get("temperature", 0) > 0
+        generate_kwargs = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "max_new_tokens": current["max_new_tokens"],
+            "use_cache": self.use_cache,
+            "do_sample": do_sample,
+        }
+        for key in ("temperature", "top_p", "top_k", "num_beams"):
+            value = current.get(key)
+            if value is not None and (do_sample or key == "num_beams"):
+                generate_kwargs[key] = value
         if self.disable_fovea_retrieval:
             generate_kwargs["disable_fovea_retrieval"] = True
         return generate_kwargs
+
+    def _apply_chat_template(self, batched_messages):
+        return self.processor.apply_chat_template(
+            batched_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
     def _build_processor_image_kwargs(self):
         max_image_tokens = getattr(self.vision_packer, "max_image_tokens", None)
@@ -360,7 +386,7 @@ class Fovea(Qwen3_VL):
                             split,
                             int(generated_ids.numel()),
                             len(ans),
-                            ans.count("<fovea>"),
+                            ans.count(FOVEA_TOOL_CALL),
                             elapsed,
                             snippet,
                         )
