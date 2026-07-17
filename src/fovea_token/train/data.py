@@ -28,6 +28,7 @@ ORPHAN_VGR_TAG_RE = re.compile(r"<SOT>|<EOT>")
 THINK_START = "<think>"
 THINK_END = "</think>"
 FOVEA_TOOL_LINE_INDENT_RE = re.compile(r'(?m)^[ \t]+(?=\{"fovea"\})')
+FOVEA_TOOL_INLINE_RE = re.compile(r'(?<!\n)[ \t]*\{"fovea"\}')
 
 
 def image_token_count_from_grid(image_grid_thw, merge_size: int) -> int:
@@ -68,6 +69,7 @@ def append_visual_placeholders_to_fovea(
             sentence["value"] = value
             continue
         value = FOVEA_TOOL_LINE_INDENT_RE.sub("", value)
+        value = FOVEA_TOOL_INLINE_RE.sub("\n" + FOVEA_TOOL_CALL, value)
         pieces: list[str] = []
         start = 0
         while True:
