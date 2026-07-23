@@ -103,6 +103,15 @@ def _redact_eval_config_secrets(value):
     return value
 
 
+def _postprocess_response_for_scoring(model, response, reasoning_tags, task_name=None):
+    postprocessor = getattr(model, "postprocess_response_for_scoring", None)
+    if callable(postprocessor):
+        return postprocessor(response, task_name)
+    if reasoning_tags is not None:
+        return strip_reasoning_tags(response, reasoning_tags)
+    return response
+
+
 def _clone_padding_request(pad_source: Instance) -> Instance:
     pad_instance = copy.copy(pad_source)
     pad_instance.metadata = dict(pad_source.metadata or {})
@@ -1209,15 +1218,15 @@ def evaluate(
                     pbar.update(1)
                     continue
 
-                # Strip reasoning tags before scoring
-                if reasoning_tags is not None:
-                    for req in requests:
-                        raw_resp = req.filtered_resps[filter_key]
-                        req.raw_filtered_resps[filter_key] = raw_resp
-                        if isinstance(raw_resp, str):
-                            req.filtered_resps[filter_key] = strip_reasoning_tags(raw_resp, reasoning_tags)
-                        elif isinstance(raw_resp, list):
-                            req.filtered_resps[filter_key] = [strip_reasoning_tags(r, reasoning_tags) if isinstance(r, str) else r for r in raw_resp]
+                for req in requests:
+                    raw_resp = req.filtered_resps[filter_key]
+                    req.raw_filtered_resps[filter_key] = raw_resp
+                    if isinstance(raw_resp, str):
+                        req.filtered_resps[filter_key] = _postprocess_response_for_scoring(lm, raw_resp, reasoning_tags, task_output.task_name)
+                    elif isinstance(raw_resp, list):
+                        req.filtered_resps[filter_key] = [
+                            _postprocess_response_for_scoring(lm, response, reasoning_tags, task_output.task_name) if isinstance(response, str) else response for response in raw_resp
+                        ]
 
                 metrics = task.process_results(doc, [req.filtered_resps[filter_key] for req in requests])
 
@@ -1278,6 +1287,8 @@ def evaluate(
                             )
                         ),
                     }
+                    if getattr(lm, "preserve_raw_resps", False):
+                        example["preserve_raw_resps"] = True
                     if input_media:
                         example["input_media"] = input_media
                     example.update(metrics)

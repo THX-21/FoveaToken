@@ -10,13 +10,15 @@ import sys
 import time
 from pathlib import Path
 
+FOVEA_REASONING_PROMPT = r'\nYou need to first think about the reasoning process in your mind and then provide the answer. When thinking you should call the "fovea" tool (format: {"fovea"}) to focus on key areas in the image. The reasoning process and the answer are included in the <think> </think> and <answer> </answer> tags respectively.'
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run lmms-eval samples through a chosen lmms-eval model.")
     parser.add_argument("--model", default="fovea", help="lmms-eval model name")
     parser.add_argument(
         "--model_args",
-        default="pretrained=Qwen/Qwen2.5-VL-7B-Instruct,device=cuda:0,device_map=cuda:0,attn_implementation=sdpa,max_image_tokens=2048,disable_fovea_retrieval=False",
+        default=f"pretrained=checkpoints/fovea-vlmr3-json-qwen2.5-vl-7b/checkpoint-1445,device=cuda:0,device_map=cuda:0,attn_implementation=sdpa,max_image_tokens=2048,disable_fovea_retrieval=False,prefill_think=False,reasoning_prompt={FOVEA_REASONING_PROMPT}",
         help="Comma-separated lmms-eval model args, e.g. pretrained=...,device=cuda:0",
     )
     parser.add_argument("--force_simple", action="store_true", help="Force the simple model/task path")

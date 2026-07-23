@@ -10,8 +10,8 @@ export OPENAI_API_URL="https://api.deepseek.com/v1"
 export API_TYPE="openai"
 export MODEL_VERSION="deepseek-v4-flash"
 
-FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vlmr3-json-qwen2.5-vl-7b}"
-LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-}"
+FULL_CHECKPOINT="${EVAL_FULL_CHECKPOINT:-Qwen/Qwen2.5-VL-7B-Instruct}"
+LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-${PROJECT_ROOT}/checkpoints/fovea-vlmr3-json-qwen2.5-vl-7b/checkpoint-1445}"
 # Common eval task names:
 #   hrbench8k      -> single task
 #   xlrs-lite      -> single task
@@ -28,7 +28,8 @@ LORA_CHECKPOINT="${EVAL_LORA_CHECKPOINT:-}"
 #   mathvista_testmini_solution
 #   mathvista_testmini_format
 # Note: `charvqa` was not found in the current repo. If you meant chart QA, use `chartqa`.
-TASKS="${EVAL_TASKS:-mathvista_testmini_solution}"
+# TASKS="${EVAL_TASKS:-hrbench8k,xlrs-lite,textvqa_val,chartqa,vstar_bench,mmstar,mathvista_testmini_solution}"
+TASKS="${EVAL_TASKS:-vstar_bench,mmstar}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
 [[ -x "${PYTHON_BIN}" ]] || PYTHON_BIN="python"
@@ -42,11 +43,14 @@ BALANCED_LIMIT="${EVAL_BALANCED_LIMIT:-true}"
 MAX_IMG_TOKENS="${EVAL_MAX_IMG_TOKENS:-2048}"
 MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-1024}"
 DISABLE_FOVEA_RETRIEVAL="${EVAL_DISABLE_FOVEA_RETRIEVAL:-false}"
+PREFILL_THINK="${EVAL_PREFILL_THINK:-true}"
+DEFAULT_FOVEA_REASONING_PROMPT='\nYou need to first think about the reasoning process in your mind and then provide the answer. When thinking you should call the "fovea" tool (format: {"fovea"}) to focus on key areas in the image. The reasoning process and the answer are included in the <think> </think> and <answer> </answer> tags respectively.'
+FOVEA_REASONING_PROMPT="${EVAL_FOVEA_REASONING_PROMPT:-${DEFAULT_FOVEA_REASONING_PROMPT}}"
 TASK_BUDGET="${EVAL_TASK_BUDGET:-600}"
 EVAL_SUBSET_SEED="${EVAL_SUBSET_SEED:-42}"
 
 RESOLVED_CHECKPOINT="${LORA_CHECKPOINT:-${FULL_CHECKPOINT}}"
-MODEL_ARGS="pretrained=${RESOLVED_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},disable_fovea_retrieval=${DISABLE_FOVEA_RETRIEVAL},max_image_tokens=${MAX_IMG_TOKENS}"
+MODEL_ARGS="pretrained=${RESOLVED_CHECKPOINT},device=${DEVICE},device_map=${DEVICE_MAP},attn_implementation=${ATTN_IMPLEMENTATION},disable_fovea_retrieval=${DISABLE_FOVEA_RETRIEVAL},prefill_think=${PREFILL_THINK},max_image_tokens=${MAX_IMG_TOKENS},reasoning_prompt=${FOVEA_REASONING_PROMPT}"
 LOG_SUFFIX_DEFAULT="$(basename "${RESOLVED_CHECKPOINT}")"
 LOG_SUFFIX="${EVAL_LOG_SUFFIX:-${LOG_SUFFIX_DEFAULT}}"
 ACCELERATE_BIN="$(command -v accelerate || true)"
@@ -68,6 +72,8 @@ echo "[eval] BALANCED_LIMIT=${BALANCED_LIMIT}"
 echo "[eval] MAX_IMG_TOKENS=${MAX_IMG_TOKENS}"
 echo "[eval] MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
 echo "[eval] DISABLE_FOVEA_RETRIEVAL=${DISABLE_FOVEA_RETRIEVAL}"
+echo "[eval] PREFILL_THINK=${PREFILL_THINK}"
+echo "[eval] FOVEA_REASONING_PROMPT=${FOVEA_REASONING_PROMPT}"
 echo "[eval] TASK_BUDGET=${TASK_BUDGET}"
 echo "[eval] EVAL_SUBSET_SEED=${EVAL_SUBSET_SEED}"
 echo "[eval] LOG_SUFFIX=${LOG_SUFFIX}"

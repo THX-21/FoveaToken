@@ -27,6 +27,15 @@ from lmms_eval.utils import (
 )
 
 
+def _drop_redundant_resps(sample: dict) -> None:
+    if sample.pop("preserve_raw_resps", False):
+        return
+    if sample["resps"] == sample["filtered_resps"]:
+        sample.pop("resps")
+    elif isinstance(sample["resps"], list) and len(sample["resps"]) == 1 and sample["resps"][0] == sample["filtered_resps"]:
+        sample.pop("resps")
+
+
 @dataclass(init=False)
 class GeneralConfigTracker:
     """
@@ -277,10 +286,7 @@ class EvaluationTracker:
                     if isinstance(sample["filtered_resps"], list) and len(sample["filtered_resps"]) == 1:
                         sample["filtered_resps"] = sample["filtered_resps"][0]
 
-                    if sample["resps"] == sample["filtered_resps"]:
-                        sample.pop("resps")
-                    elif isinstance(sample["resps"], list) and len(sample["resps"]) == 1 and sample["resps"][0] == sample["filtered_resps"]:
-                        sample.pop("resps")
+                    _drop_redundant_resps(sample)
                     sample["target"] = str(sample["target"])
                     sample.pop("arguments")
                     sample.pop("doc")

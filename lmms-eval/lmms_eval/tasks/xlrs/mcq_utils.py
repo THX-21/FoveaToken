@@ -56,29 +56,23 @@ def extract_characters_regex(s, choices=["(A)", "(B)", "(C)", "(D)", "(E)"]):
     if type(s) is dict:
         s = ""
     s = s.strip()
-    answer_prefixes = [
-        "The best answer is",
-        "The correct answer is",
-        "The answer is",
-        "The answer",
-        "The best option isThe correct option is",
-        "Best answer:Best option:",
-    ]
-    for answer_prefix in answer_prefixes:
-        s = s.replace(answer_prefix, "")
+    if not s:
+        return ""
 
-    if not re.search("[ABCDE]", s):
-        return ""
-    matches = re.findall(r"\(([a-eA-E])\)", s)
-    if len(matches) == 0:
-        matches = re.findall(r"(?:^|\s)?([a-eA-E])(?:$|[\s,.])?", s)
-    if len(matches) == 0:
-        matches = re.findall(r"[a-eA-E]", s)
-    if len(matches) == 0:
-        return ""
-    else:
-        matches = set(mat.upper() for mat in matches)
-        return "".join(matches)
+    answer_matches = list(
+        re.finditer(r"(?:final answer|the best answer|the correct answer|the answer|best option|correct option)\s*(?:is)?\s*[:：]?\s*(.+)$", s, re.IGNORECASE | re.MULTILINE)
+    )
+    if answer_matches:
+        s = answer_matches[-1].group(1).strip()
+
+    json_match = re.fullmatch(r'\{\s*"(?:answer|option)"\s*:\s*"?([A-Ea-e])"?\s*\}', s)
+    if json_match:
+        return json_match.group(1).upper()
+
+    matches = re.findall(r"\(([A-Ea-e])\)", s)
+    if not matches:
+        matches = re.findall(r"(?<![A-Za-z])([A-Ea-e])(?![A-Za-z])", s)
+    return "".join(dict.fromkeys(match.upper() for match in matches))
 
 
 def xlrs_process_results(doc, results):

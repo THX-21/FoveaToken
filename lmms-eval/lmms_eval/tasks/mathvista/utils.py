@@ -59,7 +59,11 @@ def mathvista_process_results(doc, results):
 
     prediction = mathvista_evaluator.normalize_extracted_answer(extraction, problem["choices"], problem["question_type"], problem["answer_type"], problem["precision"])
     # set test set answer to None
-    true_false = mathvista_evaluator.safe_equal(prediction, problem["answer"]) if problem["answer"] is not None else False
+    true_false = (
+        mathvista_evaluator.safe_equal(prediction, problem["answer"], problem["precision"])
+        if problem["answer"] is not None
+        else False
+    )
 
     result = {
         "question_id": doc["pid"],

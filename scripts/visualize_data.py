@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-"""Visualize training data quality — image + QA with fovea boxes overlaid."""
+"""Visualize training or lmms-eval benchmark samples."""
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
-import re
+import sys
 import textwrap
 from pathlib import Path
 
@@ -16,160 +17,205 @@ import pandas as pd
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "lmms-eval"))
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Visualize training data samples.")
+    parser = argparse.ArgumentParser(description="Visualize training or lmms-eval benchmark samples.")
+    parser.add_argument(
+        "--task",
+        nargs="+",
+        default=["train"],
+        help="`train` and/or lmms-eval task names, such as `chartqa textvqa_val`.",
+    )
+    parser.add_argument("--index", type=int, nargs="*", default=None, help="Sample indices for every task.")
+    parser.add_argument("--num_samples", type=int, default=10, help="Random samples per task; overrides --index.")
+    parser.add_argument("--output_dir", default="outputs/data_visualize")
+    parser.add_argument("--random_seed", type=int, default=42)
     parser.add_argument("--data_path", default="data/VLM-R3-data/preprocessed/vlir_sft_12k.parquet")
     parser.add_argument("--image_folder", default="data/VLM-R3-data/preprocessed")
-    parser.add_argument("--index", type=int, nargs="*", default=None)
-    parser.add_argument("--num_samples", type=int, default=10, help="Randomly sample N records (overrides --index)")
-    parser.add_argument("--output_dir", default="outputs/data_visualize")
+    parser.add_argument("--model_type", choices=("simple", "chat"), default="simple",
+                        help="lmms-eval model implementation type used when resolving tasks.")
+    parser.add_argument("--model_name", default="fovea", help="Model name used when resolving lmms-eval tasks.")
     parser.add_argument("--box_color", default="#FF4444")
     parser.add_argument("--box_alpha", type=float, default=0.3)
     parser.add_argument("--box_linewidth", type=float, default=2.0)
     parser.add_argument("--title_width", type=int, default=120)
-    parser.add_argument("--random_seed", type=int, default=42)
     return parser.parse_args()
 
 
-def wrap_text(text: str, width: int = 100) -> str:
+def wrap_text(text: str, width: int) -> str:
     lines = []
     for block in text.splitlines() or [""]:
         block = " ".join(block.split())
-        if not block:
-            lines.append("")
-            continue
         lines.extend(textwrap.wrap(block, width=width) or [""])
     return "\n".join(lines)
 
 
-def highlight_fovea(text: str) -> str:
-    """Replace the current Fovea trigger with a visible marker."""
-    return text.replace('{"fovea"}', " [FOVEA] ")
+def select_indices(total: int, args: argparse.Namespace, seed_offset: int) -> list[int]:
+    if args.num_samples > 0:
+        rng = np.random.default_rng(args.random_seed + seed_offset)
+        return sorted(rng.choice(total, size=min(args.num_samples, total), replace=False).tolist())
+    if args.index:
+        return [index for index in args.index if 0 <= index < total]
+    return list(range(min(10, total)))
 
 
-def render_sample(sample: dict, image_folder: Path, args) -> np.ndarray | None:
-    image_path = image_folder / sample["image"]
-    if not image_path.exists():
-        print(f"  SKIP: image not found {image_path}")
-        return None
+def _as_images(visuals) -> list[Image.Image]:
+    if isinstance(visuals, Image.Image):
+        return [visuals]
+    return [image for image in visuals if isinstance(image, Image.Image)]
 
-    image = Image.open(image_path).convert("RGB")
-    img_w, img_h = image.size
 
-    fig, ax = plt.subplots(figsize=(16, 12))
-    ax.imshow(np.asarray(image))
-    ax.axis("off")
+def _draw_boxes(ax, boxes, image_size: tuple[int, int], args: argparse.Namespace) -> None:
+    image_width, image_height = image_size
+    for index, box in enumerate(boxes):
+        x1, y1, x2, y2 = np.asarray(box, dtype=float).flatten()[:4]
+        rect = mpatches.Rectangle(
+            (x1 * image_width, y1 * image_height),
+            (x2 - x1) * image_width,
+            (y2 - y1) * image_height,
+            linewidth=args.box_linewidth,
+            edgecolor=args.box_color,
+            facecolor=args.box_color,
+            alpha=args.box_alpha,
+        )
+        ax.add_patch(rect)
+        ax.text(x1 * image_width, y1 * image_height - 4, f"box {index}", fontsize=8, color=args.box_color)
 
-    # Draw fovea query boxes
-    boxes = sample.get("fovea_query_boxes", [])
-    if len(boxes) > 0:
-        for i, box in enumerate(boxes):
-            box = np.asarray(box).flatten()
-            x1, y1, x2, y2 = float(box[0]) * img_w, float(box[1]) * img_h, float(box[2]) * img_w, float(box[3]) * img_h
-            rect = mpatches.Rectangle(
-                (x1, y1), x2 - x1, y2 - y1,
-                linewidth=args.box_linewidth, edgecolor=args.box_color,
-                facecolor=args.box_color, alpha=args.box_alpha,
-            )
-            ax.add_patch(rect)
-            ax.text(x1, y1 - 4, f"box {i}", fontsize=8, color=args.box_color,
-                    fontweight="bold", va="bottom", ha="left")
 
-    # Parse conversations
-    convs = sample.get("conversations", [])
-    question = ""
-    answer = ""
-    for turn in convs:
-        role = turn.get("from", "")
+def render_sample(
+    images: list[Image.Image],
+    question: str,
+    answer: str,
+    title: str,
+    args: argparse.Namespace,
+    boxes: list | None = None,
+):
+    details = [title, "", "[QUESTION]", wrap_text(question, args.title_width)]
+    if answer:
+        details.extend(["", "[ANSWER]", wrap_text(answer, args.title_width)])
+    detail_text = "\n".join(details)
+    text_height = max(3.0, 0.16 * (detail_text.count("\n") + 1))
+
+    figure = plt.figure(figsize=(12 * len(images), 12 + text_height))
+    grid = figure.add_gridspec(2, len(images), height_ratios=(12, text_height), hspace=0.04)
+    for index, image in enumerate(images):
+        axis = figure.add_subplot(grid[0, index])
+        axis.imshow(np.asarray(image.convert("RGB")))
+        axis.axis("off")
+        if boxes is not None and len(boxes) > 0 and index == 0:
+            _draw_boxes(axis, boxes, image.size, args)
+
+    text_axis = figure.add_subplot(grid[1, :])
+    text_axis.axis("off")
+    text_axis.text(0, 1, detail_text, fontsize=9, va="top", ha="left", family="monospace")
+    figure.subplots_adjust(left=0.02, right=0.98, top=0.99, bottom=0.02)
+    return figure
+
+
+def _train_question_answer(sample: dict) -> tuple[str, str]:
+    question_parts = []
+    answer_parts = []
+    for turn in sample.get("conversations", []):
         value = str(turn.get("value", ""))
-        if role in ("human", "user"):
-            question = value.replace("<image>", "").strip()
-        elif role in ("gpt", "assistant"):
-            answer = value
+        if turn.get("from") in {"human", "user"}:
+            question_parts.append(value.replace("<image>", "").strip())
+        elif turn.get("from") in {"gpt", "assistant"}:
+            answer_parts.append(value.replace('{"fovea"}', "[FOVEA]"))
+    return "\n".join(question_parts), "\n".join(answer_parts)
 
-    n_fovea = answer.count('{"fovea"}')
-    n_boxes = len(boxes)
 
-    source = sample.get("_source", "?")
-    orig_idx = sample.get("_orig_idx", "?")
-    title_lines = [
-        f"Sample: {sample['image']}  |  Source: {source}  orig_idx={orig_idx}",
-        f"Fovea tokens: {n_fovea}  |  Boxes: {n_boxes}",
-        f"",
-        f"[QUESTION]",
-        wrap_text(question, args.title_width),
-        f"",
-        f"[ANSWER]",
-        wrap_text(highlight_fovea(answer), args.title_width),
-    ]
-    title = "\n".join(title_lines)
-    ax.set_title(title, fontsize=9, loc="left", pad=12, fontfamily="monospace")
+def visualize_train(args: argparse.Namespace, output_dir: Path, seed_offset: int) -> None:
+    data_path = Path(args.data_path)
+    image_folder = Path(args.image_folder)
+    dataframe = pd.read_parquet(data_path)
+    index_path = data_path.with_name(data_path.stem + "_index.json")
+    index_map = json.loads(index_path.read_text()) if index_path.exists() else None
+    indices = select_indices(len(dataframe), args, seed_offset)
 
-    fig.tight_layout()
-    return fig
+    print(f"\n[train] {len(dataframe)} samples; visualizing {len(indices)}")
+    for output_index, dataset_index in enumerate(indices):
+        sample = dataframe.iloc[dataset_index].to_dict()
+        image_path = image_folder / sample["image"]
+        if not image_path.exists():
+            print(f"  SKIP {dataset_index}: image not found: {image_path}")
+            continue
+        source = index_map[dataset_index]["source"] if index_map else "train"
+        original_index = index_map[dataset_index]["orig_idx"] if index_map else dataset_index
+        question, answer = _train_question_answer(sample)
+        boxes = sample.get("fovea_query_boxes", [])
+        title = f"Task: train | sample={dataset_index} | source={source} | original={original_index}\nFovea boxes: {len(boxes)}"
+        figure = render_sample([Image.open(image_path).convert("RGB")], question, answer, title, args, boxes)
+        output_path = output_dir / "train" / f"sample_{output_index:05d}_{source}_{original_index}.png"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(figure)
+        print(f"  Saved: {output_path}")
+
+
+def init_eval_task(task_name: str, args: argparse.Namespace, task_manager):
+    from lmms_eval.tasks import get_task_dict
+
+    task_dict = get_task_dict(task_name, task_manager=task_manager, task_type=args.model_type)
+    if task_name not in task_dict:
+        raise ValueError(f"Task '{task_name}' not found: {sorted(task_dict)}")
+    return task_dict[task_name]
+
+
+def format_eval_answer(task, document: dict) -> str:
+    target = task.doc_to_target(document)
+    if isinstance(target, str) and target in document:
+        target = document[target]
+    elif isinstance(target, str) and document.get("answers"):
+        target = None
+    if target is None and document.get("answers"):
+        counts = Counter(str(answer) for answer in document["answers"])
+        return "Reference answers: " + ", ".join(f"{answer} ({count})" for answer, count in counts.most_common())
+    if isinstance(target, (list, tuple)):
+        return ", ".join(str(item) for item in target)
+    return "" if target is None else str(target)
+
+
+def visualize_eval_task(task_name: str, args: argparse.Namespace, output_dir: Path, seed_offset: int, task_manager) -> None:
+    task = init_eval_task(task_name, args, task_manager)
+    docs = task.task_docs
+    indices = select_indices(len(docs), args, seed_offset)
+    print(f"\n[{task_name}] {len(docs)} samples; visualizing {len(indices)}")
+
+    for output_index, document_index in enumerate(indices):
+        document = docs[document_index]
+        images = _as_images(task.doc_to_visual(document))
+        if not images:
+            print(f"  SKIP {document_index}: task returned no PIL images")
+            continue
+        question = str(task.doc_to_text(document))
+        answer = format_eval_answer(task, document)
+        title = f"Task: {task_name} | sample={document_index} | images={len(images)}"
+        figure = render_sample(images, question, answer, title, args)
+        output_path = output_dir / task_name / f"sample_{output_index:05d}_{document_index}.png"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(figure)
+        print(f"  Saved: {output_path}")
 
 
 def main() -> None:
     args = parse_args()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    eval_tasks = [task_name for task_name in args.task if task_name != "train"]
+    task_manager = None
+    if eval_tasks:
+        from lmms_eval.tasks import TaskManager
 
-    df = pd.read_parquet(args.data_path)
-    image_folder = Path(args.image_folder)
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+        task_manager = TaskManager(model_name=args.model_name)
 
-    # Load an optional index file for source tracing.
-    data_path = Path(args.data_path)
-    index_path = data_path.parent / data_path.name.replace(".parquet", "_index.json")
-    index_map: list[dict] | None = None
-    if index_path.exists():
-        import json
-        with open(index_path) as f:
-            index_map = json.load(f)
-
-    print(f"Dataset: {len(df)} samples, columns: {list(df.columns)}")
-    if index_map:
-        print(f"Index: {len(index_map)} entries")
-    print(f"Image folder: {image_folder}")
-
-    if args.num_samples > 0:
-        rng = np.random.default_rng(args.random_seed)
-        indices = sorted(rng.choice(len(df), size=min(args.num_samples, len(df)), replace=False).tolist())
-    elif args.index:
-        indices = args.index
-    else:
-        indices = list(range(min(10, len(df))))
-
-    print(f"Visualizing {len(indices)} samples")
-
-    for vis_i, idx in enumerate(indices):
-        if idx >= len(df):
-            continue
-        row = df.iloc[idx]
-        sample = {col: row[col] for col in df.columns}
-
-        # Source tracking from index file
-        if index_map and idx < len(index_map):
-            info = index_map[idx]
-            source = info["source"]
-            orig_idx = info["orig_idx"]
+    for task_index, task_name in enumerate(args.task):
+        if task_name == "train":
+            visualize_train(args, output_dir, task_index)
         else:
-            source = "?"
-            orig_idx = idx
-        sample["_source"] = source
-        sample["_orig_idx"] = orig_idx
-
-        print(f"\n=== Sample {vis_i} (merged_idx={idx}, source={source}, orig_idx={orig_idx}) ===")
-
-        fig = render_sample(sample, image_folder, args)
-        if fig is None:
-            continue
-
-        out_path = out_dir / f"sample_{vis_i:05d}_{source}_{orig_idx}.png"
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print(f"  Saved: {out_path}")
+            visualize_eval_task(task_name, args, output_dir, task_index, task_manager)
 
 
 if __name__ == "__main__":

@@ -31,11 +31,85 @@ MODEL_WEIGHT_FILENAMES = {
     "model.safetensors.index.json",
     "pytorch_model.bin.index.json",
 }
+FOVEA_ANSWER_TAG_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", flags=re.DOTALL | re.IGNORECASE)
+FOVEA_REASONING_TAG_PAIRS = (("<think>", "</think>"), ("<analysis>", "</analysis>"))
+FOVEA_TRAILING_CHAT_TOKENS_RE = re.compile(r"(?:<\|im_end\|>|<\|endoftext\|>|</s>)\s*$")
+FOVEA_BOXED_ANSWER_RE = re.compile(r"\\boxed\{([^{}]+)\}")
+FOVEA_TOOL_CALL_RE = re.compile(r'\{\s*"fovea"\s*\}')
+FOVEA_JSON_ANSWER_RE = re.compile(r'\{\s*"(?:answer|option)"\s*:\s*"?([^"}\n]+)"?\s*\}', re.IGNORECASE)
+FOVEA_CODE_OPTION_RE = re.compile(r"```(?:[A-Za-z]+)?\s*\n\s*([A-Ea-e])\s*\n?```\s*$")
+FOVEA_ANSWER_MARKER_LINE_RE = re.compile(
+    r"^\s*(?:\*{1,2})?(?:(?:the\s+)?final\s+(?:answer|value)|the\s+(?:correct\s+)?(?:answer|option)|(?:correct|best)\s+option|answer)(?:\*{1,2})?\s*(?:is)?\s*[:：]?\s*(.*)$",
+    flags=re.IGNORECASE,
+)
+FOVEA_STANDALONE_OPTION_RE = re.compile(r"^\s*\*{0,2}\(?([A-Ea-e])\)?\*{0,2}[.,]?\s*$")
+
+
+def add_think_prefill(texts: list[str], enabled: bool) -> list[str]:
+    if not enabled:
+        return texts
+    return [text + "<think>\n" for text in texts]
+
+
+def extract_fovea_final_answer(response: str) -> str:
+    """Return the Fovea response text that benchmark scorers should consume."""
+
+    response = FOVEA_TOOL_CALL_RE.sub("", response)
+    answer_tags = FOVEA_ANSWER_TAG_RE.findall(response)
+    if answer_tags:
+        result = answer_tags[-1]
+    else:
+        result = response
+        for start_tag, end_tag in FOVEA_REASONING_TAG_PAIRS:
+            while start_tag in result and end_tag in result:
+                start = result.find(start_tag)
+                end = result.find(end_tag, start)
+                result = result[:start] + result[end + len(end_tag) :]
+            if end_tag in result and start_tag not in result:
+                result = result.rsplit(end_tag, 1)[-1]
+
+        json_answers = FOVEA_JSON_ANSWER_RE.findall(result)
+        boxed_answers = FOVEA_BOXED_ANSWER_RE.findall(result)
+        code_option = FOVEA_CODE_OPTION_RE.search(result)
+        if json_answers:
+            result = json_answers[-1]
+        elif boxed_answers:
+            result = boxed_answers[-1]
+        elif code_option:
+            result = code_option.group(1).upper()
+        else:
+            lines = result.splitlines()
+            marked_answers = []
+            for index, line in enumerate(lines):
+                marker = FOVEA_ANSWER_MARKER_LINE_RE.fullmatch(line)
+                if not marker:
+                    continue
+                answer = marker.group(1).strip()
+                if not answer:
+                    answer = next((candidate.strip() for candidate in lines[index + 1 :] if candidate.strip()), "")
+                if answer:
+                    marked_answers.append(answer)
+
+            if marked_answers:
+                result = marked_answers[-1]
+            else:
+                standalone = next((line for line in reversed(lines) if line.strip()), "")
+                option = FOVEA_STANDALONE_OPTION_RE.fullmatch(standalone)
+                if option:
+                    result = option.group(1).upper()
+
+    return FOVEA_TRAILING_CHAT_TOKENS_RE.sub("", result).strip().rstrip(".,")
 
 
 @register_model("fovea")
 class Fovea(Qwen2_5_VL):
     """lmms-eval adapter for the local Fovea implementation."""
+
+    preserve_raw_resps = True
+
+    @staticmethod
+    def postprocess_response_for_scoring(response: str, task_name: str | None = None) -> str:
+        return extract_fovea_final_answer(response)
 
     @staticmethod
     def _pick_torch_dtype():
@@ -88,6 +162,7 @@ class Fovea(Qwen2_5_VL):
         system_prompt: Optional[str] = "You are a helpful assistant.",
         interleave_visuals: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
+        prefill_think: Optional[bool] = False,
         max_image_tokens: int | None = 512,
         fovea_crop_min_image_tokens: int | None = 64,
         fovea_crop_max_image_tokens: int | None = 1024,
@@ -156,6 +231,7 @@ class Fovea(Qwen2_5_VL):
             self.reasoning_prompt = reasoning_prompt.replace("\\n", "\n")
         else:
             self.reasoning_prompt = None
+        self.prefill_think = bool(prefill_think)
 
         self.system_prompt = system_prompt
         self.interleave_visuals = interleave_visuals
@@ -313,7 +389,7 @@ class Fovea(Qwen2_5_VL):
 
             batched_messages.append(message)
 
-        texts = self._apply_chat_template(batched_messages)
+        texts = add_think_prefill(self._apply_chat_template(batched_messages), self.prefill_think)
         processor_kwargs = {
             "text": texts,
             "images": image_inputs or None,

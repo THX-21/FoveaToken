@@ -1,11 +1,29 @@
 import datetime
 import json
+import re
 import statistics
 
 from loguru import logger as eval_logger
 
 from lmms_eval.tasks._task_utils.file_utils import generate_submission_file
 from lmms_eval.tasks._task_utils.vqa_eval_metric import EvalAIAnswerProcessor
+
+
+_ANSWER_TAG_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+_ANSWER_PREFIX_RE = re.compile(r"^(?:final answer|the answer is|answer)\s*[:：]\s*", re.IGNORECASE)
+_TRAILING_CHAT_TOKENS_RE = re.compile(r"(?:<\|im_end\|>|<\|endoftext\|>|</s>)\s*$")
+
+
+def normalize_textvqa_answer(answer):
+    """Remove explicit answer wrappers before official VQA normalization."""
+
+    if not isinstance(answer, str):
+        return answer
+    answer = _TRAILING_CHAT_TOKENS_RE.sub("", answer).strip()
+    answer_tags = _ANSWER_TAG_RE.findall(answer)
+    if answer_tags:
+        answer = answer_tags[-1].strip()
+    return _ANSWER_PREFIX_RE.sub("", answer).strip()
 
 
 def textvqa_doc_to_visual(doc):
@@ -15,7 +33,7 @@ def textvqa_doc_to_visual(doc):
 def textvqa_process_results(doc, result):
     eval_ai_processor = EvalAIAnswerProcessor()
     assert len(result) == 1, f"The result should be a list of length 1, but got {len(result)}."
-    resAns = eval_ai_processor(result[0])
+    resAns = eval_ai_processor(normalize_textvqa_answer(result[0]))
     accuracy = 0
 
     if "answers" in doc and doc["answers"] is not None:

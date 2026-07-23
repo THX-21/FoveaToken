@@ -1,6 +1,7 @@
 import os
 import re
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import yaml
@@ -8,6 +9,40 @@ from Levenshtein import distance
 from loguru import logger as eval_logger
 
 from lmms_eval.llm_judge import Request, ServerConfig, get_server
+
+
+_TRAILING_CHAT_TOKENS_RE = re.compile(r"(?:<\|im_end\|>|<\|endoftext\|>|</s>)\s*$")
+_ANSWER_TAG_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+_FINAL_ANSWER_RE = re.compile(r"(?:final answer|the answer is|the correct answer is|answer)\s*[:：]\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+_BOXED_RE = re.compile(r"^\\boxed\{(.+)\}$", re.DOTALL)
+_NUMBER_RE = re.compile(r"^\s*\$?\s*(-?\d[\d,]*(?:\.\d+)?)\s*(?:[%$A-Za-z°²^/]+)?\s*$")
+
+
+def extract_terminal_answer(response):
+    """Return an explicitly marked final answer, when present."""
+
+    response = _TRAILING_CHAT_TOKENS_RE.sub("", response).strip()
+    answer_tags = _ANSWER_TAG_RE.findall(response)
+    if answer_tags:
+        return answer_tags[-1].strip()
+
+    final_answers = _FINAL_ANSWER_RE.findall(response)
+    if final_answers:
+        return final_answers[-1].strip()
+    return response
+
+
+def extract_standalone_number(response):
+    """Parse a single numeric final answer, optionally followed by a unit."""
+
+    response = response.strip().replace("\\,", "")
+    boxed = _BOXED_RE.fullmatch(response)
+    if boxed:
+        response = boxed.group(1).strip()
+    if response.startswith("$") and response.endswith("$"):
+        response = response[1:-1].strip()
+    match = _NUMBER_RE.fullmatch(response)
+    return match.group(1).replace(",", "") if match else None
 
 # pids: 799, 681, 615
 shot_examples = [
@@ -162,12 +197,17 @@ class MathVistaEvaluator:
     API_TYPE = os.getenv("API_TYPE", "openai")
     gpt_model = os.getenv("MODEL_VERSION", "gpt-4o-2024-11-20")
 
-    # Initialize llm_judge server
     server_config = ServerConfig(model_name=gpt_model, temperature=0.0, max_tokens=256, timeout=60, num_retries=5, retry_delay=10)
-    server = get_server(server_name=API_TYPE, config=server_config)
+    server = None
 
     def __init__(self, quick_extract=False):
         self.quick_extract = quick_extract
+
+    @classmethod
+    def get_server(cls):
+        if cls.server is None:
+            cls.server = get_server(server_name=cls.API_TYPE, config=cls.server_config)
+        return cls.server
 
     def get_chat_response(self, prompt, temperature=0, max_tokens=256, n=1, patience=5, sleep_time=0):
         # Create a custom server config for this specific request with different parameters
@@ -179,7 +219,7 @@ class MathVistaEvaluator:
                 # Use the core evaluate method with a Request object for direct text generation
                 request = Request(messages=[{"role": "user", "content": prompt}], config=request_config)
 
-                response = self.server.evaluate(request)
+                response = self.get_server().evaluate(request)
 
                 if response.success:
                     prediction = response.content.strip()
@@ -224,19 +264,26 @@ class MathVistaEvaluator:
         if not response:
             return ""
 
+        response = extract_terminal_answer(response)
+
         if question_type == "multi_choice" and response in choices:
             return response
 
+        if question_type == "multi_choice":
+            option = re.match(r"\s*\(?([A-Za-z])\)?(?:[).,:]|\s|$)", response)
+            if option:
+                return option.group(1).upper()
+
         if answer_type == "integer":
             try:
-                extraction = int(response)
+                extraction = int(extract_standalone_number(response) or response)
                 return str(extraction)
             except ValueError:
                 pass
 
         if answer_type == "float":
             try:
-                extraction = str(float(response))
+                extraction = str(float(extract_standalone_number(response) or response))
                 return extraction
             except ValueError:
                 pass
@@ -310,7 +357,7 @@ class MathVistaEvaluator:
 
         elif answer_type == "float":
             try:
-                extraction = str(round(float(extraction), precision))
+                extraction = str(round(float(extraction), int(precision)))
             except:
                 extraction = None
 
@@ -322,13 +369,18 @@ class MathVistaEvaluator:
 
         return extraction
 
-    def safe_equal(self, prediction, answer):
+    def safe_equal(self, prediction, answer, precision=None):
         """
         Check if the prediction is equal to the answer, even if they are of different types
         """
         try:
             if str(prediction).strip() == str(answer).strip():
                 return True
+            if precision is None:
+                return False
+            difference = abs(Decimal(str(prediction)) - Decimal(str(answer)))
+            return difference <= Decimal(10) ** -int(precision)
+        except (InvalidOperation, ValueError):
             return False
         except Exception as e:
             eval_logger.info(e)

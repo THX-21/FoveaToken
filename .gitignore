@@ -8,8 +8,8 @@
 __pycache__/
 logs/
 checkpoints/
-docs/
 *.egg-info/
 data/
 outputs/
 VLM-R3/
+docs/
