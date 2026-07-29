@@ -14,44 +14,6 @@ def normalize_patch_boxes(boxes: torch.Tensor) -> torch.Tensor:
     return boxes
 
 
-def _box_boundary_distance(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
-    dx = max(box_a[0] - box_b[2], box_b[0] - box_a[2], 0)
-    dy = max(box_a[1] - box_b[3], box_b[1] - box_a[3], 0)
-    return (dx * dx + dy * dy) ** 0.5
-
-
-def _find_connected_components(boxes: list[tuple[int, int, int, int]], margin: float) -> list[list[int]]:
-    if not boxes:
-        return []
-
-    patch_size = max(boxes[0][2] - boxes[0][0], boxes[0][3] - boxes[0][1])
-    max_dist = margin * patch_size
-    neighbors = {i: [] for i in range(len(boxes))}
-    for i in range(len(boxes)):
-        for j in range(i + 1, len(boxes)):
-            if _box_boundary_distance(boxes[i], boxes[j]) <= max_dist:
-                neighbors[i].append(j)
-                neighbors[j].append(i)
-
-    visited: set[int] = set()
-    components: list[list[int]] = []
-    for start in range(len(boxes)):
-        if start in visited:
-            continue
-        queue = [start]
-        visited.add(start)
-        component: list[int] = []
-        while queue:
-            node = queue.pop()
-            component.append(node)
-            for nb in neighbors[node]:
-                if nb not in visited:
-                    visited.add(nb)
-                    queue.append(nb)
-        components.append(component)
-    return components
-
-
 @dataclass
 class CropRegion:
     box: tuple[int, int, int, int]
@@ -74,10 +36,11 @@ def crop_attended_regions(
     image: Image.Image,
     boxes: torch.Tensor,
     weights: torch.Tensor,
-    threshold: float = 0.3,
-    margin: float = 1.0,
-    padding: float = 1.0,
+    threshold: float = 0.25,
+    region_scale: float = 1.2,
 ) -> list[CropRegion]:
+    if region_scale < 1:
+        raise ValueError(f"region_scale must be at least 1, got {region_scale}.")
     width, height = image.size
     boxes_np = normalize_patch_boxes(boxes).detach().cpu().numpy()
     weights_np = weights.detach().cpu().numpy()
@@ -103,23 +66,24 @@ def crop_attended_regions(
     if not kept_boxes:
         return []
 
-    patch_w = int(round((boxes_np[0, 2] - boxes_np[0, 0]) * width))
-    patch_h = int(round((boxes_np[0, 3] - boxes_np[0, 1]) * height))
-    pad_x = int(round(padding * patch_w))
-    pad_y = int(round(padding * patch_h))
-
-    regions: list[CropRegion] = []
-    for component in _find_connected_components(kept_boxes, margin):
-        x1 = max(0, min(kept_boxes[i][0] for i in component) - pad_x)
-        y1 = max(0, min(kept_boxes[i][1] for i in component) - pad_y)
-        x2 = min(width, max(kept_boxes[i][2] for i in component) + pad_x)
-        y2 = min(height, max(kept_boxes[i][3] for i in component) + pad_y)
-        regions.append(
-            CropRegion(
-                box=(x1, y1, x2, y2),
-                weight=max(kept_weights[i] for i in component),
-                crop=image.crop((x1, y1, x2, y2)),
-            )
+    x1 = min(box[0] for box in kept_boxes)
+    y1 = min(box[1] for box in kept_boxes)
+    x2 = max(box[2] for box in kept_boxes)
+    y2 = max(box[3] for box in kept_boxes)
+    center_x = (x1 + x2) / 2
+    center_y = (y1 + y2) / 2
+    half_width = (x2 - x1) * region_scale / 2
+    half_height = (y2 - y1) * region_scale / 2
+    x1 = max(0, int(round(center_x - half_width)))
+    y1 = max(0, int(round(center_y - half_height)))
+    x2 = min(width, int(round(center_x + half_width)))
+    y2 = min(height, int(round(center_y + half_height)))
+    if x2 <= x1 or y2 <= y1:
+        return []
+    return [
+        CropRegion(
+            box=(x1, y1, x2, y2),
+            weight=max(kept_weights),
+            crop=image.crop((x1, y1, x2, y2)),
         )
-    regions.sort(key=lambda item: item.weight, reverse=True)
-    return regions
+    ]

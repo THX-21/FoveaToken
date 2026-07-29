@@ -22,7 +22,8 @@ from fovea_token.fovea_crop import crop_attended_regions, normalize_patch_boxes
 from fovea_token.tokenizers.tokenization_fovea import FOVEA_TOOL_CALL
 
 FOVEA_REASONING_PROMPT = r'\nYou need to first think about the reasoning process in your mind and then provide the answer. When thinking you should call the "fovea" tool (format: {"fovea"}) to focus on key areas in the image. The reasoning process and the answer are included in the <think> </think> and <answer> </answer> tags respectively.'
-DEFAULT_TASKS = ["hrbench8k", "xlrs-lite", "textvqa_val", "chartqa", "vstar_bench", "mmstar", "mathvista_testmini_solution"]
+# DEFAULT_TASKS = ["hrbench8k", "xlrs-lite", "textvqa_val", "chartqa", "vstar_bench", "mmstar", "mathvista_testmini_solution"]
+DEFAULT_TASKS = ["textvqa_val"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device_map", default="cuda:0")
     parser.add_argument("--attn_implementation", default="sdpa")
     parser.add_argument("--force_simple", action="store_true")
-    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
@@ -50,12 +51,10 @@ def parse_args() -> argparse.Namespace:
                         help="Disable fovea retrieval pipeline.")
     parser.add_argument("--prefill_think", action=argparse.BooleanOptionalAction, default=True, help="Prefill <think> before generation.")
     parser.add_argument("--crop", default="true", help="Crop the most-attended regions and save them.")
-    parser.add_argument("--crop_threshold", type=float, default=0.35,
+    parser.add_argument("--crop_threshold", type=float, default=0.25,
                         help="Threshold for cropping: boxes with weight > threshold * max_weight are cropped.")
-    parser.add_argument("--crop_margin", type=float, default=1.0,
-                        help="Patch count tolerance for connectivity. 0 = strictly adjacent, 1 = one-patch gap allowed.")
-    parser.add_argument("--crop_padding", type=float, default=1.0,
-                        help="Expand each crop region by this many patches outward.")
+    parser.add_argument("--crop_region_scale", type=float, default=1.2,
+                        help="Scale the selected patch bounding box around its center.")
     parser.add_argument("--save_token_overview", action=argparse.BooleanOptionalAction, default=False,
                         help="Save per-token attention panels; disabled by default because it is expensive.")
     parser.add_argument("--max_token_panels", type=int, default=64,
@@ -481,7 +480,7 @@ def _save_single_image_visualizations(sample: dict, args) -> None:
         if getattr(args, "crop", False):
             crops = crop_attended_regions(
                 sample["image"], entry["boxes"], summary,
-                threshold=args.crop_threshold, margin=args.crop_margin, padding=args.crop_padding,
+                    threshold=args.crop_threshold, region_scale=args.crop_region_scale,
             )
             for crop_idx, c in enumerate(crops[:1]):
                 crop_path = out_dir / f"{stem}_crop_{crop_idx:02d}.png"

@@ -17,9 +17,9 @@ class FoveaConfig(_Qwen2_5_VLConfig):
         fovea_align_beta: float = 0.1,
         fovea_crop_min_image_tokens: int = 64,
         fovea_crop_max_image_tokens: int = 1024,
-        fovea_crop_threshold: float = 0.35,
-        fovea_crop_margin: float = 1.0,
-        fovea_crop_padding: float = 1.0,
+        fovea_crop_threshold: float = 0.25,
+        fovea_crop_region_scale: float = 1.2,
+        fovea_crop_image_scale: float = 2.0,
         fovea_max_trigger_per_response: int = 4,
         fovea_trigger_token_ids: list[int] | None = None,
         **kwargs,
@@ -46,8 +46,8 @@ class FoveaConfig(_Qwen2_5_VLConfig):
         self.fovea_crop_min_image_tokens = int(fovea_crop_min_image_tokens)
         self.fovea_crop_max_image_tokens = int(fovea_crop_max_image_tokens)
         self.fovea_crop_threshold = float(fovea_crop_threshold)
-        self.fovea_crop_margin = float(fovea_crop_margin)
-        self.fovea_crop_padding = float(fovea_crop_padding)
+        self.fovea_crop_region_scale = float(fovea_crop_region_scale)
+        self.fovea_crop_image_scale = float(fovea_crop_image_scale)
         self.fovea_max_trigger_per_response = int(fovea_max_trigger_per_response)
         self.fovea_trigger_token_ids = fovea_trigger_token_ids
 

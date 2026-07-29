@@ -166,6 +166,9 @@ class Fovea(Qwen2_5_VL):
         max_image_tokens: int | None = 512,
         fovea_crop_min_image_tokens: int | None = 64,
         fovea_crop_max_image_tokens: int | None = 1024,
+        fovea_crop_threshold: float = 0.25,
+        fovea_crop_region_scale: float = 1.2,
+        fovea_crop_image_scale: float = 2.0,
         disable_fovea_retrieval: Optional[bool] = False,
         **kwargs,
     ) -> None:
@@ -225,6 +228,9 @@ class Fovea(Qwen2_5_VL):
         self.vision_packer = vision_packer
         fovea_model.config.fovea_crop_max_image_tokens = int(fovea_crop_max_image_tokens)
         fovea_model.config.fovea_crop_min_image_tokens = int(fovea_crop_min_image_tokens)
+        fovea_model.config.fovea_crop_threshold = float(fovea_crop_threshold)
+        fovea_model.config.fovea_crop_region_scale = float(fovea_crop_region_scale)
+        fovea_model.config.fovea_crop_image_scale = float(fovea_crop_image_scale)
         self.disable_fovea_retrieval = bool(disable_fovea_retrieval)
 
         if reasoning_prompt:

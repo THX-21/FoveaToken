@@ -5,11 +5,11 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/lmms-eval"
 # export HF_HUB_OFFLINE=1
 # MathVista tasks use the OpenAI-backed answer extractor / judge in lmms-eval.
-# Fill these before running MathVista-related tasks:
-export OPENAI_API_KEY="sk-41b71552d6744c3ab5fd5b1bfadb3512"
-export OPENAI_API_URL="https://api.deepseek.com/v1"
-export API_TYPE="openai"
-export MODEL_VERSION="deepseek-v4-flash"
+ENV_FILE="${PROJECT_ROOT}/.env"
+[[ -f "${ENV_FILE}" ]] || { echo "[eval_others] missing ${ENV_FILE}" >&2; exit 1; }
+set -a
+source "${ENV_FILE}"
+set +a
 
 BASE_MODEL="${EVAL_BASE_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
 MODEL="${EVAL_MODEL:-qwen2_5_vl}"
@@ -30,6 +30,7 @@ MODEL="${EVAL_MODEL:-qwen2_5_vl}"
 #   mathvista_testmini_format
 # Note: `charvqa` was not found in the current repo. If you meant chart QA, use `chartqa`.
 TASKS="${EVAL_TASKS:-hrbench8k,xlrs-lite,textvqa_val,chartqa,vstar_bench,mmstar,mathvista_testmini_solution}"
+# TASKS="${EVAL_TASKS:-mathvista_testmini_solution}"
 OUTPUT_PATH="${EVAL_OUTPUT_PATH:-${PROJECT_ROOT}/logs}"
 PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
 [[ -x "${PYTHON_BIN}" ]] || PYTHON_BIN="python"

@@ -556,6 +556,17 @@ class FoveaForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
     def _encode_crop_images(self, crop_images: list[Image.Image], image_processor, device, dtype):
         if not crop_images:
             return None, None, None
+        image_scale = float(self.config.fovea_crop_image_scale)
+        if image_scale <= 0:
+            raise ValueError(f"fovea_crop_image_scale must be positive, got {image_scale}.")
+        if image_scale != 1:
+            crop_images = [
+                image.resize(
+                    (round(image.width * image_scale), round(image.height * image_scale)),
+                    Image.Resampling.LANCZOS,
+                )
+                for image in crop_images
+            ]
         merge = max(int(getattr(image_processor, "merge_size", getattr(self.config.vision_config, "spatial_merge_size", 2))), 1)
         patch_size = getattr(image_processor, "patch_size", getattr(self.config.vision_config, "patch_size", 16))
         if isinstance(patch_size, (list, tuple)):
@@ -627,8 +638,7 @@ class FoveaForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             boxes=patch_boxes,
             weights=summary,
             threshold=float(self.config.fovea_crop_threshold),
-            margin=float(self.config.fovea_crop_margin),
-            padding=float(self.config.fovea_crop_padding),
+            region_scale=float(self.config.fovea_crop_region_scale),
         )
 
     def _select_source_image_for_crop(
